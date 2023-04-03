@@ -1,0 +1,12 @@
+[Unit]
+Description=Meshlinkd P2P Information Exchange Service
+After=network.target
+
+[Service]
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/meshlinkd
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
