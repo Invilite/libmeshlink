@@ -36,6 +36,8 @@ bool TcpClient::connect(const std::string& address, const int port) {
         onConnect_();
     }
 
+    should_disconnect_ = false;
+
     std::thread connection_thread(&TcpClient::receive_data, this);
     connection_thread.detach();
 
@@ -131,21 +133,26 @@ void TcpClient::disconnect() {
 }
 
 void TcpClient::send(const std::string& data) {
-    std::unique_lock<std::mutex> lock(socket_mutex_);
     if (client_socket_ != -1) {
         ::send(client_socket_, data.c_str(), data.length(), 0);
     }
 }
 
-void TcpClient::setOnConnectCallback(std::function<void()> onConnect) {
+void TcpClient::send(const char* data, uint32_t dataLen) {
+    if (client_socket_ != -1) {
+        ::send(client_socket_, data, dataLen, 0);
+    }
+}
+
+void TcpClient::onConnect(std::function<void()> onConnect) {
     onConnect_ = onConnect;
 }
 
-void TcpClient::setOnDisconnectCallback(std::function<void()> onDisconnect) {
+void TcpClient::onDisconnect(std::function<void()> onDisconnect) {
     onDisconnect_ = onDisconnect;
 }
 
-void TcpClient::setOnDataCallback(std::function<void(const std::string& data)> onData) {
+void TcpClient::onDataReceived(std::function<void(const std::string& data)> onData) {
     onData_ = onData;
 }
 

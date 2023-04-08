@@ -1,3 +1,6 @@
+#ifndef FILE_H
+#define FILE_H
+
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -39,3 +42,5 @@ protected:
 };
 
 } // namespace invilite
+
+#endif // FILE_H

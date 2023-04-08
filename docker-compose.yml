@@ -1,0 +1,37 @@
+version: '3'
+
+services:
+  meshlink1:
+    image: debian:bookworm-backports
+    volumes:
+      - "./meshlinkd:/bin/meshlinkd:ro"
+    command: /bin/meshlinkd
+    networks:
+      mynet:
+        ipv4_address: 192.168.5.10
+
+  meshlink2:
+    image: debian:bookworm-backports
+    volumes:
+      - "./meshlinkd:/bin/meshlinkd:ro"
+    command: /bin/meshlinkd
+    networks:
+      mynet:
+        ipv4_address: 192.168.5.11
+
+  meshlink3:
+    image: debian:bookworm-backports
+    volumes:
+      - "./meshlinkd:/bin/meshlinkd:ro"
+    command: /bin/meshlinkd
+    networks:
+      mynet:
+        ipv4_address: 192.168.5.12
+
+networks:
+  mynet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 192.168.5.0/24  # podsieć dla kontenerów

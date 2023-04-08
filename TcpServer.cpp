@@ -57,20 +57,38 @@ std::vector<std::shared_ptr<invilite::ClientHandler>> invilite::TcpServer::get_c
     return clients_;
 }
 
-void invilite::TcpServer::send_to_client(const std::shared_ptr<ClientHandler> &client, const std::string &data) {
+void invilite::TcpServer::sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data) {
     send(client->getSocket(), data.c_str(), data.length(), 0);
 }
 
+void invilite::TcpServer::onConnect(const OnConnectCallback &callback) {
+    on_connect_callback_ = callback;
+}
+
+void invilite::TcpServer::onDisconnect(const OnDisconnectCallback &callback) {
+    on_disconnect_callback_ = callback;
+}
+
+void invilite::TcpServer::onDataReceived(const OnReceivedCallback &callback) {
+    on_received_callback_ = callback;
+}
+
 void invilite::TcpServer::on_client_connected(const std::shared_ptr<ClientHandler> &client) {
-    std::cout << "Connected client" << std::endl << std::flush;
+    if (on_connect_callback_) {
+        on_connect_callback_(client);
+    }
 }
 
 void invilite::TcpServer::on_client_disconnected(const std::shared_ptr<ClientHandler> &client) {
-    std::cout << "Client disconnected" << std::endl << std::flush;
+    if (on_disconnect_callback_) {
+        on_disconnect_callback_(client);
+    }
 }
 
 void invilite::TcpServer::on_data_received(const std::shared_ptr<ClientHandler> &client, const std::string &data) {
-    std::cout << "Received: " << data << std::endl << std::flush;
+    if (on_received_callback_) {
+        on_received_callback_(client, data);
+    }
 }
 
 void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &client) {
