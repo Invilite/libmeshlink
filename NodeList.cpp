@@ -8,8 +8,9 @@ invilite::NodeList::NodeList(const std::string& filePath) : File(filePath) {
 }
 
 // Add a single client address or a vector of addresses to the list and update the content of the file
-void invilite::NodeList::add(const std::vector<std::string>& addresses) {
+bool invilite::NodeList::add(const std::vector<std::string>& addresses) {
     bool fileUpdated = false;
+    std::lock_guard<std::mutex> lock(list_mutex);
     for (const auto& address : addresses) {
         if (list.insert(address).second) {
             fileUpdated = true;
@@ -19,16 +20,19 @@ void invilite::NodeList::add(const std::vector<std::string>& addresses) {
     if (fileUpdated) {
         updateContent();
     }
+
+    return fileUpdated;
 }
 
-// Add client address to the list and update the content of the file
-void invilite::NodeList::add(const std::string& address) {
+// Add client address to the list and update the content of the files
+bool invilite::NodeList::add(const std::string& address) {
     std::vector<std::string> addresses{address};
-    add(addresses);
+    return add(addresses);
 }
 
 // Remove client address from the list and update the content of the file
 void invilite::NodeList::remove(const std::string& address) {
+    std::lock_guard<std::mutex> lock(list_mutex);
     if (list.erase(address) > 0) {
         updateContent();
     }

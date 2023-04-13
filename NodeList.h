@@ -2,6 +2,7 @@
 #define NODE_LIST_H
 
 #include <set>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <sstream>
@@ -13,8 +14,8 @@ namespace invilite {
 class NodeList: public File {
 public:
     NodeList(const std::string& filePath);
-    void add(const std::vector<std::string>& addresses);
-    void add(const std::string& address);
+    bool add(const std::vector<std::string>& addresses);
+    bool add(const std::string& address);
     void remove(const std::string& address);
     const std::set<std::string>& getAll() const;
 
@@ -47,6 +48,7 @@ protected:
     std::set<std::string> list;
 
 private:
+    std::mutex list_mutex;
     void parseContent();
     void updateContent();
 };

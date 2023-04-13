@@ -34,26 +34,3 @@ const std::string& invilite::File::content() const {
 void invilite::File::content(const std::string& content) {
     content_ = content;
 }
-
-
-// int main() {
-//     invilite::File file("example.txt");
-
-//     // Write content to the file
-//     file.set_content("Hello, world!");
-//     if (file.write()) {
-//         std::cout << "File written successfully." << std::endl;
-//     } else {
-//         std::cout << "Failed to write the file." << std::endl;
-//     }
-
-//     // Read content from the file
-//     if (file.read()) {
-//         std::cout << "File read successfully." << std::endl;
-//         std::cout << "Content: " << file.content() << std::endl;
-//     } else {
-//         std::cout << "Failed to read the file." << std::endl;
-//     }
-
-//     return 0;
-// }

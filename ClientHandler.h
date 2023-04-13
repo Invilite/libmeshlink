@@ -20,9 +20,12 @@ public:
     ClientHandler(int client_socket);
     int getSocket() const;
     void send(const std::string& data);
+    std::string getClientIp() const;
+    int getClientPort() const;
 
 protected:
     int socket;
+    sockaddr_in client_addr;
 };
 
 }

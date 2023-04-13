@@ -1,10 +1,12 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
+#include <set>
 #include <mutex>
 #include <string>
 #include <vector>
 #include <thread>
+#include <utility>
 #include <unistd.h>
 #include <iostream>
 #include <algorithm>
@@ -22,7 +24,7 @@ public:
     virtual ~TcpServer();
 
     void start();
-    std::vector<std::shared_ptr<ClientHandler>> get_clients();
+    std::vector<std::shared_ptr<ClientHandler>> getClients();
     void sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data);
 
     using OnConnectCallback = std::function<void(const std::shared_ptr<ClientHandler> &client)>;
@@ -32,6 +34,9 @@ public:
     void onConnect(const OnConnectCallback &callback);
     void onDisconnect(const OnDisconnectCallback &callback);
     void onDataReceived(const OnReceivedCallback &callback);
+
+    std::set<std::pair<std::string, int>> getConnectedClientsInfo() const;
+    bool isConnected(const std::string &address) const;
 
 protected:
     virtual void on_client_connected(const std::shared_ptr<ClientHandler> &client);
@@ -45,6 +50,9 @@ private:
     int server_socket_;
     std::vector<std::shared_ptr<ClientHandler>> clients_;
     std::mutex clients_mutex_;
+
+    std::set<std::pair<std::string, int>> connected_clients_info_;
+    mutable std::mutex clients_info_mutex_;
 
     OnConnectCallback on_connect_callback_;
     OnDisconnectCallback on_disconnect_callback_;

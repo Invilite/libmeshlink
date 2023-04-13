@@ -86,7 +86,46 @@ namespace invilite {
 		    return false;
 		}
 
+		static bool isLocalNetworkAddress(const std::string& address);
+
+	private:
+		static std::vector<std::string> split(const std::string& s, char delimiter);
+
 	};
 }
 
 #endif // IP_TOOLS_H
+
+std::vector<std::string> invilite::IpTools::split(const std::string& s, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::istringstream tokenStream(s);
+    while (std::getline(tokenStream, token, delimiter)) {
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+bool invilite::IpTools::isLocalNetworkAddress(const std::string& address) {
+    std::vector<std::string> octets = split(address, '.');
+
+    if (octets.size() != 4) {
+        return false;
+    }
+
+    int firstOctet = std::stoi(octets[0]);
+
+    if (firstOctet == 10) {
+        return true;
+    }
+
+    if (firstOctet == 172 && std::stoi(octets[1]) >= 16 && std::stoi(octets[1]) <= 31) {
+        return true;
+    }
+
+    if (firstOctet == 192 && std::stoi(octets[1]) == 168) {
+        return true;
+    }
+
+    return false;
+}

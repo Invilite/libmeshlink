@@ -15,8 +15,8 @@ namespace invilite {
 	public:
 		Mesh(const std::string* nodeId, NodeList* nodeList_);
 		virtual ~Mesh() = default;
-		void connect();
-		void disconnect();
+		void start();
+		void stop();
 
     	void onNodeConnected(const std::string &nodeId);
     	void onNodeDisconnected(const std::string &nodeId);

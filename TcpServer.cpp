@@ -45,20 +45,42 @@ void invilite::TcpServer::start() {
         const int clientPort = ntohs(clientAddress.sin_port);
         std::cout << "Connected client: " << clientIp << ":" << clientPort << std::endl << std::flush;
 
-        std::unique_lock<std::mutex> lock(clients_mutex_);
-        clients_.push_back(std::make_shared<ClientHandler>(clientSocket));
+        {
+            std::unique_lock<std::mutex> lock(clients_mutex_);
+            clients_.push_back(std::make_shared<ClientHandler>(clientSocket));
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(clients_info_mutex_);
+            connected_clients_info_.insert(std::make_pair(clientIp, clientPort));
+        }
+
         std::thread client_thread(&TcpServer::handle_client, this, clients_.back());
         client_thread.detach();
     }
 }
 
-std::vector<std::shared_ptr<invilite::ClientHandler>> invilite::TcpServer::get_clients() {
-    std::unique_lock<std::mutex> lock(clients_mutex_);
+std::vector<std::shared_ptr<invilite::ClientHandler>> invilite::TcpServer::getClients() {
+    std::unique_lock<std::mutex> lock(clients_info_mutex_);
     return clients_;
 }
 
 void invilite::TcpServer::sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data) {
     send(client->getSocket(), data.c_str(), data.length(), 0);
+}
+
+std::set<std::pair<std::string, int>> invilite::TcpServer::getConnectedClientsInfo() const {
+    std::unique_lock<std::mutex> lock(clients_info_mutex_);
+    return connected_clients_info_;
+}
+
+bool invilite::TcpServer::isConnected(const std::string &address) const {
+    std::unique_lock<std::mutex> lock(clients_info_mutex_);
+    auto it = std::find_if(connected_clients_info_.begin(), connected_clients_info_.end(),
+                           [&](const std::pair<std::string, int> &client_info) {
+                               return client_info.first == address;
+                           });
+    return it != connected_clients_info_.end();
 }
 
 void invilite::TcpServer::onConnect(const OnConnectCallback &callback) {
@@ -102,6 +124,11 @@ void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &cl
     }
 
     on_client_disconnected(client);
+
+    {
+        std::unique_lock<std::mutex> lock(clients_info_mutex_);
+        connected_clients_info_.erase(std::make_pair(client->getClientIp(), client->getClientPort()));
+    }
 
     std::unique_lock<std::mutex> lock(clients_mutex_);
     auto it = std::find(clients_.begin(), clients_.end(), client);
