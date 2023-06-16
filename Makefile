@@ -1,6 +1,7 @@
 CXX = g++
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pedantic
 LDFLAGS = -pthread
+#LDFLAGS = -pthread -lsfml-graphics -lsfml-window -lsfml-system
 
 TARGET = meshlinkd
 SOURCES = $(wildcard *.cpp)

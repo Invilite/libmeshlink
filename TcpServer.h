@@ -5,6 +5,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <unistd.h>
@@ -37,6 +38,7 @@ public:
 
     std::set<std::pair<std::string, int>> getConnectedClientsInfo() const;
     bool isConnected(const std::string &address) const;
+    unsigned int getConnectionsCount();
 
 protected:
     virtual void on_client_connected(const std::shared_ptr<ClientHandler> &client);

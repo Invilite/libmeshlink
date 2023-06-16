@@ -4,6 +4,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <chrono>
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
@@ -23,8 +24,7 @@ public:
     TcpClient();
     ~TcpClient();
 
-    bool connect(const std::string& address, const int port);
-    bool connect(const std::string& address, const int port, std::chrono::seconds timeout);
+    bool connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
     void disconnect();
     void send(const std::string& data);
     void send(const char* data, uint32_t dataLen);
@@ -32,6 +32,8 @@ public:
     void onConnect(std::function<void()> onConnect);
     void onDisconnect(std::function<void()> onDisconnect);
     void onDataReceived(std::function<void(const std::string& data)> onData);
+
+    unsigned int getConnectionTime() const;
 
 private:
     void receive_data();
@@ -44,6 +46,9 @@ private:
     std::function<void()> onConnect_;
     std::function<void()> onDisconnect_;
     std::function<void(const std::string& data)> onData_;
+
+    // Connection time
+    std::chrono::time_point<std::chrono::steady_clock> connectedTimestamp;
 };
 
 } // namespace invilite

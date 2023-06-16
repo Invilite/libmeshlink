@@ -1,12 +1,21 @@
 #ifndef IP_TOOLS_H
 #define IP_TOOLS_H
 
+#include <chrono>
 #include <vector>
+#include <string>
+#include <thread>
 #include <cstring>
+#include <sstream>
 #include <netdb.h>
+#include <unistd.h>
+#include <iostream>
 #include <iostream>
 #include <ifaddrs.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <arpa/inet.h>
+#include <netinet/ip_icmp.h>
 
 namespace invilite {
 	struct NetworkInterface {
@@ -20,112 +29,16 @@ namespace invilite {
 
 	class IpTools {
 	public:
-		static void getLocalInterfaces(std::vector<NetworkInterface> *interfacesList) {
-			struct ifaddrs* ifaddr = nullptr;
-		    struct ifaddrs* ifa = nullptr;
-		    int status;
-		    char host[NI_MAXHOST];
-		    char netmask[NI_MAXHOST];
-		    char network[INET_ADDRSTRLEN];
-
-		    status = getifaddrs(&ifaddr);
-		    if (status == -1) {
-		        perror("getifaddrs");
-		        exit(EXIT_FAILURE);
-		    }
-
-		    // Przejście przez listę interfejsów sieciowych
-		    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
-		        if (ifa->ifa_addr == nullptr) {
-		            continue;
-		        }
-
-		        int family = ifa->ifa_addr->sa_family;
-
-		        // Wyświetlanie informacji tylko dla interfejsów IPv4
-		        if (family == AF_INET) {
-		            status = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
-		                                 host, NI_MAXHOST,
-		                                 nullptr, 0, NI_NUMERICHOST);
-
-		            if (status != 0) {
-		                std::cout << "getnameinfo() failed: " << gai_strerror(status) << std::endl;
-		                continue;
-		            }
-
-		            // Pobranie maski podsieci
-		            getnameinfo(ifa->ifa_netmask, sizeof(struct sockaddr_in),
-		                        netmask, NI_MAXHOST,
-		                        nullptr, 0, NI_NUMERICHOST);
-
-		            // Obliczenie adresu sieci
-		            struct sockaddr_in addr, mask, net;
-		            memcpy(&addr, ifa->ifa_addr, sizeof(struct sockaddr_in));
-		            memcpy(&mask, ifa->ifa_netmask, sizeof(struct sockaddr_in));
-		            net.sin_addr.s_addr = addr.sin_addr.s_addr & mask.sin_addr.s_addr;
-		            inet_ntop(AF_INET, &(net.sin_addr), network, INET_ADDRSTRLEN);
-
-		            NetworkInterface networkInterface(std::string(ifa->ifa_name), std::string(host), std::string(netmask), std::string(network));
-		            interfacesList->push_back(networkInterface);
-
-		            //std::cout << "Interface: " << ifa->ifa_name << ", Address: " << host << ", Netmask: " << netmask << ", Network: " << network << std::endl;
-		        }
-		    }
-
-		    // Zwolnienie zaalokowanej listy interfejsów sieciowych
-		    freeifaddrs(ifaddr);
-		}
-
-		static bool isLocalAddress(std::vector<NetworkInterface> *interfacesList, std::string address) {
-			for (const auto& entry: *interfacesList) {
-		        if (entry.address == address) {
-		        	return true;
-		        }
-		    }
-
-		    return false;
-		}
-
+		static void getLocalInterfaces(std::vector<NetworkInterface> *interfacesList);
+		static bool isLocalAddress(std::vector<NetworkInterface> *interfacesList, std::string address);
 		static bool isLocalNetworkAddress(const std::string& address);
+		static double ping(const std::string &address, int packets = 4, int wait_time = 1000, int interval = 200);
 
 	private:
 		static std::vector<std::string> split(const std::string& s, char delimiter);
+		static unsigned short checksum(unsigned short *ptr, int nbytes);
 
 	};
 }
 
 #endif // IP_TOOLS_H
-
-std::vector<std::string> invilite::IpTools::split(const std::string& s, char delimiter) {
-    std::vector<std::string> tokens;
-    std::string token;
-    std::istringstream tokenStream(s);
-    while (std::getline(tokenStream, token, delimiter)) {
-        tokens.push_back(token);
-    }
-    return tokens;
-}
-
-bool invilite::IpTools::isLocalNetworkAddress(const std::string& address) {
-    std::vector<std::string> octets = split(address, '.');
-
-    if (octets.size() != 4) {
-        return false;
-    }
-
-    int firstOctet = std::stoi(octets[0]);
-
-    if (firstOctet == 10) {
-        return true;
-    }
-
-    if (firstOctet == 172 && std::stoi(octets[1]) >= 16 && std::stoi(octets[1]) <= 31) {
-        return true;
-    }
-
-    if (firstOctet == 192 && std::stoi(octets[1]) == 168) {
-        return true;
-    }
-
-    return false;
-}

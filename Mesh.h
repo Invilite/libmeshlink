@@ -6,6 +6,7 @@
 #include <iostream>
 #include "TcpServer.h"
 #include "TcpClient.h"
+#include "IpTools.h"
 #include "NodeList.h"
 #include "ClientId.h"
 #include "MeshProtocol.h"
@@ -31,7 +32,16 @@ namespace invilite {
 		std::vector<std::shared_ptr<TcpClient>> clients;
 		std::thread serverThread;
 
+		std::thread updateConnectionsThread;
+		int localConnectionsLimit;
+		int globalConnectionsLimit;
+
+		void updateConnections();
+		void connectToAvailableNodes(const std::set<std::string>& allEntries);
+
+
 	private:
+		std::shared_ptr<invilite::TcpClient> getLongestConnectedClient();
 	};
 }
 

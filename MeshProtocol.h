@@ -100,6 +100,7 @@ protected:
     template <typename T> void sendDataTo(const std::string& nodeId, T& packet);
 
     // Return true if node is connected to server or as outgoing tcp connection
+    // TODO: Implement
     bool isNodeConnected(const std::string& nodeId);
 
     // Server methods
@@ -107,18 +108,17 @@ protected:
     void onDisconnect(const std::shared_ptr<invilite::ClientHandler> &client);
     void onServerDataReceived(const std::shared_ptr<invilite::ClientHandler> &client, const std::string &data);
 
+protected:
+    // List of IP addresses of connected clients
+    // TODO: Add isClientConnected method
+    std::set<std::string> connectedAddresses;
+
 private:
-    // void handleServerConnection(const std::shared_ptr<ClientHandler>& client);
-    // void handleServerDisconnection(const std::shared_ptr<ClientHandler>& client);
-    // void handleServerData(const std::shared_ptr<ClientHandler>& client, const std::string& data);
-
-    // void handleClientConnection();
-    // void handleClientDisconnection();
-    // void handleClientData(const std::string& data);
-
     const std::string* nodeId;
 
     std::mutex nodes_mutex_;
+
+    std::mutex connectedAddressesMutex;
 
     // Map clientId with TcpClients for outgoing connections
     std::unordered_map<std::string, std::shared_ptr<TcpClient>> outgoing_nodes_;

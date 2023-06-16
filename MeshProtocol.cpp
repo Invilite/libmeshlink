@@ -7,12 +7,22 @@ invilite::MeshProtocol::MeshProtocol(const std::string* nodeId): nodeId(nodeId) 
 void invilite::MeshProtocol::connectToNode(const std::string& address, const int port) {
     auto client = std::make_shared<TcpClient>();
 
-    client->onConnect([this, client]() {
+    client->onConnect([this, client, address]() {
+    	{
+	    	std::lock_guard<std::mutex> lock(connectedAddressesMutex);
+	    	std::cout << "Dodaje adres do listy: " << address << std::endl;
+	    	this->connectedAddresses.insert(address);
+    	}
         NodeIdPacket nodeIdPacket(*this->nodeId);
         sendDataTo(client, nodeIdPacket);
     });
 
-    client->onDataReceived([this, client](const std::string& data) {
+    client->onDisconnect([this, address]() {
+    	std::lock_guard<std::mutex> lock(connectedAddressesMutex);
+        this->connectedAddresses.erase(address);
+    });
+
+    client->onDataReceived([this, client, address](const std::string& data) {
         auto packetHeader = invilite::Serializer::getHeader(data);
         if (packetHeader == MeshPacket::NODE_ID_PACKET) {
         	NodeIdPacket nodeIdPacket = NodeIdPacket::unpack(data);
@@ -31,11 +41,12 @@ void invilite::MeshProtocol::connectToNode(const std::string& address, const int
 
             onNodeConnected(nodeId);
 
-	        client->onDisconnect([this, nodeId]() {
+	        client->onDisconnect([this, nodeId, address]() {
 	            std::lock_guard<std::mutex> lock(nodes_mutex_);
 	            outgoing_nodes_.erase(nodeId);
+	            this->connectedAddresses.erase(address);
 	            
-	            onNodeDisconnected(nodeId);
+	            onNodeDisconnected(address);
 	        });
 
 	        client->onDataReceived([this, nodeId](const std::string& data) {

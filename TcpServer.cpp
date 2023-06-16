@@ -83,6 +83,10 @@ bool invilite::TcpServer::isConnected(const std::string &address) const {
     return it != connected_clients_info_.end();
 }
 
+unsigned int invilite::TcpServer::getConnectionsCount() {
+    return clients_.size();
+}
+
 void invilite::TcpServer::onConnect(const OnConnectCallback &callback) {
     on_connect_callback_ = callback;
 }
