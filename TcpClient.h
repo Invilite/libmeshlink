@@ -25,7 +25,8 @@ public:
     ~TcpClient();
 
     bool connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
-    void disconnect();
+    void disconnect(); // Note: This is also called from the destructor.
+    bool isConnected();
     void send(const std::string& data);
     void send(const char* data, uint32_t dataLen);
 
@@ -38,10 +39,10 @@ public:
 private:
     void receive_data();
 
-    int client_socket_;
+    int clientSocket;
     std::mutex socket_mutex_;
     std::thread receive_thread_;
-    std::atomic<bool> should_disconnect_;
+    std::atomic<bool> connected;
 
     std::function<void()> onConnect_;
     std::function<void()> onDisconnect_;
