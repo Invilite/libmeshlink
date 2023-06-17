@@ -19,15 +19,20 @@ bool NetDiscovery::startListening() {
 
     isListening = true;
     listenerThread = std::thread(&NetDiscovery::listener, this);
+    pthread_setname_np(listenerThread.native_handle(), "NetDiscovery");
     return true;
 }
 
 void NetDiscovery::stopListening() {
     if (isListening) {
         isListening = false;
-        listenerThread.join();
+        shutdown(sockfd, SHUT_RDWR);
         close(sockfd);
         sockfd = -1;
+
+        if(listenerThread.joinable()) {
+            listenerThread.join();
+        }
     }
 }
 

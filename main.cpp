@@ -17,7 +17,7 @@ const std::string serviceName = "meshlinkd";
 const std::string cachePath = "/var/cache/" + serviceName;
 const std::string runDataPath = "/run/" + serviceName;
 
-static bool exitServer = false;
+static std::atomic<bool> exitServer(false);
 static void signalHandler(int signum);
 static invilite::ClientId clientId(cachePath + "/node_id");
 static invilite::NodeList nodeList(cachePath + "/node_list");
@@ -37,8 +37,8 @@ int main(int argc, char** argv) {
     CLI11_PARSE(app, argc, argv);
 
     // Register signals handler
-    //signal(SIGINT, signalHandler);
-    //signal(SIGTERM, signalHandler);
+    signal(SIGINT, signalHandler);
+    signal(SIGTERM, signalHandler);
 
     // Get local network interfaces and addresses
     std::vector<invilite::NetworkInterface> interfacesList;
@@ -91,15 +91,25 @@ int main(int argc, char** argv) {
         //     window.display();
         // }    
     } else {
-        while(!exitServer) {
+        while(!exitServer.load(std::memory_order_relaxed)) {
             usleep(100000); // Sleep na 100ms
         }
     }    
 
-    std::cout << "Exiting ..." << std::endl;
+    try {
+        discovery.stopListening();
+    } catch (const std::exception &e) {
+        std::cerr << "Exception caught when stopping discovery service: " << e.what() << std::endl;
+    }
 
-    discovery.stopListening();
-    mesh.stop();
+    try {
+        std::cout << "Stopping mesh ..." << std::endl;
+        mesh.stop();
+    } catch (const std::exception &e) {
+        std::cerr << "Exception caught when stopping mesh service: " << e.what() << std::endl;
+    }
+
+    std::cout << "Exiting ..." << std::endl;
 
     return 0;
 }
@@ -108,12 +118,12 @@ void signalHandler(int signum) {
     std::cout << "Otrzymano sygnał: " << signum << std::endl;
 
     if (signum == 15) {         // SIGTERM
-        exitServer = true;
+        exitServer.store(true, std::memory_order_relaxed);
     } else if (signum == 2) {   // SIGINT
-        exitServer = true;
+        exitServer.store(true, std::memory_order_relaxed);
     }
 
     // Przywróć domyślną obsługę sygnału i wysyłanie sygnału do procesu
-    signal(signum, SIG_DFL);
-    raise(signum);
+    //signal(signum, SIG_DFL);
+    //raise(signum);
 }

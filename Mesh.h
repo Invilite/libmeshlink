@@ -4,6 +4,7 @@
 #include <thread>
 #include <cstring>
 #include <iostream>
+#include <condition_variable>
 #include "TcpServer.h"
 #include "TcpClient.h"
 #include "IpTools.h"
@@ -32,16 +33,19 @@ namespace invilite {
 		std::vector<std::shared_ptr<TcpClient>> clients;
 		std::thread serverThread;
 
-		std::thread updateConnectionsThread;
+		std::thread nodeManagerThread;
 		int localConnectionsLimit;
 		int globalConnectionsLimit;
 
-		void updateConnections();
+		void nodeManager();
 		void connectToAvailableNodes(const std::set<std::string>& allEntries);
 
 
 	private:
+		std::condition_variable cv;
+		std::mutex cv_m;
 		std::shared_ptr<invilite::TcpClient> getLongestConnectedClient();
+		std::atomic<bool> isRunning = false;
 	};
 }
 

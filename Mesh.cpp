@@ -28,40 +28,50 @@ invilite::Mesh::Mesh(const std::string* nodeId, NodeList* nodeList_): MeshProtoc
 }
 
 void invilite::Mesh::start() {
-	// Start TCP server
+    isRunning = true;
+
+    // Start NodeManager thread
+    nodeManagerThread = std::thread(&invilite::Mesh::nodeManager, this);
+
+	// Start TCP server for incomming connections
 	serverThread = std::thread(&invilite::TcpServer::start, server);
-    serverThread.detach();
-
-    // std::cout << "Connecting to nodes ..." << std::endl;
-    // const std::set<std::string>& allEntries = nodeList->getAll();
-
-    // for (const std::string& entry: allEntries) {
-    //     std::cout << "Connecting to: " << entry << std::endl;
-    //     connectToNode(entry, 8420);
-    // }
-
-    // Start updateConnections thread
-    updateConnectionsThread = std::thread(&invilite::Mesh::updateConnections, this);
-    updateConnectionsThread.detach();
+    pthread_setname_np(serverThread.native_handle(), "TcpServer");
 }
 
 void invilite::Mesh::stop() {
+    std::cout << "Stoping mesh service ..." << std::endl << std::flush;
+    isRunning = false;
+    cv.notify_all();
+
+    server->stop();
+
+    if(nodeManagerThread.joinable()) {
+        nodeManagerThread.join();
+    }
+
     if(serverThread.joinable()) {
         serverThread.join();
     }
 
-    if(updateConnectionsThread.joinable()) {
-        updateConnectionsThread.join();
-    }
+    std::cout << "All threads stoped." << std::endl << std::flush;
 }
 
-void invilite::Mesh::updateConnections() {
-    while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+void invilite::Mesh::nodeManager() {
 
+    std::cout << "Starting NodeManager thread ..." << std::endl << std::flush;
+    pthread_setname_np(pthread_self(), "NodeManager");
+
+    while (isRunning) {
         const std::set<std::string>& allEntries = nodeList->getAll();
         connectToAvailableNodes(allEntries);
+
+        std::unique_lock<std::mutex> lk(cv_m);
+        if(cv.wait_for(lk, std::chrono::milliseconds(500), [&]{return !isRunning;})) {
+            break;
+        }
     }
+
+    std::cout << "Stoping NodeManager thread ..." << std::endl << std::flush;
 }
 
 void invilite::Mesh::connectToAvailableNodes(const std::set<std::string>& allEntries) {

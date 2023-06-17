@@ -117,20 +117,18 @@ bool TcpClient::connect(const std::string& address, const int port, std::chrono:
     }
 
     should_disconnect_ = false;
-
-    std::thread connection_thread(&TcpClient::receive_data, this);
-    connection_thread.detach();
+    receive_thread_ = std::thread(&TcpClient::receive_data, this);
 
     return true;
 }
 
 void TcpClient::disconnect() {
     should_disconnect_ = true;
+    shutdown(client_socket_, SHUT_RD);
+
     if (receive_thread_.joinable()) {
         receive_thread_.join();
     }
-    close(client_socket_);
-    client_socket_ = -1;
     if (onDisconnect_) {
         onDisconnect_();
     }
@@ -161,6 +159,8 @@ void TcpClient::onDataReceived(std::function<void(const std::string& data)> onDa
 }
 
 void TcpClient::receive_data() {
+    pthread_setname_np(pthread_self(), "OutgoingConn");
+
     char buffer[1024];
     ssize_t bytes_received;
     while (!should_disconnect_) {
@@ -179,6 +179,10 @@ void TcpClient::receive_data() {
             break;
         }
     }
+
+    shutdown(client_socket_, SHUT_RDWR);
+    close(client_socket_);
+    client_socket_ = -1;
 }
 
 unsigned int TcpClient::getConnectionTime() const {

@@ -9,10 +9,17 @@ invilite::TcpServer::~TcpServer() {
 }
 
 void invilite::TcpServer::start() {
+    stopServer = false;
     server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket_ == -1) {
         std::cerr << "Error: Cannot create socket" << std::endl;
         return;
+    }
+
+    int opt = 1;
+    if (setsockopt(server_socket_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(int)) == -1) {
+        perror("setsockopt");
+        exit(1);
     }
 
     sockaddr_in server_address;
@@ -32,31 +39,74 @@ void invilite::TcpServer::start() {
 
     std::cout << "Server listening on port " << this->port << std::endl;
 
-    while (true) {
-        sockaddr_in clientAddress;
-        socklen_t clientAddressLength = sizeof(clientAddress);
-        int clientSocket = accept(server_socket_, (struct sockaddr *)&clientAddress, &clientAddressLength);
-        if (clientSocket < 0) {
-            std::cerr << "Error: Cannot accept client connection" << std::endl;
-            continue;
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(server_socket_, &read_fds);
+
+    while (!stopServer) {
+        // Set up timeout for select.
+        struct timeval timeout;
+        timeout.tv_sec = 1;  // Set timeout to 1 second.
+        timeout.tv_usec = 0;
+
+        fd_set current_fds = read_fds; // Copy fd set, select may alter it.
+
+        // Wait for a connection, but only for the timeout duration.
+        if (select(server_socket_ + 1, &current_fds, NULL, NULL, &timeout) > 0) {
+            if (!FD_ISSET(server_socket_, &read_fds)) {
+                continue;
+            }
+
+            // We have a connection! Handle it normally.
+            sockaddr_in clientAddress;
+            socklen_t clientAddressLength = sizeof(clientAddress);
+            int clientSocket = accept(server_socket_, (struct sockaddr *)&clientAddress, &clientAddressLength);
+
+            if (clientSocket < 0) {
+                std::cerr << "Error: Cannot accept client connection" << std::endl;
+                continue;
+            }
+
+            std::string clientIp = inet_ntoa(clientAddress.sin_addr);
+            const int clientPort = ntohs(clientAddress.sin_port);
+            std::cout << "Connected client: " << clientIp << ":" << clientPort << std::endl << std::flush;
+
+            {
+                std::unique_lock<std::mutex> lock(clients_mutex_);
+                clients_.push_back(std::make_shared<ClientHandler>(clientSocket));
+            }
+
+            {
+                std::unique_lock<std::mutex> lock(clients_info_mutex_);
+                connected_clients_info_.insert(std::make_pair(clientIp, clientPort));
+            }
+
+            std::thread client_thread(&TcpServer::handle_client, this, clients_.back());
+            pthread_setname_np(client_thread.native_handle(), "IncomingConn");
+            //client_thread.detach();
+            client_thread.join();
         }
+    }
 
-        std::string clientIp = inet_ntoa(clientAddress.sin_addr);
-        const int clientPort = ntohs(clientAddress.sin_port);
-        std::cout << "Connected client: " << clientIp << ":" << clientPort << std::endl << std::flush;
+    std::cout << "Server stopped. " << std::endl << std::flush;
+}
 
-        {
-            std::unique_lock<std::mutex> lock(clients_mutex_);
-            clients_.push_back(std::make_shared<ClientHandler>(clientSocket));
-        }
+void invilite::TcpServer::stop() {
+    std::cout << "Server stopping ..." << std::endl << std::flush;
+    stopServer = true;
 
-        {
-            std::unique_lock<std::mutex> lock(clients_info_mutex_);
-            connected_clients_info_.insert(std::make_pair(clientIp, clientPort));
-        }
+    // Close all client sockets
+    std::unique_lock<std::mutex> lock(clients_mutex_);
+    for (auto &client : clients_) {
+        shutdown(client->getSocket(), SHUT_RD);
+    }
+    //clients_.clear();  // Clear the list of clients
+    lock.unlock();  // Unlock the mutex
 
-        std::thread client_thread(&TcpServer::handle_client, this, clients_.back());
-        client_thread.detach();
+    if (server_socket_ != -1) {
+        shutdown(server_socket_, SHUT_RDWR);
+        close(server_socket_);
+        server_socket_ = -1;
     }
 }
 
@@ -126,6 +176,7 @@ void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &cl
         std::string data(buffer, bytes_received);
         on_data_received(client, data);
     }
+    shutdown(client->getSocket(), SHUT_RDWR);
 
     on_client_disconnected(client);
 
@@ -134,11 +185,14 @@ void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &cl
         connected_clients_info_.erase(std::make_pair(client->getClientIp(), client->getClientPort()));
     }
 
-    std::unique_lock<std::mutex> lock(clients_mutex_);
-    auto it = std::find(clients_.begin(), clients_.end(), client);
-    if (it != clients_.end()) {
-        clients_.erase(it);
+    {
+        std::unique_lock<std::mutex> lock(clients_mutex_);
+        auto it = std::find(clients_.begin(), clients_.end(), client);
+        if (it != clients_.end()) {
+            clients_.erase(it);
+        }    
     }
-
+    
     close(client->getSocket());
+    std::cout << "Socket closed ..." << std::endl << std::flush;
 }

@@ -3,6 +3,7 @@
 
 #include <set>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <vector>
 #include <memory>
@@ -25,6 +26,7 @@ public:
     virtual ~TcpServer();
 
     void start();
+    void stop();
     std::vector<std::shared_ptr<ClientHandler>> getClients();
     void sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data);
 
@@ -48,6 +50,7 @@ protected:
 private:
     void handle_client(const std::shared_ptr<ClientHandler> &client);
 
+    std::atomic<bool> stopServer = false;
     const int port;
     int server_socket_;
     std::vector<std::shared_ptr<ClientHandler>> clients_;
