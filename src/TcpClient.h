@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
+#include <sys/uio.h>
 #include <functional>
 #include <arpa/inet.h>
 #include <sys/types.h>
@@ -27,8 +28,9 @@ public:
     bool connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
     void disconnect(); // Note: This is also called from the destructor.
     bool isConnected();
-    void send(const std::string& data);
-    void send(const char* data, uint32_t dataLen);
+    ssize_t send(const std::string& data);
+    ssize_t send(const std::vector<uint8_t>& data);
+    ssize_t send(const uint8_t* data, uint32_t dataLen);
 
     void onConnect(std::function<void()> onConnect);
     void onDisconnect(std::function<void()> onDisconnect);
@@ -37,6 +39,10 @@ public:
     unsigned int getConnectionTime() const;
 
 private:
+    static const std::array<uint16_t, 256> crc16Table;
+    static std::array<uint16_t, 256> generateCRC16Table();
+    static uint16_t calculateCRC16(const std::vector<uint8_t>& data);
+
     void receive_data();
 
     int clientSocket;

@@ -7,7 +7,7 @@ services:
       - "./meshlinkd:/bin/meshlinkd:ro"
     command: /bin/meshlinkd
     networks:
-      mynet:
+      default:
         ipv4_address: 192.168.5.10
 
   meshlink2:
@@ -16,7 +16,7 @@ services:
       - "./meshlinkd:/bin/meshlinkd:ro"
     command: /bin/meshlinkd
     networks:
-      mynet:
+      default:
         ipv4_address: 192.168.5.11
 
   meshlink3:
@@ -25,11 +25,11 @@ services:
       - "./meshlinkd:/bin/meshlinkd:ro"
     command: /bin/meshlinkd
     networks:
-      mynet:
+      default:
         ipv4_address: 192.168.5.12
 
 networks:
-  mynet:
+  default:
     driver: bridge
     ipam:
       driver: default

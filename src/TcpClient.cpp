@@ -1,5 +1,7 @@
 #include "TcpClient.h"
 
+const std::array<uint16_t, 256> invilite::TcpClient::crc16Table = invilite::TcpClient::generateCRC16Table();
+
 invilite::TcpClient::TcpClient() : clientSocket(-1) {}
 
 invilite::TcpClient::~TcpClient() {
@@ -139,25 +141,50 @@ bool invilite::TcpClient::isConnected() {
     return connected;
 }
 
-// TODO: This send method should call second send method
-void invilite::TcpClient::send(const std::string& data) {
-    if (clientSocket == -1) {
-        std::cerr << "Error: socket is closed." << std::endl;
-        return;
-    }
-    long unsigned int sentBytes = ::send(clientSocket, data.c_str(), data.length(), 0);
-    if (sentBytes != data.length()) {
-        std::cerr << "Error: not all bytes were sent" << std::endl;
-    }
+ssize_t invilite::TcpClient::send(const std::string& data) {
+    std::vector<uint8_t> vector(data.begin(), data.end());
+    return this->send(vector);
 }
 
-void invilite::TcpClient::send(const char* data, uint32_t dataLen) {
-    if (clientSocket != -1) {
-        ssize_t sentBytes = ::send(clientSocket, data, dataLen, 0);
-        if (sentBytes != dataLen) {
-            std::cerr << "Error: not all bytes were sent" << std::endl;
-        }
+ssize_t invilite::TcpClient::send(const uint8_t* rawData, uint32_t dataLen) {
+    std::vector<uint8_t> data(rawData, rawData + dataLen);
+    return this->send(data);
+}
+
+ssize_t invilite::TcpClient::send(const std::vector<uint8_t>& packetData) {
+    if (clientSocket == -1) {
+        std::cerr << "Error: socket is closed." << std::endl;
+        return -1;
     }
+
+    const uint8_t  headerSize = 5;
+    const uint32_t packetSize = headerSize + packetData.size() + 2; // Header size, data size and crc size
+    const uint16_t crc = invilite::TcpClient::calculateCRC16(packetData);
+    std::vector<uint8_t> packetHeader;
+    packetHeader.reserve(headerSize);
+
+    // Add packet header
+    packetHeader.push_back(0x01);   // Packet type
+    for (int i = 3; i >= 0; --i) {
+        packetHeader.push_back(static_cast<uint8_t>((packetSize >> (8 * i)) & 0xFF));
+    }
+
+    // Join all buffers (without data copying)
+    struct iovec iov[3];
+    iov[0].iov_base = (void*) packetHeader.data();
+    iov[0].iov_len = packetHeader.size();
+    iov[1].iov_base = (void*) packetData.data();
+    iov[1].iov_len = packetData.size();
+    iov[2].iov_base = (void*)&crc;
+    iov[2].iov_len = sizeof(crc);
+
+    // Send data
+    ssize_t sentBytes = ::writev(clientSocket, iov, 3);
+    if (sentBytes != (ssize_t)packetSize) {
+        std::cerr << "Error: not all bytes were sent" << std::endl;
+    }
+
+    return sentBytes;
 }
 
 void invilite::TcpClient::onConnect(std::function<void()> onConnect) {
@@ -182,6 +209,18 @@ void invilite::TcpClient::receive_data() {
     // Start the main receive loop
     while (connected) {
         bytes_received = recv(clientSocket, buffer, sizeof(buffer), 0);
+
+        std::cout << "Received " << std::to_string(bytes_received) << " bytes from server:\n\r";
+        for (int i = 0; i < bytes_received; i++) {
+            // Drukuj każdy bajt jako liczbę szesnastkową.
+            printf("%02x ", (unsigned char)buffer[i]);
+
+            // Przejście do nowej linii co 16 bajtów.
+            if ((i + 1) % 16 == 0) {
+                printf("\n");
+            }
+        }
+
         if (bytes_received > 0) {
             // Data received
             std::string data(buffer, bytes_received);
@@ -214,4 +253,36 @@ unsigned int invilite::TcpClient::getConnectionTime() const {
     auto now = std::chrono::steady_clock::now();
     auto elapsedDuration = now - connectedTimestamp;
     return std::chrono::duration_cast<std::chrono::seconds>(elapsedDuration).count();
+}
+
+std::array<uint16_t, 256> invilite::TcpClient::generateCRC16Table() {
+    std::array<uint16_t, 256> table;
+    const uint16_t polynomial = 0x1021; // Wielomian dla CRC-16-CCITT.
+
+    for (uint16_t i = 0; i < 256; i++) {
+        uint16_t value = i << 8;
+
+        for (uint8_t j = 0; j < 8; j++) {
+            if (value & 0x8000) {
+                value = (value << 1) ^ polynomial;
+            } else {
+                value <<= 1;
+            }
+        }
+
+        table[i] = value;
+    }
+
+    return table;
+}
+
+uint16_t invilite::TcpClient::calculateCRC16(const std::vector<uint8_t>& data) {
+    uint16_t crc = 0xFFFF;
+
+    for (uint8_t byte : data) {
+        uint8_t index = (crc >> 8) ^ byte;
+        crc = crc16Table[index] ^ (crc << 8);
+    }
+
+    return crc;
 }

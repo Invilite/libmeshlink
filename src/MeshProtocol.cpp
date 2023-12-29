@@ -5,12 +5,13 @@ invilite::MeshProtocol::MeshProtocol(const std::string* nodeId): nodeId(nodeId) 
 }
 
 void invilite::MeshProtocol::connectToNode(const std::string& address, const int port) {
-    auto client = std::make_shared<TcpClient>();
+    std::shared_ptr<invilite::TcpClient> client = std::make_shared<TcpClient>();
 
     client->onConnect([this, client, address]() {
     	{
+    		std::cout << "Dodaje adres do listy: " << address << std::endl;
 	    	std::lock_guard<std::mutex> lock(connectedAddressesMutex);
-	    	std::cout << "Dodaje adres do listy: " << address << std::endl;
+	    	// TODO: Dodać adres do listy przed pomyślnym nawiązaniem połaczenia, ale pamiętać, żeby usunąć, jesli sie nie uda.
 	    	this->connectedAddresses.insert(address);
     	}
         NodeIdPacket nodeIdPacket(*this->nodeId);
@@ -22,33 +23,37 @@ void invilite::MeshProtocol::connectToNode(const std::string& address, const int
         this->connectedAddresses.erase(address);
     });
 
+    // Define simple data receive function, to handle only "node id" packets
     client->onDataReceived([this, client, address](const std::string& data) {
         auto packetHeader = invilite::Serializer::getHeader(data);
         if (packetHeader == MeshPacket::NODE_ID_PACKET) {
         	NodeIdPacket nodeIdPacket = NodeIdPacket::unpack(data);
         	const std::string nodeId = nodeIdPacket.nodeId;
 
-        	// Loop connection
+        	// Detect loop connection
         	if (nodeId == *this->nodeId) {
         		std::cout << "Loop connection detected, disconnecting!" << std::endl;
         		client->disconnect();
         	}
 
         	{
-	            std::lock_guard<std::mutex> lock(nodes_mutex_);
+        		// Register outgoing connection
+	            std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
 	            outgoing_nodes_[nodeId] = client;
 	        }
 
-            onNodeConnected(nodeId);
-
 	        client->onDisconnect([this, nodeId, address]() {
-	            std::lock_guard<std::mutex> lock(nodes_mutex_);
+	            std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
+	            std::lock_guard<std::mutex> lockconnectedAddresses(connectedAddressesMutex);
 	            outgoing_nodes_.erase(nodeId);
 	            this->connectedAddresses.erase(address);
 	            
 	            onNodeDisconnected(address);
 	        });
 
+	        onNodeConnected(nodeId);
+
+	        // Redefine data receive function, to handle all protocol communications
 	        client->onDataReceived([this, nodeId](const std::string& data) {
 	        	auto packetHeader = invilite::Serializer::getHeader(data);
 	        	switch(packetHeader) {
@@ -61,6 +66,7 @@ void invilite::MeshProtocol::connectToNode(const std::string& address, const int
         }
     });
 
+    // Start connection
     client->connect(address, port);
 }
 

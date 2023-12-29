@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "ClientHandler.h"
+#include "debug.h"
 
 namespace invilite {
 
@@ -48,6 +49,9 @@ protected:
     virtual void on_data_received(const std::shared_ptr<ClientHandler> &client, const std::string &data);
 
 private:
+    static const std::array<uint16_t, 256> crc16Table;
+    static std::array<uint16_t, 256> generateCRC16Table();
+    static uint16_t calculateCRC16(const std::vector<uint8_t>& data);
     void handle_client(const std::shared_ptr<ClientHandler> &client);
 
     std::atomic<bool> stopServer = false;

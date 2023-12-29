@@ -1,5 +1,7 @@
 #include "TcpServer.h"
 
+const std::array<uint16_t, 256> invilite::TcpServer::crc16Table = invilite::TcpServer::generateCRC16Table();
+
 invilite::TcpServer::TcpServer(const int port) : port(port), server_socket_(-1) {}
 
 invilite::TcpServer::~TcpServer() {
@@ -173,8 +175,15 @@ void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &cl
     char buffer[1024];
     ssize_t bytes_received;
     while ((bytes_received = recv(client->getSocket(), buffer, sizeof(buffer), 0)) > 0) {
+
+        PrintBuffer(buffer, bytes_received, 5);
+        // 1. Decode header if buffer is larger that header size
+        // 2. Wait for buffer to be size of packetSize
+        // 3. Validate CRC16
+        // 4. If CRC is valid call on_data_received callback
+
         std::string data(buffer, bytes_received);
-        on_data_received(client, data);
+        //on_data_received(client, data);
     }
     shutdown(client->getSocket(), SHUT_RDWR);
 
@@ -195,4 +204,36 @@ void invilite::TcpServer::handle_client(const std::shared_ptr<ClientHandler> &cl
     
     close(client->getSocket());
     std::cout << "Socket closed ..." << std::endl << std::flush;
+}
+
+std::array<uint16_t, 256> invilite::TcpServer::generateCRC16Table() {
+    std::array<uint16_t, 256> table;
+    const uint16_t polynomial = 0x1021; // Wielomian dla CRC-16-CCITT.
+
+    for (uint16_t i = 0; i < 256; i++) {
+        uint16_t value = i << 8;
+
+        for (uint8_t j = 0; j < 8; j++) {
+            if (value & 0x8000) {
+                value = (value << 1) ^ polynomial;
+            } else {
+                value <<= 1;
+            }
+        }
+
+        table[i] = value;
+    }
+
+    return table;
+}
+
+uint16_t invilite::TcpServer::calculateCRC16(const std::vector<uint8_t>& data) {
+    uint16_t crc = 0xFFFF;
+
+    for (uint8_t byte : data) {
+        uint8_t index = (crc >> 8) ^ byte;
+        crc = crc16Table[index] ^ (crc << 8);
+    }
+
+    return crc;
 }

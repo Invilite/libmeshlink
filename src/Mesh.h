@@ -1,6 +1,7 @@
 #ifndef MESH_H
 #define MESH_H
 
+#include <list>
 #include <thread>
 #include <cstring>
 #include <iostream>
@@ -12,10 +13,16 @@
 #include "ClientId.h"
 #include "MeshProtocol.h"
 
+struct NodeAddress {
+    std::string address;
+    uint16_t port;
+    bool newOnList;
+};
+
 namespace invilite {
 	class Mesh: public MeshProtocol {
 	public:
-		Mesh(const std::string* nodeId, NodeList* nodeList_);
+		Mesh(const std::string* nodeId);
 		virtual ~Mesh() = default;
 		void start();
 		void stop();
@@ -25,23 +32,20 @@ namespace invilite {
     	void onDataReceived(const std::string& nodeId, const std::string& dataName, const std::string& message);
 
     	// TODO: Implement this
-    	void addNode(const std::string& address, const int port);
+    	void addNode(const std::string& address, const uint16_t port);
 
 	protected:
 		const std::shared_ptr<invilite::TcpServer> server;
-		invilite::NodeList* nodeList;
 		std::vector<std::shared_ptr<TcpClient>> clients;
 		std::thread serverThread;
 
 		std::thread nodeManagerThread;
-		int localConnectionsLimit;
-		int globalConnectionsLimit;
+		std::list<NodeAddress> nodeAddressList;
 
 		void nodeManager();
-		void connectToAvailableNodes(const std::set<std::string>& allEntries);
-
 
 	private:
+		std::mutex nodeAddressListMutex;
 		std::condition_variable cv;
 		std::mutex cv_m;
 		std::shared_ptr<invilite::TcpClient> getLongestConnectedClient();

@@ -1,17 +1,20 @@
-#include <iostream>
-#include <cstring>
+#include <uv.h>     // libuv1-dev
+#include <cli.h>
 #include <thread>
 #include <memory>
-#include <uv.h>     // libuv1-dev
 #include <csignal>
+#include <cstring>
+#include <iostream>
 #include <unistd.h> // usleep
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/stdout_color_sinks.h>
+#include <spdlog/fmt/fmt.h>
 #include "Mesh.h"
 #include "ClientId.h"
 #include "Serializer.h"
 #include "NetDiscovery.h"
 #include "IpTools.h"
 //#include "Graph.h"
-#include "cli.h"
 
 const std::string serviceName = "meshlinkd";
 const std::string cachePath = "/var/cache/" + serviceName;
@@ -22,17 +25,20 @@ static void signalHandler(int signum);
 static invilite::ClientId clientId(cachePath + "/node_id");
 static invilite::NodeList nodeList(cachePath + "/node_list");
 static const std::string nodeId = clientId.getId();
-static invilite::Mesh mesh(&nodeId, &nodeList);
+static invilite::Mesh mesh(&nodeId);
 
 NetDiscovery discovery(8420);
 
 int main(int argc, char** argv) {
+    //spdlog::info("Meshlinkd P2P Information Exchange Service");
     CLI::App app{"Meshlinkd P2P Information Exchange Service"};
     //std::string filename;
     //app.add_option("-f,--file", filename, "File name")->required();
 
     bool showGraph = false;
+    bool daemon = false;
     app.add_flag("-g,--graph", showGraph, "Show connection graph");
+    app.add_flag("-d,--daemon", daemon, "Run as daemon");
 
     CLI11_PARSE(app, argc, argv);
 
@@ -44,11 +50,18 @@ int main(int argc, char** argv) {
     std::vector<invilite::NetworkInterface> interfacesList;
     invilite::IpTools::getLocalInterfaces(&interfacesList);
 
+    // Load known node addresses from cache file
+    const std::set<std::string>& allEntries = nodeList.getAll();
+    for (const std::string& address: allEntries) {
+        mesh.addNode(address, 8420);
+    }
+
     // Discover other nodes in local network
 	discovery.onDiscover([&interfacesList](const std::string &address) {
         if (!invilite::IpTools::isLocalAddress(&interfacesList, address)) {
             if (nodeList.add(address)) {
                 std::cout << "New node discovered in network [" << address << "]" << std::endl;
+                mesh.addNode(address, 8420);
             }
         }
     });
