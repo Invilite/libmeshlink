@@ -8,20 +8,21 @@
 #include <sstream>
 #include <algorithm>
 #include "File.h"
+#include "Node.h"
 
 namespace invilite {
 
 class NodeList: public File {
 public:
     NodeList(const std::string& filePath);
-    bool add(const std::vector<std::string>& addresses);
-    bool add(const std::string& address);
-    void remove(const std::string& address);
-    const std::set<std::string>& getAll() const;
+    bool add(const std::vector<Node>& nodes);
+    bool add(const Node& node);
+    void remove(const Node& node);
+    const std::set<Node>& getAll() const;
 
     // Implementing iterators
-    using iterator = std::set<std::string>::iterator;
-    using const_iterator = std::set<std::string>::const_iterator;
+    using iterator = std::set<Node>::iterator;
+    using const_iterator = std::set<Node>::const_iterator;
 
     iterator begin() {
         return list.begin();
@@ -45,7 +46,7 @@ public:
 
 
 protected:
-    std::set<std::string> list;
+    std::set<Node> list;
 
 private:
     std::mutex list_mutex;

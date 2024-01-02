@@ -72,9 +72,6 @@ public:
     void stopServer();
 
 protected:
-    // Connect to other server, send clientId, and wait for response with server client id, add new item to out_clients
-    void connectToNode(const std::string& address, const int port);
-
     // virtual void processData(const std::string& clientId, const std::string& dataName, void* data, uint32_t dataLen) = 0;
 
     // Call this after in or out connection connect

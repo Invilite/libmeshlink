@@ -3,6 +3,7 @@
 
 #include <list>
 #include <thread>
+#include <future>
 #include <cstring>
 #include <iostream>
 #include <condition_variable>
@@ -12,6 +13,7 @@
 #include "NodeList.h"
 #include "ClientId.h"
 #include "MeshProtocol.h"
+#include "NodeConnection.h"
 
 struct NodeAddress {
     std::string address;
@@ -20,9 +22,9 @@ struct NodeAddress {
 };
 
 namespace invilite {
-	class Mesh: public MeshProtocol {
+	class Mesh {
 	public:
-		Mesh(const std::string* nodeId);
+		Mesh(const uint16_t port, const invilite::ClientId* nodeId, const std::vector<uint32_t> networkSecretKey);
 		virtual ~Mesh() = default;
 		void start();
 		void stop();
@@ -36,19 +38,33 @@ namespace invilite {
 
 	protected:
 		const std::shared_ptr<invilite::TcpServer> server;
-		std::vector<std::shared_ptr<TcpClient>> clients;
-		std::thread serverThread;
+		// Nodes after successful handshake
+		// std::mutex connectionsMutex;
+		// std::unordered_map<int, std::shared_ptr<NodeConnection>> connections;
+
+		// Active connections (incomming)
+		std::mutex incommingConnectionsMutex;
+	    std::unordered_map<int, std::shared_ptr<NodeConnection>> incommingConnections;
+
+	    // Active connections (outgoing)
+	    std::mutex outgoingConnectionsMutex;
+	    std::unordered_map<int, std::shared_ptr<NodeConnection>> outgoingConnections;
 
 		std::thread nodeManagerThread;
 		std::list<NodeAddress> nodeAddressList;
 
 		void nodeManager();
+		void connectionThread(std::shared_ptr<NodeConnection> connection, std::function<void()> onDisconnect);
+
+		// Connect to other server, send clientId, and wait for response with server client id, add new item to out_clients
+    	void connectToNode(const std::string& address, const int port);
 
 	private:
+		const invilite::ClientId* nodeId;
+		const std::vector<uint32_t> networkSecretKey;
 		std::mutex nodeAddressListMutex;
 		std::condition_variable cv;
 		std::mutex cv_m;
-		std::shared_ptr<invilite::TcpClient> getLongestConnectedClient();
 		std::atomic<bool> isRunning = false;
 	};
 }

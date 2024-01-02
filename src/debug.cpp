@@ -2,18 +2,18 @@
 
 void PrintBuffer(const char* buffer, int length, int headerLen) {
 
-    //const uint32_t *packetSize = reinterpret_cast<const uint32_t*>(&buffer[1]);
-    uint32_t packetSize = 0;
-    packetSize |= static_cast<uint32_t>(buffer[1]) << 24;
-    packetSize |= static_cast<uint32_t>(buffer[2]) << 16;
-    packetSize |= static_cast<uint32_t>(buffer[3]) << 8;
-    packetSize |= static_cast<uint32_t>(buffer[4]);
+    // Calculate packet size from header
+    // uint32_t packetSize = 0;
+    // packetSize |= static_cast<uint32_t>(buffer[1]) << 24;
+    // packetSize |= static_cast<uint32_t>(buffer[2]) << 16;
+    // packetSize |= static_cast<uint32_t>(buffer[3]) << 8;
+    // packetSize |= static_cast<uint32_t>(buffer[4]);
+    // printf("Packet size: %d\n", packetSize);
 
-    printf("Packet size: %d\n", packetSize);
     for (int i = 0; i < length; i++) {
     	if (i < headerLen) {
     		printf("\u001b[38;5;212m");
-    	} else if (i >= length - 2) {
+    	} else if (i >= length - 32) {
     		printf("\u001b[38;5;80m");
     	} else {
         	printf("\u001b[38;5;118m");

@@ -1,4 +1,3 @@
-#include <uv.h>     // libuv1-dev
 #include <cli.h>
 #include <thread>
 #include <memory>
@@ -14,33 +13,38 @@
 #include "Serializer.h"
 #include "NetDiscovery.h"
 #include "IpTools.h"
-//#include "Graph.h"
 
 const std::string serviceName = "meshlinkd";
-const std::string cachePath = "/var/cache/" + serviceName;
+const std::string cachePath = "/var/lib/" + serviceName;
 const std::string runDataPath = "/run/" + serviceName;
+
+// 512 bits password (64 bytes)
+static const std::vector<uint32_t> networkSecretKey = {
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000,
+    0x00000000, 0x00000000, 0x00000000, 0x00000000
+};
 
 static std::atomic<bool> exitServer(false);
 static void signalHandler(int signum);
 static invilite::ClientId clientId(cachePath + "/node_id");
 static invilite::NodeList nodeList(cachePath + "/node_list");
-static const std::string nodeId = clientId.getId();
-static invilite::Mesh mesh(&nodeId);
-
-NetDiscovery discovery(8420);
 
 int main(int argc, char** argv) {
-    //spdlog::info("Meshlinkd P2P Information Exchange Service");
-    CLI::App app{"Meshlinkd P2P Information Exchange Service"};
+    spdlog::info("Mesh network information exchange service");
+    CLI::App app{"Mesh network information exchange service"};
     //std::string filename;
     //app.add_option("-f,--file", filename, "File name")->required();
 
-    bool showGraph = false;
     bool daemon = false;
-    app.add_flag("-g,--graph", showGraph, "Show connection graph");
     app.add_flag("-d,--daemon", daemon, "Run as daemon");
 
+    // Parse command line arguments
     CLI11_PARSE(app, argc, argv);
+
+    // Set logger level
+    spdlog::set_level(spdlog::level::trace);
 
     // Register signals handler
     signal(SIGINT, signalHandler);
@@ -50,64 +54,42 @@ int main(int argc, char** argv) {
     std::vector<invilite::NetworkInterface> interfacesList;
     invilite::IpTools::getLocalInterfaces(&interfacesList);
 
+    uint16_t port = 8420;
+    invilite::Mesh mesh(port, &clientId, networkSecretKey);
+
     // Load known node addresses from cache file
-    const std::set<std::string>& allEntries = nodeList.getAll();
-    for (const std::string& address: allEntries) {
-        mesh.addNode(address, 8420);
+    const std::set<Node>& allEntries = nodeList.getAll();
+    for (const Node& node: allEntries) {
+        mesh.addNode(node.address, node.port);
     }
 
+    // Starting mesh network ...
+    spdlog::debug("Starting mesh network with local id \"{}\" ...", clientId.getIdAsString());
+    mesh.start();
+
+    NetDiscovery discovery(8420);
+
     // Discover other nodes in local network
-	discovery.onDiscover([&interfacesList](const std::string &address) {
+    discovery.onDiscover([&interfacesList, &mesh](const std::string &address) {
         if (!invilite::IpTools::isLocalAddress(&interfacesList, address)) {
-            if (nodeList.add(address)) {
-                std::cout << "New node discovered in network [" << address << "]" << std::endl;
+            if (nodeList.add({address, 8420})) {
+                //std::cout << "New node discovered in local network [" << address << "]" << std::endl;
+                spdlog::debug("New node discovered in local network [{}]", address);
                 mesh.addNode(address, 8420);
             }
         }
     });
-	discovery.startListening();
+    discovery.startListening();
 
-    // Starting mesh network ...
-	std::cout << "Starting mesh network with local id \"" << nodeId << "\" ..." << std::endl;
-    mesh.start();
-
-    usleep(100000); // Sleep na 100ms
+    //usleep(100000); // Sleep na 100ms
     // Discovery service should broadcast periodically only when there is no connection to any peer,
     // after connecting to any other node, node list will be downloaded
     discovery.discovery();
-    usleep(1000000); // Sleep na 1000ms
+    //usleep(1000000); // Sleep na 1000ms
 
-    if (showGraph) {
-        // sf::RenderWindow window(sf::VideoMode(1024, 768), "Nodes and Connections");
-        // window.clear(sf::Color::Black);
-
-        // sf::Font font;
-        // if (!font.loadFromFile("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")) {
-        //     return -1;
-        // }
-
-        // Graph graph(font, window.getSize());
-        // graph.addNode("abc1", {"def2", "ghi3"});
-        // graph.addNode("def2", {"ghi3"});
-        // graph.addNode("ghi3", {});
-
-        // while (window.isOpen()) {
-        //     sf::Event event;
-        //     while (window.pollEvent(event)) {
-        //         if (event.type == sf::Event::Closed) {
-        //             window.close();
-        //         }
-        //     }
-
-        //     window.clear(sf::Color::Black);
-        //     graph.draw(window);
-        //     window.display();
-        // }    
-    } else {
-        while(!exitServer.load(std::memory_order_relaxed)) {
-            usleep(100000); // Sleep na 100ms
-        }
-    }    
+    while(!exitServer.load(std::memory_order_relaxed)) {
+        usleep(100000); // Sleep na 100ms
+    }
 
     try {
         discovery.stopListening();

@@ -4,72 +4,6 @@ invilite::MeshProtocol::MeshProtocol(const std::string* nodeId): nodeId(nodeId) 
 	std::lock_guard<std::mutex> lock(nodes_mutex_);
 }
 
-void invilite::MeshProtocol::connectToNode(const std::string& address, const int port) {
-    std::shared_ptr<invilite::TcpClient> client = std::make_shared<TcpClient>();
-
-    client->onConnect([this, client, address]() {
-    	{
-    		std::cout << "Dodaje adres do listy: " << address << std::endl;
-	    	std::lock_guard<std::mutex> lock(connectedAddressesMutex);
-	    	// TODO: Dodać adres do listy przed pomyślnym nawiązaniem połaczenia, ale pamiętać, żeby usunąć, jesli sie nie uda.
-	    	this->connectedAddresses.insert(address);
-    	}
-        NodeIdPacket nodeIdPacket(*this->nodeId);
-        sendDataTo(client, nodeIdPacket);
-    });
-
-    client->onDisconnect([this, address]() {
-    	std::lock_guard<std::mutex> lock(connectedAddressesMutex);
-        this->connectedAddresses.erase(address);
-    });
-
-    // Define simple data receive function, to handle only "node id" packets
-    client->onDataReceived([this, client, address](const std::string& data) {
-        auto packetHeader = invilite::Serializer::getHeader(data);
-        if (packetHeader == MeshPacket::NODE_ID_PACKET) {
-        	NodeIdPacket nodeIdPacket = NodeIdPacket::unpack(data);
-        	const std::string nodeId = nodeIdPacket.nodeId;
-
-        	// Detect loop connection
-        	if (nodeId == *this->nodeId) {
-        		std::cout << "Loop connection detected, disconnecting!" << std::endl;
-        		client->disconnect();
-        	}
-
-        	{
-        		// Register outgoing connection
-	            std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
-	            outgoing_nodes_[nodeId] = client;
-	        }
-
-	        client->onDisconnect([this, nodeId, address]() {
-	            std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
-	            std::lock_guard<std::mutex> lockconnectedAddresses(connectedAddressesMutex);
-	            outgoing_nodes_.erase(nodeId);
-	            this->connectedAddresses.erase(address);
-	            
-	            onNodeDisconnected(address);
-	        });
-
-	        onNodeConnected(nodeId);
-
-	        // Redefine data receive function, to handle all protocol communications
-	        client->onDataReceived([this, nodeId](const std::string& data) {
-	        	auto packetHeader = invilite::Serializer::getHeader(data);
-	        	switch(packetHeader) {
-	        	case MeshPacket::NAMED_STRING_PACKET:
-	        		NamedStringPacket namedStringPacket = NamedStringPacket::unpack(data);
-	        		onDataReceived(nodeId, namedStringPacket.dataName, namedStringPacket.data);
-	        		break;
-	        	}
-            });
-        }
-    });
-
-    // Start connection
-    client->connect(address, port);
-}
-
 void invilite::MeshProtocol::sendDataTo(const std::string& nodeId, const std::string& dataName, const std::string& data) {
 	NamedStringPacket namedStringPacket(dataName, data);
 	sendDataTo(nodeId, namedStringPacket);
@@ -91,7 +25,7 @@ void invilite::MeshProtocol::sendDataTo(const std::string& nodeId, T& packet) {
 template <typename T>
 void invilite::MeshProtocol::sendDataTo(std::shared_ptr<TcpClient> client, T& packet) {
 	std::string packedData = packet.pack();
-	client->send(packedData);
+	//client->send(packedData);
 }
 
 void invilite::MeshProtocol::onConnect(const std::shared_ptr<invilite::ClientHandler> &client) {

@@ -1,7 +1,9 @@
+# sudo apt install libcrypto++8
+
 CXX = g++
 MAKEFLAGS += -j$(nproc)
 CXXFLAGS = -std=c++17 -O2 -Wall -Wextra -pedantic
-LDFLAGS = -pthread -static -static-libstdc++ -static-libgcc
+LDFLAGS = -pthread -lcryptopp -static -static-libstdc++ -static-libgcc
 #LDFLAGS = -pthread -lsfml-graphics -lsfml-window -lsfml-system
 
 TARGET = meshlinkd

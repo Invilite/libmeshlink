@@ -2,12 +2,19 @@
 #define CLIENT_ID_H
 
 #include <ctime>
+#include <array>
+#include <cctype>
 #include <random>
 #include <string>
+#include <iomanip>
+#include <cpuid.h>
 #include <cstring>
 #include <sstream>
 #include <fstream>
+#include <unistd.h>
 #include <iostream>
+#include <crypto++/sha.h>
+#include <crypto++/hex.h>
 
 #include "File.h"
 
@@ -16,16 +23,18 @@ namespace invilite {
 class ClientId : public File {
 public:
     ClientId(const std::string& filePath);
-    std::string getId() const;
+    std::string getIdAsString() const;
 
 protected:
-    std::string generateId();
-    std::string getRandomString(size_t length);
-    std::string getHardwareUniqueId();
-    std::string getTimePart();
+    void generateId();
+    void getRandomBytes(uint8_t* output, size_t length);
+    void getHardwareId(uint8_t* output, size_t length);
+    void getTimeBytes(uint8_t* output, size_t length);
 
 private:
+    uint8_t id[16];
     std::string id_;
+    bool getCpuId(std::array<uint32_t, 4>& cpu_id);
 };
 
 } // namespace invilite

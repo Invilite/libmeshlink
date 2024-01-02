@@ -1,6 +1,5 @@
 #include "NodeList.h"
 
-
 invilite::NodeList::NodeList(const std::string& filePath) : File(filePath) {
     // Load client addresses from file
     read();
@@ -8,11 +7,11 @@ invilite::NodeList::NodeList(const std::string& filePath) : File(filePath) {
 }
 
 // Add a single client address or a vector of addresses to the list and update the content of the file
-bool invilite::NodeList::add(const std::vector<std::string>& addresses) {
+bool invilite::NodeList::add(const std::vector<Node>& nodes) {
     bool fileUpdated = false;
     std::lock_guard<std::mutex> lock(list_mutex);
-    for (const auto& address : addresses) {
-        if (list.insert(address).second) {
+    for (const auto& node : nodes) {
+        if (list.insert(node).second) {
             fileUpdated = true;
         }
     }
@@ -25,37 +24,40 @@ bool invilite::NodeList::add(const std::vector<std::string>& addresses) {
 }
 
 // Add client address to the list and update the content of the files
-bool invilite::NodeList::add(const std::string& address) {
-    std::vector<std::string> addresses{address};
-    return add(addresses);
+bool invilite::NodeList::add(const Node& node) {
+    return add(std::vector<Node>{node});
 }
 
 // Remove client address from the list and update the content of the file
-void invilite::NodeList::remove(const std::string& address) {
+void invilite::NodeList::remove(const Node& node) {
     std::lock_guard<std::mutex> lock(list_mutex);
-    if (list.erase(address) > 0) {
+    if (list.erase(node) > 0) {
         updateContent();
     }
 }
 
-const std::set<std::string>& invilite::NodeList::getAll() const {
+const std::set<Node>& invilite::NodeList::getAll() const {
     return list;
 }
 
 void invilite::NodeList::parseContent() {
-    std::istringstream iss(content());
+    std::istringstream iss(getContentAsString());
     std::string line;
     while (std::getline(iss, line)) {
-        list.insert(line);
+        std::istringstream lineStream(line);
+        Node node;
+        lineStream >> node.address;
+        lineStream >> node.port;
+        list.insert(node);
     }
 }
 
 void invilite::NodeList::updateContent() {
     std::ostringstream oss;
-    for (const auto& address: list) {
-        oss << address << std::endl;
+    for (const auto& node: list) {
+        oss << node.address << " " << node.port << std::endl;
     }
-    content(oss.str());
+    this->setContent(oss.str());
     write();
 }
 

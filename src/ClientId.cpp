@@ -1,51 +1,99 @@
 #include "ClientId.h"
 
-invilite::ClientId::ClientId(const std::string& filePath): File(filePath) {
+invilite::ClientId::ClientId(const std::string& filePath): File(filePath, public_perms) {
     if (!read()) {
-        id_ = generateId();
-        content(id_);
+        generateId();
+        this->setContent(id, sizeof(id));
         write();
     } else {
-        id_ = content();
+        this->copyContentToByteArray(id, sizeof(id));
     }
 }
 
-std::string invilite::ClientId::getId() const {
-    return id_;
+std::string invilite::ClientId::getIdAsString() const {
+    std::stringstream ss;
+    for (int i = 0; i < 16; ++i) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(id[i]);
+        if (i == 3 || i == 7 || i == 11) {
+            ss << "-";
+        }
+    }
+    return ss.str();
 }
 
-std::string invilite::ClientId::getRandomString(size_t length) {
-    static const std::string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+void invilite::ClientId::getRandomBytes(uint8_t* output, size_t length) {
     std::random_device rd;
     std::mt19937 gen(rd());
-    std::uniform_int_distribution<> distrib(0, chars.size() - 1);
-
-    std::string random_string;
-    random_string.reserve(length);
+    std::uniform_int_distribution<uint8_t> distrib(0, 255);
 
     for (size_t i = 0; i < length; ++i) {
-        random_string.push_back(chars[distrib(gen)]);
+        output[i] = distrib(gen);
+    }
+}
+
+void invilite::ClientId::getHardwareId(uint8_t* output, size_t length) {
+    std::string hardwareId;
+
+    // Prepare generator of random data
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist(0, UINT32_MAX);
+
+    // Try to read machine id
+    std::ifstream file("/etc/machine-id");
+    std::stringstream buffer;
+    if (file) {
+        buffer << file.rdbuf();
+        file.close();
+        hardwareId = buffer.str();
     }
 
-    return random_string;
+    if (hardwareId.empty()) {
+        // Get CPU id
+        std::array<uint32_t, 4> cpuId = {0};
+        if (!this->getCpuId(cpuId)) {
+            // Fallback for random data
+            for (uint32_t &val : cpuId) {
+                val = dist(gen);
+            }
+        }
+
+        // Get host id
+        long hostId = gethostid();
+
+        // Combine cpuId with hostId
+        std::stringstream ss;
+        for (uint32_t val : cpuId) {
+            ss << std::hex << std::setw(8) << std::setfill('0') << val;
+        }
+        ss << std::hex << std::setw(8) << std::setfill('0') << hostId;
+
+        hardwareId = ss.str();
+    }
+
+    CryptoPP::SHA1 sha1;
+    CryptoPP::byte digest[CryptoPP::SHA1::DIGESTSIZE];
+    sha1.CalculateDigest(digest, reinterpret_cast<const CryptoPP::byte*>(hardwareId.data()), hardwareId.size());
+    size_t bytesToCopy = std::min(length, sizeof(digest));
+    std::memcpy(output, digest, bytesToCopy);
 }
 
-std::string invilite::ClientId::getHardwareUniqueId() {
-    return getRandomString(6) + "-" + getRandomString(8);
+void invilite::ClientId::generateId() {
+    this->getHardwareId(id, 8);
+    this->getRandomBytes(id + 8, 4);
+    this->getTimeBytes(id + 12, 4);
 }
 
-std::string invilite::ClientId::generateId() {
-    std::string hardwareId = getHardwareUniqueId();
-    std::string random_part = getRandomString(6);
-    std::string time_part = getTimePart();
+void invilite::ClientId::getTimeBytes(uint8_t* output, size_t length) {
+    auto now = std::chrono::system_clock::now();
+    auto duration = now.time_since_epoch();
+    auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
 
-    return hardwareId + "-" + random_part + "-" + time_part;
+    // Kopiujemy bajty z millis do output, ale nie więcej niż length bajtów
+    size_t bytesToCopy = std::min(length, sizeof(millis));
+    std::memcpy(output, &millis, bytesToCopy);
 }
 
-std::string invilite::ClientId::getTimePart() {
-    std::time_t now = std::time(nullptr);
-    std::stringstream ss;
-    ss << std::hex << now;
-
-    return ss.str();
+bool invilite::ClientId::getCpuId(std::array<uint32_t, 4>& cpu_id) {
+    return __get_cpuid(0, &cpu_id[0], &cpu_id[1], &cpu_id[2], &cpu_id[3]);
 }
