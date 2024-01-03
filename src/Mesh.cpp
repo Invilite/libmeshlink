@@ -13,11 +13,34 @@
 using namespace invilite;
 using std::make_shared;
 
-Mesh::Mesh(const uint16_t port, const ClientId* nodeId, const std::vector<uint32_t> networkSecretKey): server(make_shared<TcpServer>(port)), nodeId(nodeId), networkSecretKey(networkSecretKey) {
+Mesh::Mesh(const uint16_t port, const ClientId* nodeId, const std::vector<uint32_t> networkSecretKey): server(make_shared<TcpServer>(port)), nodeId(nodeId) {
+    this->networkSecret.resize(networkSecretKey.size() * sizeof(uint32_t));
+    std::memcpy(this->networkSecret.BytePtr(), networkSecretKey.data(), this->networkSecret.size());
+
 	// Handle server connections
 	server->onConnect([this](int clientSocket, sockaddr_storage* clientAddress) {
 
-        std::shared_ptr<NodeConnection> incommingConnection = std::make_shared<NodeConnection>(clientSocket, this->nodeId, this->networkSecretKey);
+        char addressBuffer[INET6_ADDRSTRLEN];
+        uint16_t port;
+
+        if (clientAddress->ss_family == AF_INET) {
+            // Przychodzące połączenie IPv4
+            const sockaddr_in* addr4 = reinterpret_cast<const sockaddr_in*>(clientAddress);
+            inet_ntop(AF_INET, &addr4->sin_addr, addressBuffer, sizeof(addressBuffer));
+            port = ntohs(addr4->sin_port);
+            spdlog::debug("onConnect: Incomming IPv4 connection from {} on port {}", addressBuffer, port);
+        } else if (clientAddress->ss_family == AF_INET6) {
+            // Przychodzące połączenie IPv6
+            const sockaddr_in6* addr6 = reinterpret_cast<const sockaddr_in6*>(clientAddress);
+            inet_ntop(AF_INET6, &addr6->sin6_addr, addressBuffer, sizeof(addressBuffer));
+            port = ntohs(addr6->sin6_port);
+            spdlog::debug("onConnect: Incomming IPv6 connection from {} on port {}", addressBuffer, port);
+        } else {
+            // Nieznany typ adresu
+            spdlog::error("onConnect: Incomming connection unknown address family");
+        }
+
+        std::shared_ptr<NodeConnection> incommingConnection = std::make_shared<NodeConnection>(clientSocket, this->nodeId, this->networkSecret);
 
         std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
         this->incommingConnections[clientSocket] = incommingConnection;
@@ -25,7 +48,7 @@ Mesh::Mesh(const uint16_t port, const ClientId* nodeId, const std::vector<uint32
         auto onDisconnect = [this, clientSocket]() {
             std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
             this->incommingConnections.erase(clientSocket);
-            std::cout << "ConnectionThread zakończył pracę." << std::endl;
+            spdlog::debug("onDisconnect: ConnectionThread for incomming connection ended");
         };
 
         // Start thread for new connection
@@ -73,11 +96,11 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
     pthread_setname_np(pthread_self(), "NodeConnection");
     const int socket = connection->getSocket();
 
-    std::cout << "Connection thread started" << std::endl << std::flush;
+    spdlog::trace("connectionThread: Connection thread started ...");
 
     // Wait for handshake from client or response from server
     if (connection->waitForHandshake() < 0) {
-        std::cout << "Invalid handshake!" << std::endl << std::flush;
+        spdlog::trace("connectionThread: Handshake unsuccessful!");
 
         if (onDisconnect) {
             onDisconnect();
@@ -88,7 +111,17 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
         return;
     }
 
-    std::cout << "Handshake complete !!!!!!!!" << std::endl << std::flush;
+    spdlog::debug("connectionThread: Handshake complete");
+
+    const std::array<uint8_t, 16> remoteNodeId = connection->getRemoteNodeId();
+    std::stringstream ss;
+
+    for (auto byte : remoteNodeId) {
+        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    }
+
+    std::string hexRemoteNodeId = ss.str();
+    spdlog::info("Node {} connected", hexRemoteNodeId);
 
     char buffer[1024];
     ssize_t bytes_received;
@@ -104,16 +137,17 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
         //on_data_received(client, data);
     }
 
+    spdlog::info("Node {} disconnected", hexRemoteNodeId);
     if (onDisconnect) {
         onDisconnect();
     }
 
     connection->close();
-    std::cout << "Connection thread stopped" << std::endl << std::flush;
+    spdlog::trace("Connection thread is stoping ...");
 }
 
 void Mesh::nodeManager() {
-    std::cout << "Starting NodeManager thread ..." << std::endl << std::flush;
+    spdlog::debug("nodeManager: Starting NodeManager thread ...");
     pthread_setname_np(pthread_self(), "NodeManager");
 
     //const uint32_t softLimit = 2;
@@ -147,10 +181,10 @@ void Mesh::nodeManager() {
                 // }
 
                 if (IpTools::isLocalNetworkAddress(nodeAddress.address)) {
-                    std::cout << "Connecting to local node: " << nodeAddress.address << std::endl;
+                    spdlog::debug("nodeManager: Connecting to local node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connectToNode(nodeAddress.address, 8420);
                 } else {
-                    std::cout << "Connecting to global node: " << nodeAddress.address << std::endl;
+                    spdlog::debug("nodeManager: Connecting to global node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connectToNode(nodeAddress.address, 8420);
                 }
 
@@ -174,7 +208,7 @@ void Mesh::nodeManager() {
     // std::cout << "Closing connections ..." << std::endl << std::flush;
     // TODO: Zamknąć wszystkie nawiązane połączenia ...
 
-    std::cout << "Stoping NodeManager thread ..." << std::endl << std::flush;
+    spdlog::debug("nodeManager: Stopping NodeManager thread ...");
 }
 
 void Mesh::addNode(const std::string& address, const uint16_t port) {
@@ -205,9 +239,9 @@ void Mesh::onDataReceived(const std::string& nodeId, const std::string& dataName
 void Mesh::connectToNode(const std::string& address, const int port) {
     std::shared_ptr<TcpClient> client = std::make_shared<TcpClient>();
 
-    client->onConnect([this, client, address](int clientSocket) {
+    client->onConnect([this, client, address, port](int clientSocket) {
         const invilite::ClientId* nodeId = this->nodeId;
-        std::shared_ptr<NodeConnection> outgoingConnection = std::make_shared<NodeConnection>(clientSocket, nodeId, this->networkSecretKey);
+        std::shared_ptr<NodeConnection> outgoingConnection = std::make_shared<NodeConnection>(clientSocket, nodeId, this->networkSecret);
 
         {
             std::lock_guard<std::mutex> lock(this->outgoingConnectionsMutex);
@@ -217,7 +251,7 @@ void Mesh::connectToNode(const std::string& address, const int port) {
         auto onDisconnect = [this, clientSocket]() {
             std::lock_guard<std::mutex> lock(this->outgoingConnectionsMutex);
             this->outgoingConnections.erase(clientSocket);
-            std::cout << "ConnectionThread zakończył pracę." << std::endl;
+            spdlog::debug("onDisconnect: ConnectionThread for outgoing connection ended");
         };
 
         std::future<void> future = std::async(&Mesh::connectionThread, this, outgoingConnection, onDisconnect);
@@ -229,15 +263,13 @@ void Mesh::connectToNode(const std::string& address, const int port) {
             outgoingConnection->close();
         }
 
-        std::cout << "Handshake send successfuly." << std::endl;
+        spdlog::trace("connectToNode: Handshake to {}:{} send successfuly.", address, port);
     });
 
-    std::cout << "starting connection ..." << std::endl;
+    spdlog::trace("connectToNode: Opening connection to {}:{} ...", address, port);
 
     // Start connection
     client->connect(address, port);
-
-    std::cout << "connectToNode call connect" << std::endl;
 
     // Define simple data receive function, to handle only "node id" packets
     // client->onDataReceived([this, client, address](const std::string& data) {

@@ -7,11 +7,12 @@
 #include <cstring>
 #include <iostream>
 #include <condition_variable>
-#include "TcpServer.h"
-#include "TcpClient.h"
+#include <cryptopp/secblock.h>
 #include "IpTools.h"
 #include "NodeList.h"
 #include "ClientId.h"
+#include "TcpServer.h"
+#include "TcpClient.h"
 #include "MeshProtocol.h"
 #include "NodeConnection.h"
 
@@ -61,7 +62,7 @@ namespace invilite {
 
 	private:
 		const invilite::ClientId* nodeId;
-		const std::vector<uint32_t> networkSecretKey;
+		SecByteBlock networkSecret;
 		std::mutex nodeAddressListMutex;
 		std::condition_variable cv;
 		std::mutex cv_m;

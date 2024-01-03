@@ -1,47 +1,48 @@
 #include "NodeConnection.h"
 
-const std::array<uint16_t, 256> invilite::NodeConnection::crc16Table = invilite::NodeConnection::generateCRC16Table();
-
-invilite::NodeConnection::NodeConnection(int clientSocket, const invilite::ClientId* nodeId, const std::vector<uint32_t> networkSecretKey): clientSocket(clientSocket), nodeId(nodeId), networkSecretKey(networkSecretKey) {}
+// TODO: Configure to use other elipic curves, f.e.: secp521r1, brainpoolP384r1, brainpoolP512r1
+invilite::NodeConnection::NodeConnection(int clientSocket, const invilite::ClientId* nodeId, const SecByteBlock& networkSecret): clientSocket(clientSocket), nodeId(nodeId), dh(secp256r1()), hmac(networkSecret, networkSecret.size()) {}
 
 void invilite::NodeConnection::close() {
-	::shutdown(this->clientSocket, SHUT_RDWR);
-    ::close(this->clientSocket);
-    this->clientSocket = -1;
+	if (this->clientSocket != -1) {
+		::shutdown(this->clientSocket, SHUT_RDWR);
+    	::close(this->clientSocket);
+    	this->clientSocket = -1;
+	}
 }
 
-int invilite::NodeConnection::getSocket() {
+int invilite::NodeConnection::getSocket() const {
 	return this->clientSocket;
 }
 
 int invilite::NodeConnection::initHandshake() {
-	// message = nodeId + pubKeyA + HMAC(nodeId + pubKeyA + secretNetworkPassword)
+	spdlog::trace("initHandshake: Generating handshake request ...");
 
 	// Create message to send (get this node id)
     std::vector<uint8_t> message = this->nodeId->getContentAsBytes();
 
 	// Generate Elliptic-curve Diffie–Hellman key pair
 	AutoSeededRandomPool rng;
-    ECDH<ECP>::Domain dhA(secp256r1());
-    this->privKey = SecByteBlock(dhA.PrivateKeyLength());
-    SecByteBlock pubKeyA(dhA.PublicKeyLength());
-    dhA.GenerateKeyPair(rng, this->privKey, pubKeyA);
+	SecByteBlock pubKeyA(this->dh.PublicKeyLength());
+    this->privKey = SecByteBlock(this->dh.PrivateKeyLength());
+    this->dh.GenerateKeyPair(rng, this->privKey, pubKeyA);
 
     // Add pubKeyA as a part of a message
     message.insert(message.end(), pubKeyA.BytePtr(), pubKeyA.BytePtr() + pubKeyA.SizeInBytes());
 
-    // Use networkSecretKey as HMAC key
-    SecByteBlock key(reinterpret_cast<const byte*>(networkSecretKey.data()), networkSecretKey.size() * sizeof(uint32_t));
-
     // Calculate signature for handshake
-	HMAC<SHA3_256> hmac(key, key.size());
-    std::vector<uint8_t> signature(hmac.DigestSize());
-    hmac.CalculateDigest(signature.data(), message.data(), message.size());
+    std::vector<uint8_t> signature(this->hmac.DigestSize());
+    this->hmac.CalculateDigest(signature.data(), message.data(), message.size());
 
     // Add calculated signature to message
     message.insert(message.end(), signature.begin(), signature.end());
 
+    spdlog::trace("initHandshake: Sending handshake request ...");
+
+    // Send message to remote client
+    // message = nodeId[16] + pubKeyA + HMAC[networkSecret](nodeId + pubKeyA)
     if (this->sendRaw(message) != (ssize_t)message.size()) {
+    	spdlog::debug("initHandshake: Unable to send handshake to server");
     	return -1;
     }
 
@@ -49,9 +50,13 @@ int invilite::NodeConnection::initHandshake() {
 }
 
 int invilite::NodeConnection::waitForHandshake(uint8_t timeout) {
-	std::vector<uint8_t> message;
-	message.resize(113);
-	size_t expectedLength = 113;
+	spdlog::trace("waitForHandshake: Waiting for incomming handshake ...");
+
+	// message = nodeId[16] + pubKeyA + HMAC[networkSecret](nodeId + pubKeyA)
+	const size_t expectedLength = 16 + this->dh.PublicKeyLength() + this->hmac.DigestSize();
+
+	// Buffer for incomming message
+	std::vector<uint8_t> message(expectedLength);
 
 	size_t totalReceived = 0;
     while (totalReceived < expectedLength) {
@@ -64,33 +69,37 @@ int invilite::NodeConnection::waitForHandshake(uint8_t timeout) {
         tv.tv_sec = timeout;
         tv.tv_usec = 0;
 
-        // Wait for data with timeout
+        // Wait for incomming data to be ready (with timeout)
         int selectResult = select(clientSocket + 1, &readfds, NULL, NULL, &tv);
 
         if (selectResult < 0) {
-        	std::cout << "Error in select()" << std::endl << std::flush;
+        	spdlog::debug("waitForHandshake: Error in select()");
         	return -1;
         } else if (selectResult == 0) {
-            std::cout << "Handshake timeout" << std::endl << std::flush;
+            spdlog::debug("waitForHandshake: Handshake timeout after {} seconds", timeout);
             return -2;
         }
 
-        // Incomming data
+        // Receive incomming data
         ssize_t received = recv(clientSocket, message.data() + totalReceived, expectedLength - totalReceived, 0);
         if (received < 0) {
-            std::cout << "Error receiving data" << std::endl << std::flush;
+            spdlog::debug("waitForHandshake: Error receiving data");
             return -3;
         }
         totalReceived += received;
     }
 
-    // If connection doesn't have a private key yet, this is a server side
+    spdlog::trace("waitForHandshake: Handshake received");
+
+    // If connection doesn't have a private key yet, this is a server side, otherwise it's response from the server
     if (this->privKey.size() == 0) {
     	if (this->validateHandshake(&message) < 0) {
+    		spdlog::debug("waitForHandshake: Unable to validate handshake");
 	    	return -4;
 	    }
     } else {
     	if (this->finishHandshake(&message) < 0) {
+    		spdlog::debug("waitForHandshake: Unable to finish handshake");
 	    	return -4;
 	    }
     }
@@ -100,43 +109,42 @@ int invilite::NodeConnection::waitForHandshake(uint8_t timeout) {
 }
 
 int invilite::NodeConnection::validateHandshake(const std::vector<uint8_t>* message) {
+	spdlog::trace("validateHandshake: Starting handshake validation ...");
 	// message = nodeId + pubKeyB + HMAC(nodeId + pubKeyB + secretNetworkPassword)
 
 	// Create reply to send (get this node id)
     std::vector<uint8_t> reply = this->nodeId->getContentAsBytes();
 
 	std::vector<uint8_t> nodeId(message->begin(), message->begin() + 16);
-    std::vector<uint8_t> pubKeyA(message->begin() + 16, message->begin() + 16 + 65);
-    std::vector<uint8_t> hmacSignature(message->end() - 32, message->end());
-
-    // Use networkSecretKey as HMAC key
-    SecByteBlock key(reinterpret_cast<const byte*>(networkSecretKey.data()), networkSecretKey.size() * sizeof(uint32_t));
+    std::vector<uint8_t> pubKeyA(message->begin() + 16, message->begin() + 16 + this->dh.PublicKeyLength());
+    std::vector<uint8_t> hmacSignature(message->end() - this->hmac.DigestSize(), message->end());
 
     // Calculate signature for handshake
-	HMAC<SHA3_256> hmac(key, key.size());
-    std::vector<uint8_t> signature(hmac.DigestSize());
-    hmac.CalculateDigest(signature.data(), message->data(), message->size() - 32);
+    std::vector<uint8_t> signature(this->hmac.DigestSize());
+    this->hmac.CalculateDigest(signature.data(), message->data(), message->size() - this->hmac.DigestSize());
 
     // Check if signature was valid
     if (hmacSignature != signature) {
-    	std::cout << "Signature mismatch!" << std::endl << std::flush;
+    	spdlog::debug("validateHandshake: Signature mismatch!");
     	return -1;
     }
 
+    // If signature was valid, we can trust that remote node id is valid
+    std::copy(message->begin(), message->begin() + 16, remoteNodeId.begin());
+
 	// Generate Elliptic-curve Diffie–Hellman key pair
 	AutoSeededRandomPool rng;
-    ECDH<ECP>::Domain dhB(secp256r1());
-    SecByteBlock privKeyB(dhB.PrivateKeyLength());
-    SecByteBlock pubKeyB(dhB.PublicKeyLength());
-    dhB.GenerateKeyPair(rng, privKeyB, pubKeyB);
+    SecByteBlock privKeyB(this->dh.PrivateKeyLength());
+    SecByteBlock pubKeyB(this->dh.PublicKeyLength());
+    this->dh.GenerateKeyPair(rng, privKeyB, pubKeyB);
 
     // Convert received public key from client to SecByteBlock
     SecByteBlock pubKeyClient(pubKeyA.data(), pubKeyA.size());
 
     // Calculate shared secret
-    this->sharedSecret.resize(dhB.AgreedValueLength());
-    if (!dhB.Agree(this->sharedSecret, privKeyB, pubKeyClient)) {
-        std::cout << "Failed to agree on a shared secret" << std::endl << std::flush;
+    this->sharedSecret.resize(this->dh.AgreedValueLength());
+    if (!this->dh.Agree(this->sharedSecret, privKeyB, pubKeyClient)) {
+        spdlog::debug("validateHandshake: Failed to agree on a shared secret");
         return -2;
     }
 
@@ -144,56 +152,67 @@ int invilite::NodeConnection::validateHandshake(const std::vector<uint8_t>* mess
     reply.insert(reply.end(), pubKeyB.BytePtr(), pubKeyB.BytePtr() + pubKeyB.SizeInBytes());
 
     // Calculate signature for reply
-    std::vector<uint8_t> replySignature(hmac.DigestSize());
-    hmac.CalculateDigest(signature.data(), reply.data(), reply.size());
+    std::vector<uint8_t> replySignature(this->hmac.DigestSize());
+    this->hmac.CalculateDigest(signature.data(), reply.data(), reply.size());
 
     // Add calculated signature to message
     reply.insert(reply.end(), signature.begin(), signature.end());
 
+    spdlog::debug("validateHandshake: Sending handshake reply to client ...");
     if (this->sendRaw(reply) != (ssize_t)reply.size()) {
+    	spdlog::debug("validateHandshake: Unable to send handshake reply to client");
     	return -3;
     }
 
+    // TODO: Remove this aftr tests
     std::string hexSecret = SecByteBlockToHex(sharedSecret);
-	std::cout << "Shared secret (hex): " << hexSecret << std::endl;
+    spdlog::trace("validateHandshake: Shared secret (hex): {}", hexSecret);
+
+	spdlog::trace("validateHandshake: Validation successful");
 
     return 0;
 }
 
 int invilite::NodeConnection::finishHandshake(const std::vector<uint8_t>* message) {
+	spdlog::trace("finishHandshake: Starting handshake validation ...");
 	std::vector<uint8_t> nodeId(message->begin(), message->begin() + 16);
-    std::vector<uint8_t> pubKeyB(message->begin() + 16, message->begin() + 16 + 65);
-    std::vector<uint8_t> hmacSignature(message->end() - 32, message->end());
-
-    // Use networkSecretKey as HMAC key
-    SecByteBlock key(reinterpret_cast<const byte*>(networkSecretKey.data()), networkSecretKey.size() * sizeof(uint32_t));
+    std::vector<uint8_t> pubKeyB(message->begin() + 16, message->begin() + 16 + this->dh.PublicKeyLength());
+    std::vector<uint8_t> hmacSignature(message->end() - this->hmac.DigestSize(), message->end());
 
     // Calculate signature for handshake
-	HMAC<SHA3_256> hmac(key, key.size());
-    std::vector<uint8_t> signature(hmac.DigestSize());
-    hmac.CalculateDigest(signature.data(), message->data(), message->size() - 32);
+    std::vector<uint8_t> signature(this->hmac.DigestSize());
+    this->hmac.CalculateDigest(signature.data(), message->data(), message->size() - this->hmac.DigestSize());
 
     // Check if signature was valid
     if (hmacSignature != signature) {
-    	std::cout << "Signature mismatch!" << std::endl << std::flush;
+    	spdlog::debug("finishHandshake: Signature mismatch!");
     	return -1;
     }
+
+    // If signature was valid, we can trust that remote node id is valid
+    std::copy(message->begin(), message->begin() + 16, remoteNodeId.begin());
 
     // Convert received public key from client to SecByteBlock
     SecByteBlock pubKeyServer(pubKeyB.data(), pubKeyB.size());
 
     // Calculate shared secret
-    ECDH<ECP>::Domain dhA(secp256r1());
-    this->sharedSecret.resize(dhA.AgreedValueLength());
-    if (!dhA.Agree(this->sharedSecret, this->privKey, pubKeyServer)) {
-        std::cout << "Failed to agree on a shared secret" << std::endl << std::flush;
+    this->sharedSecret.resize(this->dh.AgreedValueLength());
+    if (!this->dh.Agree(this->sharedSecret, this->privKey, pubKeyServer)) {
+        spdlog::debug("finishHandshake: Failed to agree on a shared secret");
         return -2;
     }
 
+    // TODO: Remove this after tests
     std::string hexSecret = SecByteBlockToHex(sharedSecret);
-	std::cout << "Shared secret (hex): " << hexSecret << std::endl;
+	spdlog::trace("finishHandshake: Shared secret (hex): {}", hexSecret);
+
+	spdlog::trace("finishHandshake: Validation successful");
 
     return 0;
+}
+
+const std::array<uint8_t, 16> invilite::NodeConnection::getRemoteNodeId() const {
+	return this->remoteNodeId;
 }
 
 ssize_t invilite::NodeConnection::send(const std::string& data) {
@@ -208,13 +227,13 @@ ssize_t invilite::NodeConnection::send(const uint8_t* rawData, uint32_t dataLen)
 
 ssize_t invilite::NodeConnection::send(const std::vector<uint8_t>& packetData) {
     if (clientSocket == -1) {
-        std::cerr << "Error: socket is closed." << std::endl;
+        spdlog::error("Unable to send data: socket is closed");
         return -1;
     }
 
     const uint8_t  headerSize = 5;
     const uint32_t packetSize = headerSize + packetData.size() + 2; // Header size, data size and crc size
-    const uint16_t crc = invilite::NodeConnection::calculateCRC16(packetData);
+    const uint16_t crc = 0;
     std::vector<uint8_t> packetHeader;
     packetHeader.reserve(headerSize);
 
@@ -236,7 +255,7 @@ ssize_t invilite::NodeConnection::send(const std::vector<uint8_t>& packetData) {
     // Send data
     ssize_t sentBytes = ::writev(clientSocket, iov, 3);
     if (sentBytes != (ssize_t)packetSize) {
-        std::cerr << "Error: not all bytes were sent" << std::endl;
+        spdlog::error("Unable to send data: not all bytes were sent");
     }
 
     return sentBytes;
@@ -262,36 +281,104 @@ ssize_t invilite::NodeConnection::sendRaw(const std::vector<uint8_t>& data) {
     return (n == -1) ? -1 : totalSent;
 }
 
-std::array<uint16_t, 256> invilite::NodeConnection::generateCRC16Table() {
-    std::array<uint16_t, 256> table;
-    const uint16_t polynomial = 0x1021; // Wielomian dla CRC-16-CCITT.
+const std::vector<uint8_t> invilite::NodeConnection::encryptData(const std::vector<uint8_t>& data) {
+	// Generate initialization vector
+	AutoSeededRandomPool prng;
+	SecByteBlock iv(12);
+    prng.GenerateBlock(iv, iv.size());
 
-    for (uint16_t i = 0; i < 256; i++) {
-        uint16_t value = i << 8;
+    // Poly1305 tag size is 16 bytes (128 bits)
+    const size_t poly1305size = 16;
 
-        for (uint8_t j = 0; j < 8; j++) {
-            if (value & 0x8000) {
-                value = (value << 1) ^ polynomial;
-            } else {
-                value <<= 1;
-            }
-        }
+    // Calculate total packet length (length + IV + encrypted data + checksum tag (Poly1305))
+    const uint32_t packetLength = static_cast<uint32_t>(sizeof(uint32_t) + iv.size() + data.size() + poly1305size);
 
-        table[i] = value;
-    }
+    // Create additional authenticated data from packet length and IV
+    std::vector<uint8_t> aad(sizeof(packetLength) + iv.size());
+    std::memcpy(aad.data(), &packetLength, sizeof(packetLength));
+    std::memcpy(aad.data() + sizeof(packetLength), iv.data(), iv.size());
 
-    return table;
+    // Allocate space for the ciphertext and the Poly1305 tag
+    std::vector<uint8_t> ciphertext(data.size());
+    CryptoPP::SecByteBlock tag(poly1305size);
+
+    // Prepare ChaCha20-Poly1305 cipher
+    ChaCha20Poly1305::Encryption cipher;
+    cipher.SetKeyWithIV(this->sharedSecret, this->sharedSecret.size(), iv, iv.size());
+
+    // Encrypt and authenticate (generate Poly1305 tag)
+    cipher.EncryptAndAuthenticate(ciphertext.data(), tag, tag.size(), iv, iv.size(), aad.data(), aad.size(), data.data(), data.size());
+
+    // Construct the final packet with AAD, encrypted data, and tag
+    std::vector<uint8_t> packet(aad.size() + ciphertext.size() + tag.size());
+    std::memcpy(packet.data(), aad.data(), aad.size());
+    std::memcpy(packet.data() + aad.size(), ciphertext.data(), ciphertext.size());
+    std::memcpy(packet.data() + aad.size() + ciphertext.size(), tag.data(), tag.size());
+
+    // TODO: Check if std::vector can be repleaced with std::array
+
+    return packet;
 }
 
-uint16_t invilite::NodeConnection::calculateCRC16(const std::vector<uint8_t>& data) {
-    uint16_t crc = 0xFFFF;
+const std::vector<uint8_t> invilite::NodeConnection::decryptData(const std::vector<uint8_t>& packet) {
+	// Initialization vector size
+	const uint32_t ivSize = 12;
 
-    for (uint8_t byte : data) {
-        uint8_t index = (crc >> 8) ^ byte;
-        crc = crc16Table[index] ^ (crc << 8);
+	// Poly1305 tag size is 16 bytes (128 bits)
+    const size_t poly1305size = 16;
+
+    // Total packet length
+    uint32_t totalPacketLength;
+
+    const uint32_t minPacketLength = (sizeof(totalPacketLength) + ivSize + poly1305size);
+
+    // Check if packed has minimum packet size for zero data packet (header + iv + poly1305tag)
+    if (packet.size() < minPacketLength) {
+    	std::ostringstream oss;
+    	oss << "Packet is damage, minimum " << minPacketLength << " bytes is required, but only " << packet.size() << " bytes found.";
+        throw std::runtime_error(oss.str());
     }
 
-    return crc;
+    // Extract total packet length from header (and match it to real packet length)
+    std::memcpy(&totalPacketLength, packet.data(), sizeof(totalPacketLength));
+    if (packet.size() != totalPacketLength) {
+    	std::ostringstream oss;
+    	oss << "Invalid packet length, expected " << totalPacketLength << " bytes, but " << packet.size() << " bytes found.";
+        throw std::runtime_error(oss.str());
+    }
+
+    // Extract IV from packet
+    CryptoPP::SecByteBlock iv(ivSize);
+    std::memcpy(iv.data(), packet.data() + sizeof(totalPacketLength), ivSize);
+
+    const size_t ciphertextSize = totalPacketLength - sizeof(totalPacketLength) - ivSize - poly1305size;
+
+    // Separate ciphertext and tag
+    std::vector<uint8_t> ciphertext(ciphertextSize);
+    std::memcpy(ciphertext.data(), packet.data() + sizeof(totalPacketLength) + ivSize, ciphertextSize);
+
+    CryptoPP::SecByteBlock tag(poly1305size);
+    std::memcpy(tag.data(), packet.data() + sizeof(totalPacketLength) + ivSize + ciphertextSize, poly1305size);
+
+    // Prepare ChaCha20Poly1305 cipher
+    CryptoPP::ChaCha20Poly1305::Decryption dec;
+    dec.SetKeyWithIV(this->sharedSecret, this->sharedSecret.size(), iv, iv.size());
+
+    // Create AAD from packet length and IV
+    // TODO: Use data from "packet"
+    std::vector<uint8_t> aad(sizeof(totalPacketLength) + iv.size());
+    std::memcpy(aad.data(), &totalPacketLength, sizeof(totalPacketLength));
+    std::memcpy(aad.data() + sizeof(totalPacketLength), iv.data(), iv.size());
+
+    // Decrypt and verify
+    std::vector<uint8_t> decryptedData(ciphertextSize);
+    bool isValid = dec.DecryptAndVerify(decryptedData.data(), tag, tag.size(), iv, iv.size(), aad.data(), aad.size(), ciphertext.data(), ciphertextSize);
+
+    if (!isValid) {
+        throw std::runtime_error("Invalid authentication tag.");
+    }
+
+    return decryptedData;
 }
 
 std::string invilite::NodeConnection::SecByteBlockToHex(const CryptoPP::SecByteBlock& block) {
