@@ -27,12 +27,13 @@ void NetDiscovery::stopListening() {
     if (isListening) {
         isListening = false;
         shutdown(sockfd, SHUT_RDWR);
-        close(sockfd);
-        sockfd = -1;
 
         if(listenerThread.joinable()) {
             listenerThread.join();
         }
+
+        close(sockfd);
+        sockfd = -1;
     }
 }
 

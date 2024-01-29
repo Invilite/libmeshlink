@@ -8,7 +8,7 @@ services:
     command: /bin/meshlinkd
     networks:
       default:
-        ipv4_address: 192.168.5.10
+        ipv4_address: 192.168.8.10
 
   meshlink2:
     image: debian:bookworm-backports
@@ -17,7 +17,7 @@ services:
     command: /bin/meshlinkd
     networks:
       default:
-        ipv4_address: 192.168.5.11
+        ipv4_address: 192.168.8.11
 
   meshlink3:
     image: debian:bookworm-backports
@@ -26,7 +26,7 @@ services:
     command: /bin/meshlinkd
     networks:
       default:
-        ipv4_address: 192.168.5.12
+        ipv4_address: 192.168.8.12
 
 networks:
   default:
@@ -34,4 +34,4 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: 192.168.5.0/24  # podsieć dla kontenerów
+        - subnet: 192.168.8.0/24  # podsieć dla kontenerów

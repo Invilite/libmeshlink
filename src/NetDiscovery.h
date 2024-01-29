@@ -1,6 +1,7 @@
 #ifndef NET_DISCOVERY_H
 #define NET_DISCOVERY_H
 
+#include <atomic>
 #include <thread>
 #include <cstring>
 #include <unistd.h>
@@ -25,7 +26,7 @@ private:
 
     const int port;
     int sockfd;
-    bool isListening;
+    std::atomic<bool> isListening;
     std::function<void(const std::string&)> discoverCallback;
     std::thread listenerThread;
 };

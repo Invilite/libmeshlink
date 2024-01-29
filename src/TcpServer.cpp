@@ -87,50 +87,61 @@ void invilite::TcpServer::stop() {
     // Stop server thread
     this->stopServer = true;
 
-    // Close server socket
+    // Shutdown socket
     if (this->serverSocket != -1) {
         shutdown(this->serverSocket, SHUT_RDWR);
-        close(this->serverSocket);
-        this->serverSocket = -1;
     }
 
     // Wait for server thread to finish
     if (this->serverThread.joinable()) {
         this->serverThread.join();
     }
+
+    // Close server socket
+    close(this->serverSocket);
+    this->serverSocket = -1;
 }
 
 void invilite::TcpServer::server_thread () {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(this->serverSocket, &read_fds);
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        std::cerr << "Error: Cannot create epoll" << std::endl;
+        return;
+    }
+
+    const int MAX_EVENTS = 15;
+    struct epoll_event ev, events[MAX_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd = this->serverSocket;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, this->serverSocket, &ev) == -1) {
+        std::cerr << "Error: Cannot add server socket to epoll" << std::endl;
+        close(epoll_fd);
+        return;
+    }
 
     while (!this->stopServer) {
-        fd_set current_fds = read_fds; // Copy fd set, select may alter it.
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // Timeout 1000 ms
+        if (nfds == -1) {
+            std::cerr << "Error: epoll_wait" << std::endl;
+            continue;
+        }
 
-        // Set up timeout for select.
-        struct timeval receiveTimeout;
-        receiveTimeout.tv_sec = 1;  // Set timeout to 1 second.
-        receiveTimeout.tv_usec = 0;
+        for (int n = 0; n < nfds; ++n) {
+            if (events[n].data.fd == this->serverSocket) {
+                // New connection
+                sockaddr_storage clientAddress;
+                socklen_t clientAddressLength = sizeof(clientAddress);
+                int clientSocket = accept(this->serverSocket, (struct sockaddr *)&clientAddress, &clientAddressLength);
 
-        // Wait for a connection, but only for the timeout duration.
-        if (select(this->serverSocket + 1, &current_fds, NULL, NULL, &receiveTimeout) > 0) {
-            if (!FD_ISSET(this->serverSocket, &read_fds)) {
-                continue;
-            }
+                if (clientSocket < 0) {
+                    std::cerr << "Error: Cannot accept client connection" << std::endl;
+                    continue;
+                }
 
-            // New connection
-            sockaddr_storage clientAddress;
-            socklen_t clientAddressLength = sizeof(clientAddress);
-            int clientSocket = accept(this->serverSocket, (struct sockaddr *)&clientAddress, &clientAddressLength);
-
-            if (clientSocket < 0) {
-                std::cerr << "Error: Cannot accept client connection" << std::endl;
-                continue;
-            }
-            
-            if (this->on_connect_callback_) {
-                this->on_connect_callback_(clientSocket, &clientAddress);
+                if (this->on_connect_callback_) {
+                    this->on_connect_callback_(clientSocket, &clientAddress);
+                }
             }
         }
     }

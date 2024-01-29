@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <functional>
 #include <arpa/inet.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include "ClientHandler.h"
