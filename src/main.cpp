@@ -9,7 +9,7 @@
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/fmt/fmt.h>
 #include "Mesh.h"
-#include "ClientId.h"
+#include "NodeId.h"
 #include "Serializer.h"
 #include "NetDiscovery.h"
 #include "IpTools.h"
@@ -28,7 +28,7 @@ static const std::vector<uint32_t> networkSecretKey = {
 
 static std::atomic<bool> exitServer(false);
 static void signalHandler(int signum);
-static invilite::ClientId clientId(cachePath + "/node_id");
+static invilite::NodeId nodeId(cachePath + "/node_id");
 static invilite::NodeList nodeList(cachePath + "/node_list");
 
 int main(int argc, char** argv) {
@@ -58,7 +58,7 @@ int main(int argc, char** argv) {
     invilite::IpTools::getLocalInterfaces(&interfacesList);
 
     uint16_t port = 8420;
-    invilite::Mesh mesh(port, &clientId, networkSecretKey);
+    invilite::Mesh mesh(port, &nodeId, networkSecretKey);
 
     // Add node addresses from command line
     for (const auto& node : nodes) {
@@ -85,7 +85,7 @@ int main(int argc, char** argv) {
     }
 
     // Starting mesh network ...
-    spdlog::debug("Starting mesh network with local id \"{}\" ...", clientId.getIdAsString());
+    spdlog::debug("Starting mesh network with local id \"{}\" ...", nodeId.getIdAsString());
     mesh.start();
 
     NetDiscovery discovery(8420);
@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
     }
 
     try {
-        std::cout << "Stopping mesh ..." << std::endl;
+        std::cout << "Stopping mesh network ..." << std::endl;
         mesh.stop();
     } catch (const std::exception &e) {
         std::cerr << "Exception caught when stopping mesh service: " << e.what() << std::endl;

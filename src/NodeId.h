@@ -1,5 +1,5 @@
-#ifndef CLIENT_ID_H
-#define CLIENT_ID_H
+#ifndef NODE_ID_H
+#define NODE_ID_H
 
 #include <ctime>
 #include <array>
@@ -20,9 +20,9 @@
 
 namespace invilite {
 
-class ClientId : public File {
+class NodeId : public File {
 public:
-    ClientId(const std::string& filePath);
+    NodeId(const std::string& filePath);
     std::string getIdAsString() const;
 
 protected:

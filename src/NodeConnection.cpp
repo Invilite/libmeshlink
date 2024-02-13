@@ -1,7 +1,29 @@
 #include "NodeConnection.h"
 
+/**
+char addressBuffer[INET6_ADDRSTRLEN];
+uint16_t port;
+
+if (clientAddress->ss_family == AF_INET) {
+    // Przychodzące połączenie IPv4
+    const sockaddr_in* addr4 = reinterpret_cast<const sockaddr_in*>(clientAddress);
+    inet_ntop(AF_INET, &addr4->sin_addr, addressBuffer, sizeof(addressBuffer));
+    port = ntohs(addr4->sin_port);
+    spdlog::debug("onConnect: Incomming IPv4 connection from {} on port {}", addressBuffer, port);
+} else if (clientAddress->ss_family == AF_INET6) {
+    // Przychodzące połączenie IPv6
+    const sockaddr_in6* addr6 = reinterpret_cast<const sockaddr_in6*>(clientAddress);
+    inet_ntop(AF_INET6, &addr6->sin6_addr, addressBuffer, sizeof(addressBuffer));
+    port = ntohs(addr6->sin6_port);
+    spdlog::debug("onConnect: Incomming IPv6 connection from {} on port {}", addressBuffer, port);
+} else {
+    // Nieznany typ adresu
+    spdlog::error("onConnect: Incomming connection unknown address family");
+}
+ */
+
 // TODO: Configure to use other elipic curves, f.e.: secp521r1, brainpoolP384r1, brainpoolP512r1
-invilite::NodeConnection::NodeConnection(int clientSocket, const invilite::ClientId* nodeId, const SecByteBlock& networkSecret): clientSocket(clientSocket), nodeId(nodeId), dh(secp256r1()), hmac(networkSecret, networkSecret.size()) {}
+invilite::NodeConnection::NodeConnection(int clientSocket, const sockaddr_storage* clientAddress, const invilite::NodeId* nodeId, const SecByteBlock& networkSecret): clientSocket(clientSocket), nodeId(nodeId), clientAddress(*clientAddress), dh(secp256r1()), hmac(networkSecret, networkSecret.size()) {}
 
 void invilite::NodeConnection::close() {
 	if (this->clientSocket != -1) {

@@ -27,11 +27,11 @@ public:
 
     bool connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
     void disconnect(); // Note: This is also called from the destructor.
-    void onConnect(std::function<void(int clientSocket)> onConnect);
+    void onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> onConnect);
 
 private:
     int clientSocket;
-    std::function<void(int clientSocket)> onConnect_;
+    std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> onConnect_;
 };
 
 } // namespace invilite

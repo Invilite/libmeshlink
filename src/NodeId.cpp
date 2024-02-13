@@ -1,6 +1,6 @@
-#include "ClientId.h"
+#include "NodeId.h"
 
-invilite::ClientId::ClientId(const std::string& filePath): File(filePath, public_perms) {
+invilite::NodeId::NodeId(const std::string& filePath): File(filePath, public_perms) {
     if (!read()) {
         generateId();
         this->setContent(id, sizeof(id));
@@ -10,7 +10,7 @@ invilite::ClientId::ClientId(const std::string& filePath): File(filePath, public
     }
 }
 
-std::string invilite::ClientId::getIdAsString() const {
+std::string invilite::NodeId::getIdAsString() const {
     std::stringstream ss;
     for (int i = 0; i < 16; ++i) {
         ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(id[i]);
@@ -21,7 +21,7 @@ std::string invilite::ClientId::getIdAsString() const {
     return ss.str();
 }
 
-void invilite::ClientId::getRandomBytes(uint8_t* output, size_t length) {
+void invilite::NodeId::getRandomBytes(uint8_t* output, size_t length) {
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_int_distribution<uint8_t> distrib(0, 255);
@@ -31,7 +31,7 @@ void invilite::ClientId::getRandomBytes(uint8_t* output, size_t length) {
     }
 }
 
-void invilite::ClientId::getHardwareId(uint8_t* output, size_t length) {
+void invilite::NodeId::getHardwareId(uint8_t* output, size_t length) {
     std::string hardwareId;
 
     // Prepare generator of random data
@@ -78,13 +78,13 @@ void invilite::ClientId::getHardwareId(uint8_t* output, size_t length) {
     std::memcpy(output, digest, bytesToCopy);
 }
 
-void invilite::ClientId::generateId() {
+void invilite::NodeId::generateId() {
     this->getHardwareId(id, 8);
     this->getRandomBytes(id + 8, 4);
     this->getTimeBytes(id + 12, 4);
 }
 
-void invilite::ClientId::getTimeBytes(uint8_t* output, size_t length) {
+void invilite::NodeId::getTimeBytes(uint8_t* output, size_t length) {
     auto now = std::chrono::system_clock::now();
     auto duration = now.time_since_epoch();
     auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
@@ -94,6 +94,6 @@ void invilite::ClientId::getTimeBytes(uint8_t* output, size_t length) {
     std::memcpy(output, &millis, bytesToCopy);
 }
 
-bool invilite::ClientId::getCpuId(std::array<uint32_t, 4>& cpu_id) {
+bool invilite::NodeId::getCpuId(std::array<uint32_t, 4>& cpu_id) {
     return __get_cpuid(0, &cpu_id[0], &cpu_id[1], &cpu_id[2], &cpu_id[3]);
 }

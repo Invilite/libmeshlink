@@ -1,18 +1,24 @@
 #ifndef MESH_H
 #define MESH_H
 
+#include <set>
 #include <list>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <chrono>
 #include <thread>
-#include <future>
 #include <cstring>
 #include <iostream>
+#include <unistd.h> // usleep
+#include <algorithm>
 #include <condition_variable>
 #include <cryptopp/secblock.h>
+#include "NodeId.h"
 #include "IpTools.h"
 #include "NodeList.h"
-#include "ClientId.h"
-#include "TcpServer.h"
 #include "TcpClient.h"
+#include "TcpServer.h"
 #include "NodeConnection.h"
 
 struct NodeAddress {
@@ -24,14 +30,10 @@ struct NodeAddress {
 namespace invilite {
 	class Mesh {
 	public:
-		Mesh(const uint16_t port, const invilite::ClientId* nodeId, const std::vector<uint32_t> networkSecretKey);
+		Mesh(const uint16_t port, const invilite::NodeId* nodeId, const std::vector<uint32_t> networkSecretKey);
 		virtual ~Mesh() = default;
 		void start();
 		void stop();
-
-    	void onNodeConnected(const std::string &nodeId);
-    	void onNodeDisconnected(const std::string &nodeId);
-    	void onDataReceived(const std::string& nodeId, const std::string& dataName, const std::string& message);
 
     	// TODO: Implement this
     	void addNode(const std::string& address, const uint16_t port);
@@ -41,9 +43,6 @@ namespace invilite {
 		// Nodes after successful handshake
 		// std::mutex connectionsMutex;
 		// std::unordered_map<int, std::shared_ptr<NodeConnection>> connections;
-
-		// Connections threads
-		std::vector<std::thread> threads;
 
 		// Active connections (incomming)
 		std::mutex incommingConnectionsMutex;
@@ -60,10 +59,10 @@ namespace invilite {
 		void connectionThread(std::shared_ptr<NodeConnection> connection, std::function<void()> onDisconnect);
 
 		// Connect to other server, send clientId, and wait for response with server client id, add new item to out_clients
-    	void connectToNode(const std::string& address, const int port);
+    	void connect(const std::string& address, const int port);
 
 	private:
-		const invilite::ClientId* nodeId;
+		const invilite::NodeId* nodeId;
 		SecByteBlock networkSecret;
 		std::mutex nodeAddressListMutex;
 		std::condition_variable cv;

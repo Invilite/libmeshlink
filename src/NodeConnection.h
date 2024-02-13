@@ -19,7 +19,7 @@
 #include <cryptopp/secblock.h>
 #include <cryptopp/eccrypto.h>
 #include <cryptopp/chachapoly.h>
-#include "ClientId.h"
+#include "NodeId.h"
 
 using CryptoPP::OID;
 using CryptoPP::ECP;
@@ -37,7 +37,7 @@ namespace invilite {
 
 class NodeConnection {
 public:
-	NodeConnection(int clientSocket, const invilite::ClientId* nodeId, const SecByteBlock& networkSecret);
+	NodeConnection(int clientSocket, const sockaddr_storage* clientAddress, const invilite::NodeId* nodeId, const SecByteBlock& networkSecret);
 	void close();
 	int getSocket() const;
 	int initHandshake();
@@ -53,7 +53,8 @@ public:
 protected:
 	int clientSocket;
 	std::array<uint8_t, 16> remoteNodeId;
-	const invilite::ClientId* nodeId;
+	const invilite::NodeId* nodeId;
+	const sockaddr_storage clientAddress;
 	const std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
 	const std::vector<uint8_t> decryptData(const std::vector<uint8_t>& packet);
 	ssize_t sendRaw(const std::vector<uint8_t>& data);

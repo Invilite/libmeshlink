@@ -97,10 +97,14 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         return false;
     }
 
+    sockaddr_storage localAddress;
+    socklen_t addressLength = sizeof(localAddress);
+    getsockname(this->clientSocket, (struct sockaddr*)&localAddress, &addressLength);
+
     std::cout << "Debug: onConnect start" << std::endl;
     try {
         if (onConnect_) {
-            onConnect_(this->clientSocket);
+            onConnect_(this->clientSocket, &localAddress);
         }
     } catch (const std::exception& e) {
         std::cerr << "Exception in onConnect_: " << e.what() << std::endl;
@@ -120,6 +124,6 @@ void invilite::TcpClient::disconnect() {
     }
 }
 
-void invilite::TcpClient::onConnect(std::function<void(int clientSocket)> onConnect) {
+void invilite::TcpClient::onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> onConnect) {
     onConnect_ = onConnect;
 }
