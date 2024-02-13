@@ -77,7 +77,7 @@ int invilite::TcpServer::start() {
 
     // Start server accept thread
     this->stopServer = false;
-    this->serverThread = std::thread(&TcpServer::server_thread, this);
+    this->serverThread = std::thread(&TcpServer::serverListener, this);
     pthread_setname_np(this->serverThread.native_handle(), "TcpServer");
 
     return 0;
@@ -102,7 +102,7 @@ void invilite::TcpServer::stop() {
     this->serverSocket = -1;
 }
 
-void invilite::TcpServer::server_thread () {
+void invilite::TcpServer::serverListener() {
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         std::cerr << "Error: Cannot create epoll" << std::endl;
@@ -121,7 +121,7 @@ void invilite::TcpServer::server_thread () {
     }
 
     while (!this->stopServer) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // Timeout 1000 ms
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 500); // Timeout 500 ms
         if (nfds == -1) {
             std::cerr << "Error: epoll_wait" << std::endl;
             continue;
@@ -133,6 +133,11 @@ void invilite::TcpServer::server_thread () {
                 sockaddr_storage clientAddress;
                 socklen_t clientAddressLength = sizeof(clientAddress);
                 int clientSocket = accept(this->serverSocket, (struct sockaddr *)&clientAddress, &clientAddressLength);
+
+                // If we have a error, but it's causing by stoping server stop this loop
+                if (clientSocket < 0 && this->stopServer) {
+                    break;
+                }
 
                 if (clientSocket < 0) {
                     std::cerr << "Error: Cannot accept client connection" << std::endl;

@@ -40,6 +40,9 @@ int main(int argc, char** argv) {
     bool daemon = false;
     app.add_flag("-d,--daemon", daemon, "Run as daemon");
 
+    std::vector<std::string> nodes;
+    app.add_option("--node", nodes, "Node address")->expected(-1);
+
     // Parse command line arguments
     CLI11_PARSE(app, argc, argv);
 
@@ -56,6 +59,24 @@ int main(int argc, char** argv) {
 
     uint16_t port = 8420;
     invilite::Mesh mesh(port, &clientId, networkSecretKey);
+
+    // Add node addresses from command line
+    for (const auto& node : nodes) {
+        std::string address;
+        int port = 8420;
+
+        size_t colonPos = node.find(':');
+        if (colonPos != std::string::npos) {
+            // Znaleziono port, rozdziel adres i port
+            address = node.substr(0, colonPos);
+            port = std::stoi(node.substr(colonPos + 1)); // Konwersja string na int
+        } else {
+            // Tylko adres, użyj domyślnego portu
+            address = node;
+        }
+
+        mesh.addNode(address, port);
+    }
 
     // Load known node addresses from cache file
     const std::set<Node>& allEntries = nodeList.getAll();

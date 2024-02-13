@@ -32,13 +32,13 @@ public:
     void stop();
     void sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data);
 
-    using OnConnectCallback = std::function<void(int clientSocket, sockaddr_storage* clientAddress)>;
+    using OnConnectCallback = std::function<void(int clientSocket, const sockaddr_storage* clientAddress)>;
     void onConnect(const OnConnectCallback &callback);
 
 protected:
 
 private:
-    void server_thread();
+    void serverListener();
 
     const int serverPort;
     int serverSocket;

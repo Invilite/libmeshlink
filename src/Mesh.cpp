@@ -18,7 +18,7 @@ Mesh::Mesh(const uint16_t port, const ClientId* nodeId, const std::vector<uint32
     std::memcpy(this->networkSecret.BytePtr(), networkSecretKey.data(), this->networkSecret.size());
 
 	// Handle server connections
-	server->onConnect([this](int clientSocket, sockaddr_storage* clientAddress) {
+	server->onConnect([this](int clientSocket, const sockaddr_storage* clientAddress) {
 
         char addressBuffer[INET6_ADDRSTRLEN];
         uint16_t port;
@@ -52,12 +52,14 @@ Mesh::Mesh(const uint16_t port, const ClientId* nodeId, const std::vector<uint32
         };
 
         // Start thread for new connection
-        std::future<void> future = std::async(&Mesh::connectionThread, this, incommingConnection, onDisconnect);
+        //threads.push_back(std::thread(&Mesh::connectionThread, this, incommingConnection, onDisconnect));
+        auto hThread = std::thread(&Mesh::connectionThread, this, incommingConnection, onDisconnect);
+        hThread.detach();
     });
 }
 
 void Mesh::start() {
-    isRunning = true;
+    this->isRunning = true;
 
     // Start NodeManager thread
     nodeManagerThread = std::thread(&Mesh::nodeManager, this);
@@ -68,24 +70,41 @@ void Mesh::start() {
 
 void Mesh::stop() {
     // Stop TCP server and close all incomming connections
-    std::cout << "Server stopping ..." << std::endl << std::flush;
+    std::cout << "Server stopping ... " << std::flush;
     server->stop();
-    std::cout << "Server stopped. " << std::endl << std::flush;
+    std::cout << "OK" << std::endl << std::flush;
 
-    std::cout << "Stoping mesh service ..." << std::endl << std::flush;
-    isRunning = false;
+    std::cout << "Mesh service stopping ... " << std::flush;
+    {
+        std::lock_guard lk(cv_m);
+        this->isRunning = false;
+    }
     cv.notify_all();
 
     if (nodeManagerThread.joinable()) {
         nodeManagerThread.join();
     }
+    std::cout << "OK" << std::endl << std::flush;
 
-    std::cout << "Closing all connections ..." << std::endl << std::flush;
-    // Close all outgoing connections
+    std::cout << "Closing all outgoing connections ... " << std::flush;
     for (auto& pair : outgoingConnections) {
         auto& connection = pair.second;
         if (connection) {
             connection->close();
+        }
+    }
+
+    std::cout << "Closing all incomming connections ... " << std::flush;
+    for (auto& pair : incommingConnections) {
+        auto& connection = pair.second;
+        if (connection) {
+            connection->close();
+        }
+    }
+
+    for (auto& th : threads) {
+        if (th.joinable()) {
+            th.join();
         }
     }
 
@@ -159,9 +178,14 @@ void Mesh::nodeManager() {
     // 4. Jeśli są, wypróbować inne połączenia z listy nawiązując maksymalną dopuszczoną ilość połączeń roboczych i skoczyć do pkt. 2
     // 5. Monitorować aktywne pozostałe połączenia, jeśli któreś zostanie zamkniętę, skocz do pkt. 1
 
-    while (isRunning) {
+    while (this->isRunning) {
         // Step 1. Select new nodes to connect
         for (auto& nodeAddress: nodeAddressList) {
+            // Don't connect new nodes if thread is requested to finish
+            if (!this->isRunning) {
+                break;
+            }
+
             // Don't connect new nodes if hard limit is reached
             if (this->outgoingConnections.size() >= hardLimit) {
                 break;
@@ -199,10 +223,12 @@ void Mesh::nodeManager() {
         // Jeśli istnieje ilość połączeń z przetestowaną jakością, powyżej softLimit, zamykamy najgorsze (inaczej pomijamy ten krok)
 
         // We break the main loop if running flag is set to false
-        std::unique_lock<std::mutex> lk(cv_m);
-        if(cv.wait_for(lk, std::chrono::milliseconds(100), [&]{return !isRunning;})) {
-            break;
-        }
+        {
+            std::unique_lock<std::mutex> lock(cv_m);
+            if(cv.wait_for(lock, std::chrono::milliseconds(100), [&]{return !this->isRunning;})) {
+                break;
+            }
+        }  
     }
 
     // std::cout << "Closing connections ..." << std::endl << std::flush;
@@ -237,9 +263,11 @@ void Mesh::onDataReceived(const std::string& nodeId, const std::string& dataName
 }
 
 void Mesh::connectToNode(const std::string& address, const int port) {
+    spdlog::trace("connectToNode: Start");
     std::shared_ptr<TcpClient> client = std::make_shared<TcpClient>();
 
     client->onConnect([this, client, address, port](int clientSocket) {
+        spdlog::trace("connectToNode: onConnect start");
         const invilite::ClientId* nodeId = this->nodeId;
         std::shared_ptr<NodeConnection> outgoingConnection = std::make_shared<NodeConnection>(clientSocket, nodeId, this->networkSecret);
 
@@ -254,7 +282,9 @@ void Mesh::connectToNode(const std::string& address, const int port) {
             spdlog::debug("onDisconnect: ConnectionThread for outgoing connection ended");
         };
 
-        std::future<void> future = std::async(&Mesh::connectionThread, this, outgoingConnection, onDisconnect);
+        //threads.push_back(std::thread(&Mesh::connectionThread, this, outgoingConnection, onDisconnect));
+        auto hThread = std::thread(&Mesh::connectionThread, this, outgoingConnection, onDisconnect);
+        hThread.detach();
 
         // Send handshake
         int handshakeResult = outgoingConnection->initHandshake();
@@ -264,53 +294,15 @@ void Mesh::connectToNode(const std::string& address, const int port) {
         }
 
         spdlog::trace("connectToNode: Handshake to {}:{} send successfuly.", address, port);
+        spdlog::trace("connectToNode: onConnect finish");
     });
 
     spdlog::trace("connectToNode: Opening connection to {}:{} ...", address, port);
 
     // Start connection
+    spdlog::trace("connectToNode: connect start");
     client->connect(address, port);
+    spdlog::trace("connectToNode: connect finish");
 
-    // Define simple data receive function, to handle only "node id" packets
-    // client->onDataReceived([this, client, address](const std::string& data) {
-    //     auto packetHeader = Serializer::getHeader(data);
-    //     if (packetHeader == MeshPacket::NODE_ID_PACKET) {
-    //         NodeIdPacket nodeIdPacket = NodeIdPacket::unpack(data);
-    //         const std::string nodeId = nodeIdPacket.nodeId;
-
-    //         // Detect loop connection
-    //         if (nodeId == *this->nodeId) {
-    //             std::cout << "Loop connection detected, disconnecting!" << std::endl;
-    //             client->disconnect();
-    //         }
-
-    //         {
-    //             // Register outgoing connection
-    //             std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
-    //             outgoing_nodes_[nodeId] = client;
-    //         }
-
-    //         client->onDisconnect([this, nodeId, address]() {
-    //             std::lock_guard<std::mutex> lockOutgoingNodes(nodes_mutex_);
-    //             std::lock_guard<std::mutex> lockconnectedAddresses(connectedAddressesMutex);
-    //             outgoing_nodes_.erase(nodeId);
-    //             this->connectedAddresses.erase(address);
-                
-    //             onNodeDisconnected(address);
-    //         });
-
-    //         onNodeConnected(nodeId);
-
-    //         // Redefine data receive function, to handle all protocol communications
-    //         client->onDataReceived([this, nodeId](const std::string& data) {
-    //             auto packetHeader = Serializer::getHeader(data);
-    //             switch(packetHeader) {
-    //             case MeshPacket::NAMED_STRING_PACKET:
-    //                 NamedStringPacket namedStringPacket = NamedStringPacket::unpack(data);
-    //                 onDataReceived(nodeId, namedStringPacket.dataName, namedStringPacket.data);
-    //                 break;
-    //             }
-    //         });
-    //     }
-    // });
+    spdlog::trace("connectToNode: Finish");
 }

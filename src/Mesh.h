@@ -13,7 +13,6 @@
 #include "ClientId.h"
 #include "TcpServer.h"
 #include "TcpClient.h"
-#include "MeshProtocol.h"
 #include "NodeConnection.h"
 
 struct NodeAddress {
@@ -42,6 +41,9 @@ namespace invilite {
 		// Nodes after successful handshake
 		// std::mutex connectionsMutex;
 		// std::unordered_map<int, std::shared_ptr<NodeConnection>> connections;
+
+		// Connections threads
+		std::vector<std::thread> threads;
 
 		// Active connections (incomming)
 		std::mutex incommingConnectionsMutex;

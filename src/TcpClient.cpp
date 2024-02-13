@@ -97,9 +97,17 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         return false;
     }
 
-    if (onConnect_) {
-        onConnect_(this->clientSocket);
+    std::cout << "Debug: onConnect start" << std::endl;
+    try {
+        if (onConnect_) {
+            onConnect_(this->clientSocket);
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Exception in onConnect_: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "Unknown exception in onConnect_" << std::endl;
     }
+    std::cout << "Debug: onConnect finish" << std::endl;
 
     return true;
 }

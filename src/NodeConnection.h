@@ -39,7 +39,6 @@ class NodeConnection {
 public:
 	NodeConnection(int clientSocket, const invilite::ClientId* nodeId, const SecByteBlock& networkSecret);
 	void close();
-
 	int getSocket() const;
 	int initHandshake();
 	int waitForHandshake(uint8_t timeout = 3);
@@ -50,7 +49,6 @@ public:
 	ssize_t send(const std::string& data);
     ssize_t send(const std::vector<uint8_t>& data);
     ssize_t send(const uint8_t* data, uint32_t dataLen);
-    ssize_t sendRaw(const std::vector<uint8_t>& data);
 
 protected:
 	int clientSocket;
@@ -58,6 +56,7 @@ protected:
 	const invilite::ClientId* nodeId;
 	const std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
 	const std::vector<uint8_t> decryptData(const std::vector<uint8_t>& packet);
+	ssize_t sendRaw(const std::vector<uint8_t>& data);
 
 private:
 	// Elliptic-curve Diffie-Hellman key exchange

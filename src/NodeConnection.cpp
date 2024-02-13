@@ -50,7 +50,7 @@ int invilite::NodeConnection::initHandshake() {
 }
 
 int invilite::NodeConnection::waitForHandshake(uint8_t timeout) {
-	spdlog::trace("waitForHandshake: Waiting for incomming handshake ...");
+	spdlog::trace("waitForHandshake: Waiting for handshake ...");
 
 	// message = nodeId[16] + pubKeyA + HMAC[networkSecret](nodeId + pubKeyA)
 	const size_t expectedLength = 16 + this->dh.PublicKeyLength() + this->hmac.DigestSize();
