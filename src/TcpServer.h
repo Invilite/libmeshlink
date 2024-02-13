@@ -18,7 +18,6 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include "ClientHandler.h"
 #include "debug.h"
 
 namespace invilite {
@@ -30,7 +29,6 @@ public:
 
     int start();
     void stop();
-    void sendTo(const std::shared_ptr<ClientHandler> &client, const std::string &data);
 
     using OnConnectCallback = std::function<void(int clientSocket, const sockaddr_storage* clientAddress)>;
     void onConnect(const OnConnectCallback &callback);
