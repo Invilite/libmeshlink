@@ -10,7 +10,6 @@
 #include <spdlog/fmt/fmt.h>
 #include "Mesh.h"
 #include "NodeId.h"
-#include "Serializer.h"
 #include "NetDiscovery.h"
 #include "IpTools.h"
 

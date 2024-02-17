@@ -40,9 +40,10 @@ namespace invilite {
 
 	protected:
 		const std::shared_ptr<invilite::TcpServer> server;
+
 		// Nodes after successful handshake
-		// std::mutex connectionsMutex;
-		// std::unordered_map<int, std::shared_ptr<NodeConnection>> connections;
+		std::mutex connectionsMutex;
+		std::unordered_map<int, std::shared_ptr<NodeConnection>> connections;
 
 		// Active connections (incomming)
 		std::mutex incommingConnectionsMutex;
@@ -55,11 +56,13 @@ namespace invilite {
 		std::thread nodeManagerThread;
 		std::list<NodeAddress> nodeAddressList;
 
-		void nodeManager();
+		virtual void nodeManager();
 		void connectionThread(std::shared_ptr<NodeConnection> connection, std::function<void()> onDisconnect);
 
 		// Connect to other server, send clientId, and wait for response with server client id, add new item to out_clients
     	void connect(const std::string& address, const int port);
+
+    	void onDataReceived(const std::vector<uint8_t>*data);
 
 	private:
 		const invilite::NodeId* nodeId;

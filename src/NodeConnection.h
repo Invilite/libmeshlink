@@ -41,10 +41,12 @@ public:
 	void close();
 	int getSocket() const;
 	int initHandshake();
-	int waitForHandshake(uint8_t timeout = 3);
+	int waitForHandshake(uint8_t timeout = 5);
 	int validateHandshake(const std::vector<uint8_t>* message);
 	int finishHandshake(const std::vector<uint8_t>* message);
 	const std::array<uint8_t, 16> getRemoteNodeId() const;
+	const std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
+	const std::vector<uint8_t> decryptData(const std::vector<uint8_t>& packet);
 
 	ssize_t send(const std::string& data);
     ssize_t send(const std::vector<uint8_t>& data);
@@ -55,8 +57,6 @@ protected:
 	std::array<uint8_t, 16> remoteNodeId;
 	const invilite::NodeId* nodeId;
 	const sockaddr_storage clientAddress;
-	const std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
-	const std::vector<uint8_t> decryptData(const std::vector<uint8_t>& packet);
 	ssize_t sendRaw(const std::vector<uint8_t>& data);
 
 private:

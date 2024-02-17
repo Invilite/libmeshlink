@@ -249,33 +249,29 @@ ssize_t invilite::NodeConnection::send(const uint8_t* rawData, uint32_t dataLen)
 
 ssize_t invilite::NodeConnection::send(const std::vector<uint8_t>& packetData) {
     if (clientSocket == -1) {
-        spdlog::error("Unable to send data: socket is closed");
+    	// Socket is closed
         return -1;
     }
 
-    const uint8_t  headerSize = 5;
-    const uint32_t packetSize = headerSize + packetData.size() + 2; // Header size, data size and crc size
-    const uint16_t crc = 0;
+    const uint8_t  headerSize = 4;
+    const uint32_t packetSize = headerSize + packetData.size();
     std::vector<uint8_t> packetHeader;
     packetHeader.reserve(headerSize);
 
     // Add packet header
-    packetHeader.push_back(0x01);   // Packet type
     for (int i = 3; i >= 0; --i) {
         packetHeader.push_back(static_cast<uint8_t>((packetSize >> (8 * i)) & 0xFF));
     }
 
-    // Join all buffers (without data copying)
-    struct iovec iov[3];
+    // Join all buffers (without data copying) - packetHeader + packetData
+    struct iovec iov[2];
     iov[0].iov_base = (void*) packetHeader.data();
     iov[0].iov_len = packetHeader.size();
     iov[1].iov_base = (void*) packetData.data();
     iov[1].iov_len = packetData.size();
-    iov[2].iov_base = (void*)&crc;
-    iov[2].iov_len = sizeof(crc);
 
     // Send data
-    ssize_t sentBytes = ::writev(clientSocket, iov, 3);
+    ssize_t sentBytes = ::writev(clientSocket, iov, 2);
     if (sentBytes != (ssize_t)packetSize) {
         spdlog::error("Unable to send data: not all bytes were sent");
     }
@@ -285,6 +281,7 @@ ssize_t invilite::NodeConnection::send(const std::vector<uint8_t>& packetData) {
 
 ssize_t invilite::NodeConnection::sendRaw(const std::vector<uint8_t>& data) {
 	if (this->clientSocket == -1) {
+		// Socket is closed
         return -1;
     }
 

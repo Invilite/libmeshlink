@@ -1,4 +1,5 @@
 #include "Mesh.h"
+#include <iomanip> // Dla std::setw i std::setfill
 
 using namespace invilite;
 using std::make_shared;
@@ -12,9 +13,11 @@ Mesh::Mesh(const uint16_t port, const NodeId* nodeId, const std::vector<uint32_t
 	server->onConnect([this](int clientSocket, const sockaddr_storage* clientAddress) {
         std::shared_ptr<NodeConnection> incommingConnection = std::make_shared<NodeConnection>(clientSocket, clientAddress, this->nodeId, this->networkSecret);
 
-        // Add incomming connection to map of incomming connections
-        std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
-        this->incommingConnections[clientSocket] = incommingConnection;
+        {
+            // Add incomming connection to map of incomming connections
+            std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
+            this->incommingConnections[clientSocket] = incommingConnection;
+        }
 
         // Remove connection from map on disconnect
         auto onDisconnect = [this, clientSocket]() {
