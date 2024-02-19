@@ -233,7 +233,12 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
     }
 
     const std::array<uint8_t, 16> remoteNodeId = connection->getRemoteNodeId();
-    spdlog::trace("[{}] Handshake complete", connection->getRemoteClientAddress());
+    {
+        std::stringstream ss;
+        for (auto byte: remoteNodeId) ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+        std::string nodeIdAsHexString = ss.str();
+        spdlog::trace("[{}] Handshake complete (node {})", connection->getRemoteClientAddress(), nodeIdAsHexString);
+    }
 
     if (onHandshake) {
         onHandshake();
@@ -245,8 +250,8 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
     ssize_t  bytesReceived;
     char recvBuffer[8192];
     while ((bytesReceived = recv(socket, recvBuffer, sizeof(recvBuffer), 0)) > 0) {
-        std::cout << "New data received, " << bytesReceived << " bytes." << std::endl;
-        PrintBuffer(recvBuffer, bytesReceived, 24);
+        // std::cout << "New data received, " << bytesReceived << " bytes." << std::endl;
+        // PrintBuffer(recvBuffer, bytesReceived, 24);
         packetBuffer.insert(packetBuffer.end(), recvBuffer, recvBuffer + bytesReceived);
 
         // Verify packet header if first 10 bytes was received
@@ -258,7 +263,7 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
         }
 
         if (expectedPacketLength > 0 && packetBuffer.size() >= expectedPacketLength) {
-            std::cout << "Complete packet received." << std::endl;
+            //std::cout << "Complete packet received." << std::endl;
             try {
                 const std::vector<uint8_t>data = connection->decryptData(packetBuffer);
                 if (onReceive) {
@@ -266,22 +271,25 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
                 }
                 this->notify(&data, &remoteNodeId);
             } catch (const std::exception& e) {
-                std::cerr << "Wyjątek podczas deszyfrowania danych: " << e.what() << std::endl;
+                connection->close();
+                spdlog::error("[{}] Unable to decrypt data: {}", connection->getRemoteClientAddress(), e.what());
             }
 
             packetBuffer.erase(packetBuffer.begin(), packetBuffer.begin() + expectedPacketLength);
             expectedPacketLength = 0;
         }
     }
+    spdlog::trace("[{}] Connection closed", connection->getRemoteClientAddress());
 
     if (onDisconnect) {
         onDisconnect();
     }
+
     spdlog::trace("[{}] Connection thread ended", connection->getRemoteClientAddress());
 }
 
 void Mesh::nodeManager() {
-    spdlog::debug("nodeManager: Starting NodeManager thread ...");
+    spdlog::debug("Starting NodeManager thread ...");
     pthread_setname_np(pthread_self(), "NodeManager");
 
     //const uint32_t softLimit = 2;
@@ -320,10 +328,10 @@ void Mesh::nodeManager() {
                 // }
 
                 if (IpTools::isLocalNetworkAddress(nodeAddress.address)) {
-                    spdlog::debug("nodeManager: Connecting to local node: {}:{}", nodeAddress.address, nodeAddress.port);
+                    spdlog::debug("Connecting to local node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connect(nodeAddress.address, 8420);
                 } else {
-                    spdlog::debug("nodeManager: Connecting to global node: {}:{}", nodeAddress.address, nodeAddress.port);
+                    spdlog::debug("Connecting to global node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connect(nodeAddress.address, 8420);
                 }
 
@@ -349,7 +357,7 @@ void Mesh::nodeManager() {
     // std::cout << "Closing connections ..." << std::endl << std::flush;
     // TODO: Zamknąć wszystkie nawiązane połączenia ...
 
-    spdlog::debug("nodeManager: Stopping NodeManager thread ...");
+    spdlog::debug("Stopping NodeManager thread ...");
 }
 
 void Mesh::addNode(const std::string& address, const uint16_t port) {
