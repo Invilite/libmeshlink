@@ -1,22 +1,13 @@
 #ifndef TCPCLIENT_H
 #define TCPCLIENT_H
 
-#include <mutex>
-#include <atomic>
-#include <thread>
 #include <chrono>
-#include <string>
 #include <fcntl.h>
 #include <unistd.h>
 #include <iostream>
-#include <sys/uio.h>
 #include <functional>
 #include <arpa/inet.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/select.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
 
 namespace invilite {
 

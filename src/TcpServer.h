@@ -1,23 +1,16 @@
 #ifndef TCP_SERVER_H
 #define TCP_SERVER_H
 
-#include <set>
-#include <mutex>
 #include <atomic>
-#include <string>
-#include <vector>
-#include <memory>
 #include <thread>
 #include <utility>
 #include <string.h>
 #include <unistd.h>
 #include <iostream>
-#include <algorithm>
 #include <functional>
 #include <arpa/inet.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
 #include "debug.h"
 
 namespace invilite {

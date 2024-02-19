@@ -3,7 +3,7 @@
 CXX = g++
 MAKEFLAGS += -j$(nproc)
 CXXFLAGS = -std=c++17 -Wall -Wextra -pedantic -fstack-protector-all
-LDFLAGS = -pthread -lcryptopp -static-libstdc++ -static-libgcc
+LDFLAGS = -pthread -lcryptopp -lrt -static-libstdc++ -static-libgcc
 #LDFLAGS = -pthread -lsfml-graphics -lsfml-window -lsfml-system
 
 TARGET = meshlinkd

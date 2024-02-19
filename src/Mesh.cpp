@@ -1,5 +1,4 @@
 #include "Mesh.h"
-#include <iomanip> // Dla std::setw i std::setfill
 
 using namespace invilite;
 using std::make_shared;
@@ -15,61 +14,109 @@ Mesh::Mesh(const uint16_t port, const NodeId* nodeId, const std::vector<uint32_t
 
         {
             // Add incomming connection to map of incomming connections
-            std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
+            std::unique_lock<std::shared_mutex> lock(this->incommingConnectionsMutex);
             this->incommingConnections[clientSocket] = incommingConnection;
         }
 
         // Remove connection from map on disconnect
-        auto onDisconnect = [this, clientSocket]() {
-            std::lock_guard<std::mutex> lock(this->incommingConnectionsMutex);
-            this->incommingConnections.erase(clientSocket);
-            spdlog::debug("onDisconnect: ConnectionThread for incomming connection ended");
+        auto onDisconnect = [this, clientSocket, incommingConnection]() {
+            {
+                const std::array<uint8_t, 16> remoteNodeId = incommingConnection->getRemoteNodeId();
+                std::unique_lock<std::shared_mutex> lock(this->connectionsMutex);
+                this->connections.erase(remoteNodeId);
+            }
+
+            {
+                std::unique_lock<std::shared_mutex> lock(this->incommingConnectionsMutex);
+                this->incommingConnections.erase(clientSocket);
+            }
+
+            incommingConnection->close();
+        };
+
+        auto onHandshake = [this, clientSocket, incommingConnection]() {
+            const std::array<uint8_t, 16> remoteNodeId = incommingConnection->getRemoteNodeId();
+
+            {
+                // Add connection to map of sucessful connections
+                std::unique_lock<std::shared_mutex> lock(this->connectionsMutex);
+                this->connections[remoteNodeId] = incommingConnection;
+            }
         };
 
         // Start thread for new connection
-        std::thread(&Mesh::connectionThread, this, incommingConnection, onDisconnect).detach();
+        std::thread(&Mesh::connectionThread, this, incommingConnection, onDisconnect, onHandshake).detach();
     });
 }
 
 void Mesh::connect(const std::string& address, const int port) {
-    spdlog::trace("connectToNode: Start");
     std::shared_ptr<TcpClient> client = std::make_shared<TcpClient>();
 
-    client->onConnect([this, address, port](int clientSocket, const sockaddr_storage* clientAddress) {
-        spdlog::trace("connectToNode: onConnect start");
+    // TODO: client
+    client->onConnect([this, client, address, port](int clientSocket, const sockaddr_storage* clientAddress) {
         std::shared_ptr<NodeConnection> outgoingConnection = std::make_shared<NodeConnection>(clientSocket, clientAddress, this->nodeId, this->networkSecret);
+        spdlog::trace("[{}] Connected.", outgoingConnection->getRemoteClientAddress());
 
         {
             // Add outgoing connection to map of outgoing connections
-            std::lock_guard<std::mutex> lock(this->outgoingConnectionsMutex);
+            std::unique_lock<std::shared_mutex> lock(this->outgoingConnectionsMutex);
             this->outgoingConnections[clientSocket] = outgoingConnection;
         }
 
-        auto onDisconnect = [this, clientSocket]() {
-            std::lock_guard<std::mutex> lock(this->outgoingConnectionsMutex);
-            this->outgoingConnections.erase(clientSocket);
+        auto onDisconnect = [this, clientSocket, outgoingConnection]() {
+            {
+                const std::array<uint8_t, 16> remoteNodeId = outgoingConnection->getRemoteNodeId();
+                std::unique_lock<std::shared_mutex> lock(this->connectionsMutex);
+                this->connections.erase(remoteNodeId);
+            }
+
+            {
+                std::unique_lock<std::shared_mutex> lock(this->outgoingConnectionsMutex);
+                this->outgoingConnections.erase(clientSocket);
+            }
+
+            outgoingConnection->close();
             spdlog::debug("onDisconnect: ConnectionThread for outgoing connection ended");
         };
 
+        auto onHandshake = [this, clientSocket, outgoingConnection]() {
+            const std::array<uint8_t, 16> remoteNodeId = outgoingConnection->getRemoteNodeId();
+
+            {
+                // Add connection to map of sucessful connections
+                std::unique_lock<std::shared_mutex> lock(this->connectionsMutex);
+                this->connections[remoteNodeId] = outgoingConnection;
+            }
+
+            std::vector<uint8_t> data;
+            data.reserve(4);
+            data.push_back(0x01);
+            data.push_back(0x02);
+            data.push_back(0x03);
+            data.push_back(0x04);
+
+            const std::vector<uint8_t> encData = outgoingConnection->encryptData(data);
+            const char* buffer = reinterpret_cast<const char*>(encData.data());
+            PrintBuffer(buffer, encData.size(), 24);
+            outgoingConnection->sendRaw(encData);
+        };
+
         // Start thread for new connection
-        std::thread(&Mesh::connectionThread, this, outgoingConnection, onDisconnect).detach();
+        std::thread(&Mesh::connectionThread, this, outgoingConnection, onDisconnect, onHandshake).detach();
 
         // Init handshake with server
         int handshakeResult = outgoingConnection->initHandshake();
         if (handshakeResult != 0) {
-            std::cout << "Unable to send handshake!" << std::endl;
+            spdlog::trace("[{}] Unable to send handshake!", outgoingConnection->getRemoteClientAddress());
             outgoingConnection->close();
+        } else {
+            spdlog::trace("[{}] Handshake sended successfuly.", outgoingConnection->getRemoteClientAddress());
         }
-
-        spdlog::trace("connectToNode: Handshake to {}:{} send successfuly.", address, port);
     });
 
-    spdlog::trace("connectToNode: Opening connection to {}:{} ...", address, port);
-
     // Start connection
-    spdlog::trace("connectToNode: connect start");
+    spdlog::debug("Opening new connection to {} ...", address);
     client->connect(address, port);
-    spdlog::trace("connectToNode: connect finish");
 }
 
 void Mesh::start() {
@@ -79,7 +126,9 @@ void Mesh::start() {
     nodeManagerThread = std::thread(&Mesh::nodeManager, this);
 
 	// Start TCP server for incomming connections
-	server->start();
+	if (server->start() == 0) {
+        spdlog::debug("Server listening ...");
+    }
 }
 
 void Mesh::stop() {
@@ -118,104 +167,117 @@ void Mesh::stop() {
     bool allClosed = false;
     while (!allClosed) {
         {
-            std::lock_guard<std::mutex> incomingLock(incommingConnectionsMutex);
-            std::lock_guard<std::mutex> outgoingLock(outgoingConnectionsMutex);
+            std::shared_lock<std::shared_mutex> incommingLock(this->incommingConnectionsMutex);
+            std::shared_lock<std::shared_mutex> outgoingLock(this->outgoingConnectionsMutex);
             allClosed = incommingConnections.empty() && outgoingConnections.empty();
         }
 
         if (!allClosed) {
-            // Czekaj 100ms przed kolejnym sprawdzeniem
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Czekaj 50ms przed kolejnym sprawdzeniem
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
     std::cout << "Mesh network stopped." << std::endl << std::flush;
 }
 
-void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::function<void()> onDisconnect) {
+void Mesh::attach(PacketObserver* observer) {
+    observers.push_back(observer);
+}
+
+void Mesh::detach(PacketObserver* observer) {
+    observers.remove(observer);
+}
+
+void Mesh::setOnReceivedCallback(OnReceiveType callback) {
+    this->onReceive = callback;
+}
+
+void Mesh::notify(const std::vector<uint8_t>* data, const std::array<uint8_t, 16>* remoteNodeId) {
+    for (PacketObserver* observer : observers) {
+        observer->update(data, remoteNodeId);
+    }
+}
+
+void Mesh::broadcast(const std::vector<uint8_t>* data) {
+    // TODO: Made this async?
+    std::shared_lock<std::shared_mutex> lock(this->connectionsMutex);
+    for (const auto& pair: connections) {
+        //std::cout << "Klucz: " << pair.first << std::endl;
+        const std::vector<uint8_t> encData = pair.second->encryptData(*data);
+        pair.second->sendRaw(encData);
+    }
+}
+
+void Mesh::send(const std::vector<uint8_t>* data, const std::array<uint8_t, 16>* nodeId) {
+    auto it = connections.find(*nodeId);
+    if (it != connections.end()) {
+        auto connection = it->second;
+        const std::vector<uint8_t> encData = connection->encryptData(*data);
+        connection->sendRaw(encData);
+    }
+}
+
+void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::function<void()> onDisconnect, std::function<void()> onHandshake) {
     pthread_setname_np(pthread_self(), "NodeConnection");
     const int socket = connection->getSocket();
-    spdlog::trace("connectionThread: Connection thread started ...");
+    spdlog::trace("[{}] Connection thread started", connection->getRemoteClientAddress());
 
     // Wait for handshake from client or response from server
     if (connection->waitForHandshake() < 0) {
-        spdlog::trace("connectionThread: Handshake unsuccessful!");
-
         if (onDisconnect) {
             onDisconnect();
         }
-
-        connection->close();
-
+        spdlog::trace("[{}] Handshake unsuccessful", connection->getRemoteClientAddress());
         return;
     }
 
-    spdlog::debug("connectionThread: Handshake complete");
-
     const std::array<uint8_t, 16> remoteNodeId = connection->getRemoteNodeId();
-    std::stringstream ss;
+    spdlog::trace("[{}] Handshake complete", connection->getRemoteClientAddress());
 
-    for (auto byte : remoteNodeId) {
-        ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+    if (onHandshake) {
+        onHandshake();
     }
-
-    {
-        // Add connection to map of sucessful connections
-        std::lock_guard<std::mutex> lock(this->connectionsMutex);
-        this->connections[socket] = connection;
-    }
-
-    std::string hexRemoteNodeId = ss.str();
-    spdlog::info("Node {} connected", hexRemoteNodeId);
 
     std::vector<uint8_t> packetBuffer;
+    uint8_t  expectedProtocol = 0;
     uint32_t expectedPacketLength = 0;
-    ssize_t bytes_received;
-    char buffer[1024];
-    while ((bytes_received = recv(socket, buffer, sizeof(buffer), 0)) > 0) {
-        packetBuffer.insert(packetBuffer.end(), buffer, buffer + bytes_received);
+    ssize_t  bytesReceived;
+    char recvBuffer[8192];
+    while ((bytesReceived = recv(socket, recvBuffer, sizeof(recvBuffer), 0)) > 0) {
+        std::cout << "New data received, " << bytesReceived << " bytes." << std::endl;
+        PrintBuffer(recvBuffer, bytesReceived, 24);
+        packetBuffer.insert(packetBuffer.end(), recvBuffer, recvBuffer + bytesReceived);
 
-        if (expectedPacketLength == 0 && packetBuffer.size() >= sizeof(uint32_t)) {
-            memcpy(&expectedPacketLength, packetBuffer.data(), sizeof(uint32_t));
+        // Verify packet header if first 10 bytes was received
+        if (expectedPacketLength == 0 && packetBuffer.size() >= 10) {
+            if (!connection->verifyHeader(packetBuffer, expectedPacketLength, expectedProtocol)) {
+                connection->close();
+                spdlog::error("[{}] Wrong protocol header was received, connection terminated.", connection->getRemoteClientAddress());
+            }
         }
 
         if (expectedPacketLength > 0 && packetBuffer.size() >= expectedPacketLength) {
-            std::vector<uint8_t> packet(packetBuffer.begin(), packetBuffer.begin() + expectedPacketLength);
-            packetBuffer.erase(packetBuffer.begin(), packetBuffer.begin() + expectedPacketLength);
-            expectedPacketLength = 0;
-
+            std::cout << "Complete packet received." << std::endl;
             try {
-                const std::vector<uint8_t>data = connection->decryptData(packet);
-                this->onDataReceived(&data);
-
+                const std::vector<uint8_t>data = connection->decryptData(packetBuffer);
+                if (onReceive) {
+                    onReceive(&data, &remoteNodeId);
+                }
+                this->notify(&data, &remoteNodeId);
             } catch (const std::exception& e) {
                 std::cerr << "Wyjątek podczas deszyfrowania danych: " << e.what() << std::endl;
             }
 
+            packetBuffer.erase(packetBuffer.begin(), packetBuffer.begin() + expectedPacketLength);
+            expectedPacketLength = 0;
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(this->connectionsMutex);
-        this->connections.erase(socket);
-    }
-
-    spdlog::info("Node {} disconnected", hexRemoteNodeId);
     if (onDisconnect) {
         onDisconnect();
     }
-
-    connection->close();
-    spdlog::trace("Connection thread is stoping ...");
-}
-
-void Mesh::onDataReceived(const std::vector<uint8_t>*data) {
-    if (data != nullptr) {
-        for (const auto& byte : *data) {
-            std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte) << " ";
-        }
-        std::cout << std::dec << std::endl; // Powrót do wyświetlania w systemie dziesiętnym
-    }
+    spdlog::trace("[{}] Connection thread ended", connection->getRemoteClientAddress());
 }
 
 void Mesh::nodeManager() {

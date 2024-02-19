@@ -73,8 +73,6 @@ int invilite::TcpServer::start() {
         return -7;
     }
 
-    std::cout << "Server listening on port " << this->serverPort << std::endl;
-
     // Start server accept thread
     this->stopServer = false;
     this->serverThread = std::thread(&TcpServer::serverListener, this);

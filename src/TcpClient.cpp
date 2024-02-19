@@ -97,21 +97,27 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         return false;
     }
 
-    sockaddr_storage localAddress;
-    socklen_t addressLength = sizeof(localAddress);
-    getsockname(this->clientSocket, (struct sockaddr*)&localAddress, &addressLength);
+    // sockaddr_storage localAddress;
+    // socklen_t addressLength = sizeof(localAddress);
+    // getsockname(this->clientSocket, (struct sockaddr*)&localAddress, &addressLength);
 
-    std::cout << "Debug: onConnect start" << std::endl;
+    sockaddr_storage remoteAddress;
+    socklen_t addressLength = sizeof(remoteAddress);
+    if (getpeername(this->clientSocket, (struct sockaddr*)&remoteAddress, &addressLength) == -1) {
+        std::cerr << "Error: Could not get remote address" << std::endl;
+        this->disconnect();
+        return false;
+    }
+
     try {
         if (onConnect_) {
-            onConnect_(this->clientSocket, &localAddress);
+            onConnect_(this->clientSocket, &remoteAddress);
         }
     } catch (const std::exception& e) {
         std::cerr << "Exception in onConnect_: " << e.what() << std::endl;
     } catch (...) {
         std::cerr << "Unknown exception in onConnect_" << std::endl;
     }
-    std::cout << "Debug: onConnect finish" << std::endl;
 
     return true;
 }

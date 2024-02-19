@@ -3,10 +3,6 @@
 
 #include <set>
 #include <mutex>
-#include <vector>
-#include <string>
-#include <sstream>
-#include <algorithm>
 #include "File.h"
 #include "Node.h"
 

@@ -1,10 +1,8 @@
 #ifndef FILE_H
 #define FILE_H
 
-#include <string>
 #include <vector>
 #include <fstream>
-#include <iostream>
 #include <filesystem>
 
 namespace invilite {

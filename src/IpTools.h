@@ -1,7 +1,6 @@
 #ifndef IP_TOOLS_H
 #define IP_TOOLS_H
 
-#include <chrono>
 #include <vector>
 #include <string>
 #include <thread>
@@ -10,10 +9,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <iostream>
-#include <iostream>
 #include <ifaddrs.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/ip_icmp.h>
 

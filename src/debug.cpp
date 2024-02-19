@@ -13,7 +13,7 @@ void PrintBuffer(const char* buffer, int length, int headerLen) {
     for (int i = 0; i < length; i++) {
     	if (i < headerLen) {
     		printf("\u001b[38;5;212m");
-    	} else if (i >= length - 32) {
+    	} else if (i >= length - 16) {
     		printf("\u001b[38;5;80m");
     	} else {
         	printf("\u001b[38;5;118m");

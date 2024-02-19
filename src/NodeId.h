@@ -1,21 +1,10 @@
 #ifndef NODE_ID_H
 #define NODE_ID_H
 
-#include <ctime>
-#include <array>
-#include <cctype>
 #include <random>
-#include <string>
-#include <iomanip>
 #include <cpuid.h>
-#include <cstring>
-#include <sstream>
-#include <fstream>
 #include <unistd.h>
-#include <iostream>
 #include <crypto++/sha.h>
-#include <crypto++/hex.h>
-
 #include "File.h"
 
 namespace invilite {

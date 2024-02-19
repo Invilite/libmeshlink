@@ -3,6 +3,7 @@
 #include <memory>
 #include <csignal>
 #include <cstring>
+#include <mqueue.h>
 #include <iostream>
 #include <unistd.h> // usleep
 #include <spdlog/spdlog.h>
@@ -42,11 +43,18 @@ int main(int argc, char** argv) {
     std::vector<std::string> nodes;
     app.add_option("--node", nodes, "Node address")->expected(-1);
 
+    bool verbose = false;
+    app.add_flag("-v,--verbose", verbose, "More logs");
+
     // Parse command line arguments
     CLI11_PARSE(app, argc, argv);
 
     // Set logger level
-    spdlog::set_level(spdlog::level::trace);
+    if (verbose) {
+        spdlog::set_level(spdlog::level::trace);
+    } else {
+        spdlog::set_level(spdlog::level::info);
+    }
 
     // Register signals handler
     signal(SIGINT, signalHandler);
@@ -58,6 +66,33 @@ int main(int argc, char** argv) {
 
     uint16_t port = 8420;
     invilite::Mesh mesh(port, &nodeId, networkSecretKey);
+
+    // QUEUE
+    const char* queueName = "/testQueue";
+
+    // Atrybuty kolejki
+    mq_attr attr;
+    attr.mq_flags = 0;      // Blokujące operacje I/O
+    attr.mq_maxmsg = 10;    // Maksymalna liczba komunikatów w kolejce
+    attr.mq_msgsize = 1024; // Maksymalny rozmiar komunikatu
+    attr.mq_curmsgs = 0;    // Liczba komunikatów aktualnie w kolejce (ustawiane przez system)
+
+    // Utworzenie kolejki komunikatów (O_CREAT - utwórz jeśli nie istnieje, O_RDWR - otwórz do odczytu i zapisu)
+    mqd_t mq = mq_open(queueName, O_CREAT | O_RDWR, 0644, &attr);
+    if (mq == (mqd_t)-1) {
+        std::cerr << "Błąd przy tworzeniu kolejki: " << strerror(errno) << std::endl;
+        return 1;
+    }
+
+    // Komunikat do wysłania
+    const char* message = "Hello, Message Queue!";
+    if (mq_send(mq, message, strlen(message) + 1, 0) == -1) {
+        std::cerr << "Błąd przy wysyłaniu do kolejki: " << strerror(errno) << std::endl;
+        mq_close(mq);
+        mq_unlink(queueName); // Usunięcie kolejki
+        return 1;
+    }
+    // QUEUE
 
     // Add node addresses from command line
     for (const auto& node : nodes) {
@@ -82,6 +117,18 @@ int main(int argc, char** argv) {
     for (const Node& node: allEntries) {
         mesh.addNode(node.address, node.port);
     }
+
+    mesh.setOnReceivedCallback([](const std::vector<uint8_t>* data, const std::array<uint8_t, 16>* remoteNodeId) {
+        std::cout << "Dane odebrane od węzła: ";
+        for (auto byte : *remoteNodeId) {
+            std::cout << std::hex << static_cast<int>(byte);
+        }
+        std::cout << "\nDane: ";
+        for (auto byte : *data) {
+            std::cout << std::hex << static_cast<int>(byte) << " ";
+        }
+        std::cout << std::endl;
+    });
 
     // Starting mesh network ...
     spdlog::debug("Starting mesh network with local id \"{}\" ...", nodeId.getIdAsString());
@@ -123,6 +170,10 @@ int main(int argc, char** argv) {
     } catch (const std::exception &e) {
         std::cerr << "Exception caught when stopping mesh service: " << e.what() << std::endl;
     }
+
+    // Zamknięcie i usunięcie kolejki
+    mq_close(mq);
+    //mq_unlink(queueName);
 
     std::cout << "Exiting ..." << std::endl;
 
