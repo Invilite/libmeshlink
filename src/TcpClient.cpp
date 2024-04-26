@@ -6,12 +6,12 @@ invilite::TcpClient::~TcpClient() {
     disconnect();
 }
 
-bool invilite::TcpClient::connect(const std::string& address, const int port, std::chrono::seconds timeout) {
+uint8_t invilite::TcpClient::connect(const std::string& address, const int port, std::chrono::seconds timeout) {
     // Creating a new socket
     this->clientSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (this->clientSocket < 0) {
         std::cerr << "Error: Cannot create socket" << std::endl;
-        return false;
+        return 1;
     }
 
     // Setting socket to non-blocking mode
@@ -19,13 +19,13 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
     if (flags < 0) {
         std::cerr << "Error: fcntl F_GETFL failed" << std::endl;
         this->disconnect();
-        return false;
+        return 10;
     }
 
     if (fcntl(this->clientSocket, F_SETFL, flags | O_NONBLOCK) < 0) {
         std::cerr << "Error: fcntl F_SETFL failed" << std::endl;
         this->disconnect();
-        return false;
+        return 11;
     }
 
     // Initiate connection
@@ -50,13 +50,13 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         if (select_result < 0) { // błąd select
             std::cerr << "Error: select failed" << std::endl;
             this->disconnect();
-            return false;
+            return 101;
         }
 
         if (select_result == 0) { // timeout
             std::cerr << "Error: Connection timed out" << std::endl;
             this->disconnect();
-            return false;
+            return 102;
         }
 
         // Sprawdź, czy połączenie zostało nawiązane poprawnie
@@ -65,14 +65,14 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         getsockopt(this->clientSocket, SOL_SOCKET, SO_ERROR, &error, &error_len);
 
         if (error != 0) { // błąd podczas nawiązywania połączenia
-            std::cerr << "Error: Connection failed" << std::endl;
+            //std::cerr << "Error: Connection failed" << std::endl;
             this->disconnect();
-            return false;
+            return 103;
         }
     } else if (connect_result == -1) { // błąd podczas próby połączenia
         std::cerr << "Error: Connection attempt failed" << std::endl;
         this->disconnect();
-        return false;
+        return 100;
     }
 
     // Restoring the blocking state of the socket
@@ -80,13 +80,13 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
     if (flags < 0) {
         std::cerr << "Error: fcntl F_GETFL failed" << std::endl;
         this->disconnect();
-        return false;
+        return 12;
     }
 
     if (fcntl(this->clientSocket, F_SETFL, flags & ~O_NONBLOCK) < 0) {
         std::cerr << "Error: fcntl F_SETFL failed" << std::endl;
         this->disconnect();
-        return false;
+        return 13;
     }
 
     // Set KEEPALIVE option
@@ -94,7 +94,7 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
     if (setsockopt(this->clientSocket, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) < 0) {
         std::cerr << "Error: setsockopt SO_KEEPALIVE failed" << std::endl;
         this->disconnect();
-        return false;
+        return 14;
     }
 
     // sockaddr_storage localAddress;
@@ -106,7 +106,7 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
     if (getpeername(this->clientSocket, (struct sockaddr*)&remoteAddress, &addressLength) == -1) {
         std::cerr << "Error: Could not get remote address" << std::endl;
         this->disconnect();
-        return false;
+        return 200;
     }
 
     try {
@@ -119,7 +119,7 @@ bool invilite::TcpClient::connect(const std::string& address, const int port, st
         std::cerr << "Unknown exception in onConnect_" << std::endl;
     }
 
-    return true;
+    return 0;
 }
 
 void invilite::TcpClient::disconnect() {

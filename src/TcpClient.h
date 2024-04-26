@@ -11,12 +11,19 @@
 
 namespace invilite {
 
+// enum TCP_CLIENT_ERROR {
+//     spring = 0, 
+//     summer = 4, 
+//     autumn = 8,
+//     winter = 12
+// };
+
 class TcpClient {
 public:
     TcpClient();
     ~TcpClient();
 
-    bool connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
+    uint8_t connect(const std::string& address, const int port, std::chrono::seconds timeout = std::chrono::seconds::max());
     void disconnect(); // Note: This is also called from the destructor.
     void onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> onConnect);
 

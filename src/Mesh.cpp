@@ -52,7 +52,7 @@ Mesh::Mesh(const uint16_t port, const NodeId* nodeId, const std::vector<uint32_t
 void Mesh::connect(const std::string& address, const int port) {
     std::shared_ptr<TcpClient> client = std::make_shared<TcpClient>();
 
-    // TODO: client
+    // TODO: client scope
     client->onConnect([this, client, address, port](int clientSocket, const sockaddr_storage* clientAddress) {
         std::shared_ptr<NodeConnection> outgoingConnection = std::make_shared<NodeConnection>(clientSocket, clientAddress, this->nodeId, this->networkSecret);
         spdlog::trace("[{}] Connected.", outgoingConnection->getRemoteClientAddress());
@@ -88,17 +88,22 @@ void Mesh::connect(const std::string& address, const int port) {
                 this->connections[remoteNodeId] = outgoingConnection;
             }
 
-            std::vector<uint8_t> data;
-            data.reserve(4);
-            data.push_back(0x01);
-            data.push_back(0x02);
-            data.push_back(0x03);
-            data.push_back(0x04);
+            // Send local nodes list
+            MeshEvent event(1);
+            event.setTopic("network.client.list");
+            
+            // Inline serialization of node addresses list
+            std::vector<uint8_t> serializedAddresses;
+            for (const auto& address : this->nodeAddressList) {
+                // Serialize each address, example serialization of simple address data
+                std::copy(address.address.begin(), address.address.end(), std::back_inserter(serializedAddresses));
+                uint16_t port = htons(address.port);
+                serializedAddresses.insert(serializedAddresses.end(), reinterpret_cast<uint8_t*>(&port), reinterpret_cast<uint8_t*>(&port) + sizeof(port));
+            }
+            event.setData(&serializedAddresses);
 
-            const std::vector<uint8_t> encData = outgoingConnection->encryptData(data);
-            const char* buffer = reinterpret_cast<const char*>(encData.data());
-            PrintBuffer(buffer, encData.size(), 24);
-            outgoingConnection->sendRaw(encData);
+            // Send the serialized event
+            outgoingConnection->sendEvent(&event);
         };
 
         // Start thread for new connection
@@ -116,7 +121,9 @@ void Mesh::connect(const std::string& address, const int port) {
 
     // Start connection
     spdlog::debug("Opening new connection to {} ...", address);
-    client->connect(address, port);
+    if (client->connect(address, port) != 0) {
+        spdlog::debug("Unable to connect to {}", address);
+    }
 }
 
 void Mesh::start() {
@@ -266,10 +273,28 @@ void Mesh::connectionThread(std::shared_ptr<NodeConnection> connection, std::fun
             //std::cout << "Complete packet received." << std::endl;
             try {
                 const std::vector<uint8_t>data = connection->decryptData(packetBuffer);
-                if (onReceive) {
-                    onReceive(&data, &remoteNodeId);
+                MeshEvent event = MeshEvent::deserialize(data);
+                
+                // For user events
+                if (onReceive && event.getType() == 0) {
+                    onReceive(&event, &remoteNodeId);
                 }
-                this->notify(&data, &remoteNodeId);
+                if (event.getType() == 0) {
+                    this->notify(&data, &remoteNodeId);
+                }
+
+                // For network diagnostics events
+                if (event.getType() == 1) {
+                    const std::vector<uint8_t>& eventTopic = event.getTopic();
+                    std::string topicString(eventTopic.begin(), eventTopic.end());
+
+                    if (topicString == "network.client.list") {
+                        // Wykonaj odpowiednią akcję
+                        spdlog::info("[{}] Action for network.client.list", connection->getRemoteClientAddress());
+                        // Tutaj możesz dodać kod, który ma być wykonany dla tego topicu
+                    }
+                }
+
             } catch (const std::exception& e) {
                 connection->close();
                 spdlog::error("[{}] Unable to decrypt data: {}", connection->getRemoteClientAddress(), e.what());
@@ -302,6 +327,15 @@ void Mesh::nodeManager() {
     // 5. Monitorować aktywne pozostałe połączenia, jeśli któreś zostanie zamkniętę, skocz do pkt. 1
 
     while (this->isRunning) {
+        // Get new nodes from buffer list
+        {
+            std::lock_guard<std::mutex> lock(this->newAddressBufferMutex);
+            if (!newAddressBuffer.empty()) {
+                spdlog::debug("Adding new addresses from buffer ...");
+                nodeAddressList.splice(nodeAddressList.end(), newAddressBuffer);
+            }
+        }
+
         // Step 1. Select new nodes to connect
         for (auto& nodeAddress: nodeAddressList) {
             // Don't connect new nodes if thread is requested to finish
@@ -328,14 +362,13 @@ void Mesh::nodeManager() {
                 // }
 
                 if (IpTools::isLocalNetworkAddress(nodeAddress.address)) {
-                    spdlog::debug("Connecting to local node: {}:{}", nodeAddress.address, nodeAddress.port);
+                    spdlog::trace("Connecting to local node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connect(nodeAddress.address, 8420);
                 } else {
-                    spdlog::debug("Connecting to global node: {}:{}", nodeAddress.address, nodeAddress.port);
+                    spdlog::trace("Connecting to global node: {}:{}", nodeAddress.address, nodeAddress.port);
                     connect(nodeAddress.address, 8420);
                 }
 
-                // TODO: Dodać mutex przy zapisie
                 nodeAddress.newOnList = false;
             }
         }
@@ -362,11 +395,12 @@ void Mesh::nodeManager() {
 
 void Mesh::addNode(const std::string& address, const uint16_t port) {
     NodeAddress nodeAddress = {
+        NodeListStatus::UNKNOWN,
         address,
         port,
         true
     };
 
-    std::lock_guard<std::mutex> lock(nodeAddressListMutex);
-    nodeAddressList.push_back(nodeAddress);
+    std::lock_guard<std::mutex> lock(this->newAddressBufferMutex);
+    newAddressBuffer.push_back(nodeAddress);
 }

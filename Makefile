@@ -3,7 +3,7 @@
 CXX = g++
 MAKEFLAGS += -j$(nproc)
 CXXFLAGS = -std=c++17 -Wall -Wextra -pedantic -fstack-protector-all
-LDFLAGS = -pthread -lcryptopp -lrt -static-libstdc++ -static-libgcc
+LDFLAGS = -pthread -lcryptopp -luuid -lrt -static-libstdc++ -static-libgcc
 #LDFLAGS = -pthread -lsfml-graphics -lsfml-window -lsfml-system
 
 TARGET = meshlinkd
@@ -11,7 +11,7 @@ INCLUDE = -I./include
 SOURCES = $(wildcard src/*.cpp) $(wildcard libs/*.cpp)
 OBJECTS = $(SOURCES:.cpp=.o)
 
-all: CXXFLAGS += -O2 -flto
+all: CXXFLAGS += -O1 -flto
 all: LDFLAGS += -flto -static
 all: $(TARGET)
 

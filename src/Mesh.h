@@ -11,13 +11,19 @@
 #include "NodeId.h"
 #include "IpTools.h"
 #include "NodeList.h"
+#include "MeshEvent.h"
 #include "TcpClient.h"
 #include "TcpServer.h"
 #include "SimpleHash.h"
 #include "PacketObserver.h"
 #include "NodeConnection.h"
 
+enum NodeListStatus {
+	UNKNOWN,
+};
+
 struct NodeAddress {
+	NodeListStatus status;
     std::string address;
     uint16_t port;
     bool newOnList;
@@ -26,7 +32,7 @@ struct NodeAddress {
 namespace invilite {
 	class Mesh {
 	public:
-		using OnReceiveType = std::function<void(const std::vector<uint8_t>*, const std::array<uint8_t, 16>*)>;
+		using OnReceiveType = std::function<void(const MeshEvent*, const std::array<uint8_t, 16>*)>;
 
 		Mesh(const uint16_t port, const invilite::NodeId* nodeId, const std::vector<uint32_t> networkSecretKey);
 		virtual ~Mesh() = default;
@@ -59,7 +65,9 @@ namespace invilite {
 	    std::shared_mutex outgoingConnectionsMutex;
 	    std::unordered_map<int, std::shared_ptr<NodeConnection>> outgoingConnections;
 
-		std::thread nodeManagerThread;
+	    // List of all known nodes adresses
+		std::mutex newAddressBufferMutex;
+		std::list<NodeAddress> newAddressBuffer;
 		std::list<NodeAddress> nodeAddressList;
 
 		virtual void nodeManager();
@@ -74,7 +82,7 @@ namespace invilite {
 	private:
 		const invilite::NodeId* nodeId;
 		SecByteBlock networkSecret;
-		std::mutex nodeAddressListMutex;
+		std::thread nodeManagerThread;
 		std::condition_variable cv;
 		std::mutex cv_m;
 		std::atomic<bool> isRunning = false;

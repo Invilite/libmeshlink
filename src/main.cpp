@@ -11,6 +11,7 @@
 #include <spdlog/fmt/fmt.h>
 #include "Mesh.h"
 #include "NodeId.h"
+#include "MeshEvent.h"
 #include "NetDiscovery.h"
 #include "IpTools.h"
 
@@ -19,7 +20,7 @@ const std::string cachePath = "/var/lib/" + serviceName;
 const std::string runDataPath = "/run/" + serviceName;
 
 // 512 bits password (64 bytes)
-static const std::vector<uint32_t> networkSecretKey = {
+static const std::vector<uint32_t> networkSecret = {
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
     0x00000000, 0x00000000, 0x00000000, 0x00000000,
@@ -65,33 +66,33 @@ int main(int argc, char** argv) {
     invilite::IpTools::getLocalInterfaces(&interfacesList);
 
     uint16_t port = 8420;
-    invilite::Mesh mesh(port, &nodeId, networkSecretKey);
+    invilite::Mesh mesh(port, &nodeId, networkSecret);
 
     // QUEUE
-    const char* queueName = "/testQueue";
+    // const char* queueName = "/testQueue";
 
-    // Atrybuty kolejki
-    mq_attr attr;
-    attr.mq_flags = 0;      // Blokujące operacje I/O
-    attr.mq_maxmsg = 10;    // Maksymalna liczba komunikatów w kolejce
-    attr.mq_msgsize = 1024; // Maksymalny rozmiar komunikatu
-    attr.mq_curmsgs = 0;    // Liczba komunikatów aktualnie w kolejce (ustawiane przez system)
+    // // Atrybuty kolejki
+    // mq_attr attr;
+    // attr.mq_flags = 0;      // Blokujące operacje I/O
+    // attr.mq_maxmsg = 10;    // Maksymalna liczba komunikatów w kolejce
+    // attr.mq_msgsize = 1024; // Maksymalny rozmiar komunikatu
+    // attr.mq_curmsgs = 0;    // Liczba komunikatów aktualnie w kolejce (ustawiane przez system)
 
-    // Utworzenie kolejki komunikatów (O_CREAT - utwórz jeśli nie istnieje, O_RDWR - otwórz do odczytu i zapisu)
-    mqd_t mq = mq_open(queueName, O_CREAT | O_RDWR, 0644, &attr);
-    if (mq == (mqd_t)-1) {
-        std::cerr << "Błąd przy tworzeniu kolejki: " << strerror(errno) << std::endl;
-        return 1;
-    }
+    // // Utworzenie kolejki komunikatów (O_CREAT - utwórz jeśli nie istnieje, O_RDWR - otwórz do odczytu i zapisu)
+    // mqd_t mq = mq_open(queueName, O_CREAT | O_RDWR, 0644, &attr);
+    // if (mq == (mqd_t)-1) {
+    //     std::cerr << "Błąd przy tworzeniu kolejki: " << strerror(errno) << std::endl;
+    //     return 1;
+    // }
 
-    // Komunikat do wysłania
-    const char* message = "Hello, Message Queue!";
-    if (mq_send(mq, message, strlen(message) + 1, 0) == -1) {
-        std::cerr << "Błąd przy wysyłaniu do kolejki: " << strerror(errno) << std::endl;
-        mq_close(mq);
-        mq_unlink(queueName); // Usunięcie kolejki
-        return 1;
-    }
+    // // Komunikat do wysłania
+    // const char* message = "Hello, Message Queue!";
+    // if (mq_send(mq, message, strlen(message) + 1, 0) == -1) {
+    //     std::cerr << "Błąd przy wysyłaniu do kolejki: " << strerror(errno) << std::endl;
+    //     mq_close(mq);
+    //     mq_unlink(queueName); // Usunięcie kolejki
+    //     return 1;
+    // }
     // QUEUE
 
     // Add node addresses from command line
@@ -118,14 +119,18 @@ int main(int argc, char** argv) {
         mesh.addNode(node.address, node.port);
     }
 
-    mesh.setOnReceivedCallback([](const std::vector<uint8_t>* data, const std::array<uint8_t, 16>* remoteNodeId) {
+    mesh.setOnReceivedCallback([](const invilite::MeshEvent* event, const std::array<uint8_t, 16>* remoteNodeId) {
         std::cout << "Dane odebrane od węzła: ";
         for (auto byte : *remoteNodeId) {
             std::cout << std::hex << static_cast<int>(byte);
         }
+        std::cout << "\nTopic: ";
+        for (auto byte : event->getTopic()) {
+            std::cout << static_cast<char>(byte); // Zakładając, że topic jest ciągiem znaków
+        }
         std::cout << "\nDane: ";
-        for (auto byte : *data) {
-            std::cout << std::hex << static_cast<int>(byte) << " ";
+        for (auto byte : event->getData()) {
+            std::cout << static_cast<char>(byte); // Zakładając, że data jest ciągiem znaków
         }
         std::cout << std::endl;
     });
@@ -172,7 +177,7 @@ int main(int argc, char** argv) {
     }
 
     // Zamknięcie i usunięcie kolejki
-    mq_close(mq);
+    //mq_close(mq);
     //mq_unlink(queueName);
 
     std::cout << "Exiting ..." << std::endl;

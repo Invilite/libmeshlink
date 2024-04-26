@@ -322,7 +322,7 @@ ssize_t invilite::NodeConnection::sendRaw(const std::vector<uint8_t>& data) {
 
     ssize_t totalSent = 0;
     ssize_t bytesLeft = data.size();
-    ssize_t n;
+    ssize_t n = 0;
 
     while (totalSent < bytesLeft) {
         n = ::send(this->clientSocket, data.data() + totalSent, bytesLeft, 0);
@@ -333,6 +333,14 @@ ssize_t invilite::NodeConnection::sendRaw(const std::vector<uint8_t>& data) {
 
     // Return -1 on error, total bytes send otherwise
     return (n == -1) ? -1 : totalSent;
+}
+
+ssize_t invilite::NodeConnection::sendEvent(const MeshEvent* event) {
+	const std::vector<uint8_t> data = event->serialize();
+	const std::vector<uint8_t> encData = this->encryptData(data);
+    // const char* buffer = reinterpret_cast<const char*>(encData.data());
+    // PrintBuffer(buffer, encData.size(), 24);
+    return this->sendRaw(encData);
 }
 
 const std::vector<uint8_t> invilite::NodeConnection::encryptData(const std::vector<uint8_t>& data) {
@@ -439,16 +447,17 @@ const std::vector<uint8_t> invilite::NodeConnection::decryptData(const std::vect
 }
 
 const std::array<uint8_t, 24> invilite::NodeConnection::createHeader(uint32_t packetSize, const CryptoPP::SecByteBlock& iv) {
-    std::array<uint8_t, 24> header;					// Reserve 24 bytes for header
-    header[0] = 0x55;								// Magic number byte 1
-    header[1] = 0xB4;								// Magic number byte 2
-    header[2] = 0x88;								// Magic number byte 3
-    header[3] = 0x01;								// Protocol version
-
-    header[6] = (packetSize >> 24) & 0xFF;
-    header[7] = (packetSize >> 16) & 0xFF;
-    header[8] = (packetSize >> 8) & 0xFF;
-    header[9] = packetSize & 0xFF;
+    std::array<uint8_t, 24> header;			// Reserve 24 bytes for header
+    header[0] = 0x55;						// Magic number byte 1
+    header[1] = 0xB4;						// Magic number byte 2
+    header[2] = 0x88;						// Magic number byte 3
+    header[3] = 0x01;						// Protocol version
+    header[3] = 0x00;						// Reserved
+    header[3] = 0x00;						// Reserved
+    header[6] = (packetSize >> 24) & 0xFF;	// Packet length
+    header[7] = (packetSize >> 16) & 0xFF;	// Packet length
+    header[8] = (packetSize >> 8) & 0xFF;	// Packet length
+    header[9] = packetSize & 0xFF;			// Packet length
 
     // Calculate CRC for first 10 bytes of header
     const uint16_t crc = calculateCRC16(header, 0, 10);

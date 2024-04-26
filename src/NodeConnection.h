@@ -17,6 +17,7 @@
 #include <cryptopp/secblock.h>
 #include <cryptopp/eccrypto.h>
 #include <cryptopp/chachapoly.h>
+#include "MeshEvent.h"
 #include "NodeId.h"
 #include "debug.h"
 
@@ -52,6 +53,7 @@ public:
     ssize_t send(const std::vector<uint8_t>& data);
     ssize_t send(const uint8_t* data, uint32_t dataLen);
     ssize_t sendRaw(const std::vector<uint8_t>& data);
+    ssize_t sendEvent(const MeshEvent* event);
 
     const char* getRemoteClientAddress();
 
