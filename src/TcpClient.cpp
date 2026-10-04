@@ -1,135 +1,170 @@
-#include "TcpClient.h"
+#include "transport/TcpClient.h"
 
-invilite::TcpClient::TcpClient() : clientSocket(-1) {}
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <iostream>
 
-invilite::TcpClient::~TcpClient() {
-    disconnect();
+namespace invilite::Transport {
+
+TcpClient::TcpClient() : clientSocket(-1) {}
+
+TcpClient::~TcpClient() {
+    this->disconnect();
 }
 
-uint8_t invilite::TcpClient::connect(const std::string& address, const int port, std::chrono::seconds timeout) {
-    // Creating a new socket
-    this->clientSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (this->clientSocket < 0) {
-        std::cerr << "Error: Cannot create socket" << std::endl;
-        return 1;
+uint8_t TcpClient::connect(const std::string& address, int port, std::chrono::seconds timeout) {
+    if (this->clientSocket != -1) {
+        return 1;                                                                   // already connected
     }
 
-    // Setting socket to non-blocking mode
-    int flags = fcntl(this->clientSocket, F_GETFL, 0);
-    if (flags < 0) {
-        std::cerr << "Error: fcntl F_GETFL failed" << std::endl;
-        this->disconnect();
-        return 10;
+    // Resolve address — handles IPv4 literals, IPv6 literals, and hostnames
+    addrinfo hints{};
+    hints.ai_family   = AF_UNSPEC;                                                  // accept both IPv4 and IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    char portStr[8];
+    std::snprintf(portStr, sizeof(portStr), "%d", port);
+
+    addrinfo* resolved = nullptr;
+    const int gai = ::getaddrinfo(address.c_str(), portStr, &hints, &resolved);
+    if (gai != 0) {
+        std::cerr << "TcpClient: getaddrinfo('" << address << "') failed: " << ::gai_strerror(gai) << std::endl;
+        return 2;
     }
 
-    if (fcntl(this->clientSocket, F_SETFL, flags | O_NONBLOCK) < 0) {
-        std::cerr << "Error: fcntl F_SETFL failed" << std::endl;
-        this->disconnect();
-        return 11;
-    }
+    sockaddr_storage remoteAddress{};
+    uint8_t          lastError = 100;
+    int              sock      = -1;
 
-    // Initiate connection
-    sockaddr_in server_address;
-    server_address.sin_family = AF_INET;
-    server_address.sin_addr.s_addr = inet_addr(address.c_str());
-    server_address.sin_port = htons(port);
-    int connect_result = ::connect(this->clientSocket, (struct sockaddr *)&server_address, sizeof(server_address));
+    // Try each resolved address in turn — first one that connects wins
+    for (addrinfo* rp = resolved; rp != nullptr; rp = rp->ai_next) {
+        sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock < 0) {
+            lastError = 3;
+            continue;
+        }
 
-    // Jeśli połączenie nie zostanie zakończone natychmiast, sprawdź czy będzie dostępne w czasie określonym przez timeout
-    if (connect_result == -1 && errno == EINPROGRESS) {
-        fd_set writefds;
-        FD_ZERO(&writefds);
-        FD_SET(this->clientSocket, &writefds);
+        // Non-blocking for timeout-based connect
+        const int flags = ::fcntl(sock, F_GETFL, 0);
+        if (flags < 0) {
+            ::close(sock);
+            sock = -1;
+            lastError = 10;
+            continue;
+        }
+        if (::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+            ::close(sock);
+            sock = -1;
+            lastError = 11;
+            continue;
+        }
+
+        const int result = ::connect(sock, rp->ai_addr, rp->ai_addrlen);
+
+        if (result == 0) {
+            // Instant connect (rare — e.g. loopback with nothing to wait for)
+            std::memcpy(&remoteAddress, rp->ai_addr, rp->ai_addrlen);
+            break;
+        }
+
+        if (result < 0 && errno != EINPROGRESS) {
+            ::close(sock);
+            sock = -1;
+            lastError = 100;
+            continue;
+        }
+
+        // EINPROGRESS — wait for socket to become writable within timeout
+        fd_set writeFds;
+        FD_ZERO(&writeFds);
+        FD_SET(sock, &writeFds);
 
         timeval tv;
-        tv.tv_sec = timeout.count();
+        tv.tv_sec  = timeout.count();
         tv.tv_usec = 0;
 
-        int select_result = select(this->clientSocket + 1, nullptr, &writefds, nullptr, &tv);
-
-        if (select_result < 0) { // błąd select
-            std::cerr << "Error: select failed" << std::endl;
-            this->disconnect();
-            return 101;
+        const int selResult = ::select(sock + 1, nullptr, &writeFds, nullptr, &tv);
+        if (selResult < 0) {
+            ::close(sock);
+            sock = -1;
+            lastError = 101;
+            continue;
+        }
+        if (selResult == 0) {
+            ::close(sock);
+            sock = -1;
+            lastError = 102;
+            continue;
         }
 
-        if (select_result == 0) { // timeout
-            std::cerr << "Error: Connection timed out" << std::endl;
-            this->disconnect();
-            return 102;
+        // Check connect result via SO_ERROR
+        int       soError = 0;
+        socklen_t errLen  = sizeof(soError);
+        if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &errLen) < 0 || soError != 0) {
+            ::close(sock);
+            sock = -1;
+            lastError = 103;
+            continue;
         }
 
-        // Sprawdź, czy połączenie zostało nawiązane poprawnie
-        int error;
-        socklen_t error_len = sizeof(error);
-        getsockopt(this->clientSocket, SOL_SOCKET, SO_ERROR, &error, &error_len);
-
-        if (error != 0) { // błąd podczas nawiązywania połączenia
-            //std::cerr << "Error: Connection failed" << std::endl;
-            this->disconnect();
-            return 103;
-        }
-    } else if (connect_result == -1) { // błąd podczas próby połączenia
-        std::cerr << "Error: Connection attempt failed" << std::endl;
-        this->disconnect();
-        return 100;
+        // Success
+        std::memcpy(&remoteAddress, rp->ai_addr, rp->ai_addrlen);
+        break;
     }
 
-    // Restoring the blocking state of the socket
-    flags = fcntl(this->clientSocket, F_GETFL, 0);
-    if (flags < 0) {
-        std::cerr << "Error: fcntl F_GETFL failed" << std::endl;
-        this->disconnect();
-        return 12;
+    ::freeaddrinfo(resolved);
+
+    if (sock < 0) {
+        return lastError;
     }
 
-    if (fcntl(this->clientSocket, F_SETFL, flags & ~O_NONBLOCK) < 0) {
-        std::cerr << "Error: fcntl F_SETFL failed" << std::endl;
-        this->disconnect();
-        return 13;
-    }
+    this->clientSocket = sock;
 
-    // Set KEEPALIVE option
-    int enable = 1;
-    if (setsockopt(this->clientSocket, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) < 0) {
-        std::cerr << "Error: setsockopt SO_KEEPALIVE failed" << std::endl;
+    // Enable TCP keepalive
+    const int enable = 1;
+    if (::setsockopt(this->clientSocket, SOL_SOCKET, SO_KEEPALIVE, &enable, sizeof(enable)) < 0) {
         this->disconnect();
         return 14;
     }
 
-    // sockaddr_storage localAddress;
-    // socklen_t addressLength = sizeof(localAddress);
-    // getsockname(this->clientSocket, (struct sockaddr*)&localAddress, &addressLength);
-
-    sockaddr_storage remoteAddress;
-    socklen_t addressLength = sizeof(remoteAddress);
-    if (getpeername(this->clientSocket, (struct sockaddr*)&remoteAddress, &addressLength) == -1) {
-        std::cerr << "Error: Could not get remote address" << std::endl;
-        this->disconnect();
-        return 200;
-    }
-
+    // Fire callback — caller may extract socket via release() if they want ownership
     try {
-        if (onConnect_) {
-            onConnect_(this->clientSocket, &remoteAddress);
+        if (this->onConnect_) {
+            this->onConnect_(this->clientSocket, &remoteAddress);
         }
     } catch (const std::exception& e) {
-        std::cerr << "Exception in onConnect_: " << e.what() << std::endl;
+        std::cerr << "TcpClient: exception in onConnect callback: " << e.what() << std::endl;
     } catch (...) {
-        std::cerr << "Unknown exception in onConnect_" << std::endl;
+        std::cerr << "TcpClient: unknown exception in onConnect callback" << std::endl;
     }
 
     return 0;
 }
 
-void invilite::TcpClient::disconnect() {
+void TcpClient::disconnect() {
     if (this->clientSocket != -1) {
-        shutdown(this->clientSocket, SHUT_RDWR);
-        close(this->clientSocket);
+        ::shutdown(this->clientSocket, SHUT_RDWR);
+        ::close(this->clientSocket);
         this->clientSocket = -1;
     }
 }
 
-void invilite::TcpClient::onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> onConnect) {
-    onConnect_ = onConnect;
+int TcpClient::release() {
+    const int fd = this->clientSocket;
+    this->clientSocket = -1;
+    return fd;
 }
+
+void TcpClient::onConnect(std::function<void(int, const sockaddr_storage*)> cb) {
+    this->onConnect_ = std::move(cb);
+}
+
+} // namespace invilite::Transport

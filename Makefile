@@ -1,31 +1,43 @@
-# sudo apt install libcrypto++8
+# sudo apt install libgtest-dev
 
 CXX = g++
 MAKEFLAGS += -j$(nproc)
-CXXFLAGS = -std=c++17 -Wall -Wextra -pedantic -fstack-protector-all
-LDFLAGS = -pthread -lcryptopp -luuid -lrt -static-libstdc++ -static-libgcc
-#LDFLAGS = -pthread -lsfml-graphics -lsfml-window -lsfml-system
+CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic -fPIC -fstack-protector-all
+LDFLAGS = ../botan/libbotan-3.a
 
-TARGET = meshlinkd
-INCLUDE = -I./include
+STATIC_LIB = libmeshlink.a
+SHARED_LIB = libmeshlink.so
+INCLUDE = -I./include -I../botan/build/include/public
 SOURCES = $(wildcard src/*.cpp) $(wildcard libs/*.cpp)
 OBJECTS = $(SOURCES:.cpp=.o)
+TEST_SOURCES = $(wildcard tests/*.cpp)
+TEST_OBJECTS = $(TEST_SOURCES:.cpp=.o)
+TEST_BINARY = run_test
 
-all: CXXFLAGS += -O1 -flto
-all: LDFLAGS += -flto -static
-all: $(TARGET)
+all: CXXFLAGS += -O2 -flto
+all: LDFLAGS += -flto
+all: $(STATIC_LIB) $(SHARED_LIB)
 
 dev: CXXFLAGS += -g -fsanitize=thread -fsanitize=undefined
 dev: LDFLAGS += -fsanitize=thread -fsanitize=undefined
-dev: $(TARGET)
+dev: $(STATIC_LIB) $(SHARED_LIB)
 
-$(TARGET): $(OBJECTS)
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -o $@ $^ $(LDFLAGS)
+$(STATIC_LIB): $(OBJECTS)
+	ar rcs $@ $^
+
+$(SHARED_LIB): $(OBJECTS)
+	$(CXX) -shared -o $@ $^ $(LDFLAGS)
+
+tests: $(TEST_OBJECTS) $(STATIC_LIB)
+	$(CXX) $(CXXFLAGS) -o $(TEST_BINARY) $(TEST_OBJECTS) -L. -lmeshlink -lgtest_main -lgtest -lpthread
 
 %.o: %.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
+
+tests/%.o: tests/%.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
 
 .PHONY: clean
 
 clean:
-	rm -f $(OBJECTS) $(TARGET)
+	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB)

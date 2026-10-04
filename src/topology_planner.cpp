@@ -1,0 +1,46 @@
+#include "meshlink/topology_planner.h"
+#include "meshlink/network.h"                                                       // full NetworkConfig definition
+
+#include <algorithm>
+#include <random>
+
+namespace invilite::Mesh {
+
+    namespace {
+        constexpr auto TICK_NEEDS_PEERS = std::chrono::milliseconds(3000);             // actively building connections
+        constexpr auto TICK_WAITING     = std::chrono::milliseconds(10000);            // below target but no candidates yet
+        constexpr auto TICK_SATISFIED   = std::chrono::milliseconds(30000);            // outbound target met
+    }
+
+    TopologyDecision TopologyPlanner::evaluate(const std::vector<ConnectedPeerInfo>& connected,
+                                               const std::vector<SignedPeerRecord>&  candidates,
+                                               const NetworkConfig&                  config) const {
+        TopologyDecision decision;
+
+        const size_t outboundCount = std::count_if(connected.begin(), connected.end(),
+                                                   [](const ConnectedPeerInfo& p) { return p.isOutbound; });
+
+        if (outboundCount >= config.targetOutbound || candidates.empty()) {
+            decision.nextTick = (outboundCount >= config.targetOutbound)
+                                ? TICK_SATISFIED
+                                : TICK_WAITING;
+            return decision;
+        }
+
+        // Pick a random candidate — fair distribution, avoids always hammering the same peer.
+        // Caller has already excluded self and currently connected peers.
+        static thread_local std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+        const SignedPeerRecord& chosen = candidates[dist(rng)];
+
+        if (!chosen.addresses.empty()) {
+            decision.connectTo = { chosen.addresses.front().address, chosen.addresses.front().port };
+        }
+
+        // disconnect remains nullopt until scoring is available (FoundAnother / churn)
+
+        decision.nextTick = decision.connectTo.has_value() ? TICK_NEEDS_PEERS : TICK_WAITING;
+        return decision;
+    }
+
+} // namespace invilite::Mesh

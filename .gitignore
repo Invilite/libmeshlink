@@ -1,2 +1,7 @@
 *.o
-meshlinkd
+*.a
+*.so
+.idea/
+*.pid
+*.log
+run_test

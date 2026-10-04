@@ -1,14 +1,14 @@
-#include "TcpServer.h"
+#include "transport/TcpServer.h"
 
-invilite::TcpServer::TcpServer(const int port) : serverPort(port), serverSocket(-1) {}
+invilite::Transport::TcpServer::TcpServer(const int port) : serverPort(port), serverSocket(-1) {}
 
-invilite::TcpServer::~TcpServer() {
+invilite::Transport::TcpServer::~TcpServer() {
     if (serverSocket != -1) {
         close(serverSocket);
     }
 }
 
-int invilite::TcpServer::start() {
+int invilite::Transport::TcpServer::start() {
     // Stop server if running
     this->stop();
 
@@ -81,7 +81,7 @@ int invilite::TcpServer::start() {
     return 0;
 }
 
-void invilite::TcpServer::stop() {
+void invilite::Transport::TcpServer::stop() {
     // Stop server thread
     this->stopServer = true;
 
@@ -100,14 +100,14 @@ void invilite::TcpServer::stop() {
     this->serverSocket = -1;
 }
 
-void invilite::TcpServer::serverListener() {
+void invilite::Transport::TcpServer::serverListener() {
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         std::cerr << "Error: Cannot create epoll" << std::endl;
         return;
     }
 
-    const int MAX_EVENTS = 15;
+    const int MAX_EVENTS = 25;
     struct epoll_event ev, events[MAX_EVENTS];
     ev.events = EPOLLIN;
     ev.data.fd = this->serverSocket;
@@ -128,11 +128,11 @@ void invilite::TcpServer::serverListener() {
         for (int n = 0; n < nfds; ++n) {
             if (events[n].data.fd == this->serverSocket) {
                 // New connection
-                sockaddr_storage clientAddress;
+                sockaddr_storage clientAddress{};
                 socklen_t clientAddressLength = sizeof(clientAddress);
-                int clientSocket = accept(this->serverSocket, (struct sockaddr *)&clientAddress, &clientAddressLength);
+                const int clientSocket = accept(this->serverSocket, reinterpret_cast<struct sockaddr *>(&clientAddress), &clientAddressLength);
 
-                // If we have a error, but it's causing by stoping server stop this loop
+                // If we have an error, but it's causing by stoping server stop this loop
                 if (clientSocket < 0 && this->stopServer) {
                     break;
                 }
@@ -150,6 +150,6 @@ void invilite::TcpServer::serverListener() {
     }
 }
 
-void invilite::TcpServer::onConnect(const OnConnectCallback &callback) {
+void invilite::Transport::TcpServer::onConnect(const OnConnectCallback &callback) {
     on_connect_callback_ = callback;
 }
