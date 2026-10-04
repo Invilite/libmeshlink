@@ -3,6 +3,7 @@
 CXX = g++
 MAKEFLAGS += -j$(nproc)
 CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic -fPIC -fstack-protector-all
+DEPFLAGS = -MMD -MP                                         # emit .d files so header edits rebuild every dependent object
 LDFLAGS = ../botan/libbotan-3.a
 
 STATIC_LIB = libmeshlink.a
@@ -32,12 +33,14 @@ tests: $(TEST_OBJECTS) $(STATIC_LIB)
 	$(CXX) $(CXXFLAGS) -o $(TEST_BINARY) $(TEST_OBJECTS) $(STATIC_LIB) $(LDFLAGS) -lgtest_main -lgtest -lpthread
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
 tests/%.o: tests/%.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
 .PHONY: clean
 
 clean:
-	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY)
+	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY) $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+
+-include $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)

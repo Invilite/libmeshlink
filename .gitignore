@@ -5,3 +5,4 @@
 *.pid
 *.log
 run_test
+*.d
