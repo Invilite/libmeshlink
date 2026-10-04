@@ -78,3 +78,35 @@ PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<SignedP
 }
 
 } // namespace invilite::Mesh::PexAnnounceCodec
+
+namespace invilite::Mesh::PexRequestCodec {
+
+namespace {
+    constexpr size_t COUNT_SIZE   = 1;
+    constexpr size_t PEER_ID_SIZE = 32;
+}
+
+std::vector<uint8_t> serialize(const std::vector<PeerId>& wanted) {
+    if (wanted.empty() || wanted.size() > PexAnnounceCodec::MAX_RECORDS_PER_BATCH) return {};
+
+    std::vector<uint8_t> out;
+    out.reserve(COUNT_SIZE + wanted.size() * PEER_ID_SIZE);
+    out.push_back(static_cast<uint8_t>(wanted.size()));
+    for (const PeerId& id : wanted) out.insert(out.end(), id.begin(), id.end());
+    return out;
+}
+
+PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<PeerId>& outWanted) {
+    outWanted.clear();
+    if (data.size() < COUNT_SIZE) return PexAnnounceStatus::MalformedEncoding;
+
+    const uint8_t count = data[0];
+    if (count == 0 || count > PexAnnounceCodec::MAX_RECORDS_PER_BATCH) return PexAnnounceStatus::MalformedEncoding;
+    if (data.size() != COUNT_SIZE + count * PEER_ID_SIZE)               return PexAnnounceStatus::MalformedEncoding;
+
+    outWanted.resize(count);
+    for (uint8_t i = 0; i < count; ++i) std::copy_n(data.begin() + COUNT_SIZE + i * PEER_ID_SIZE, PEER_ID_SIZE, outWanted[i].begin());
+    return PexAnnounceStatus::Success;
+}
+
+} // namespace invilite::Mesh::PexRequestCodec

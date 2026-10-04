@@ -84,3 +84,37 @@ TEST(PexAnnounceCodecTest, SkipsInvalidRecordButKeepsTheRest) {
     EXPECT_EQ(decoded[0].peerId, records[0].peerId);
     EXPECT_EQ(decoded[1].peerId, records[2].peerId);
 }
+
+// ── PEX_REQUEST ─────────────────────────────────────────────────────────────
+
+namespace {
+PeerId filledPeerId(uint8_t fill) { PeerId id; id.fill(fill); return id; }
+}
+
+TEST(PexRequestCodecTest, RoundTripPreservesIdsAndOrder) {
+    const std::vector<PeerId> wanted{ filledPeerId(3), filledPeerId(1), filledPeerId(2) };
+    std::vector<PeerId> decoded;
+    ASSERT_EQ(PexRequestCodec::deserialize(PexRequestCodec::serialize(wanted), decoded), PexAnnounceStatus::Success);
+    EXPECT_EQ(decoded, wanted);
+}
+
+TEST(PexRequestCodecTest, SerializeRefusesEmptyAndOversizedRequests) {
+    EXPECT_TRUE(PexRequestCodec::serialize({}).empty());
+    EXPECT_FALSE(PexRequestCodec::serialize(std::vector<PeerId>(PexAnnounceCodec::MAX_RECORDS_PER_BATCH)).empty());
+    EXPECT_TRUE(PexRequestCodec::serialize(std::vector<PeerId>(PexAnnounceCodec::MAX_RECORDS_PER_BATCH + 1)).empty());
+}
+
+TEST(PexRequestCodecTest, RejectsMalformedPayloads) {
+    std::vector<PeerId> decoded;
+    const auto valid = PexRequestCodec::serialize({ filledPeerId(1), filledPeerId(2) });
+
+    EXPECT_EQ(PexRequestCodec::deserialize({}, decoded), PexAnnounceStatus::MalformedEncoding);
+    EXPECT_EQ(PexRequestCodec::deserialize(std::vector<uint8_t>{ 0 }, decoded), PexAnnounceStatus::MalformedEncoding);           // count 0
+    std::vector<uint8_t> overCap(1 + 33 * 32, 0);
+    overCap[0] = 33;
+    EXPECT_EQ(PexRequestCodec::deserialize(overCap, decoded), PexAnnounceStatus::MalformedEncoding);
+    EXPECT_EQ(PexRequestCodec::deserialize(std::span(valid).first(valid.size() - 1), decoded), PexAnnounceStatus::MalformedEncoding);
+    auto trailing = valid;
+    trailing.push_back(0);
+    EXPECT_EQ(PexRequestCodec::deserialize(trailing, decoded), PexAnnounceStatus::MalformedEncoding);
+}

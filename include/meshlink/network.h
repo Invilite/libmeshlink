@@ -149,8 +149,17 @@ namespace invilite::Mesh {
         void addListener(std::shared_ptr<NetworkEventListener> listener);
         void removeListener(const std::shared_ptr<NetworkEventListener>& listener);
 
+        // Send a complete frame (Group | Subtype | payload) to a connected peer. Group 0xFF belongs to Network alone and is
+        // refused (-1), as is a frame shorter than the 3-byte header. Group 0xFE (Router control) is reserved for the Router
+        // by convention; the API moves to the Router in C6. Never blocks — see Network::sendFrameTo.
         ssize_t sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data);
-        size_t  sendToAllConnected(const std::vector<uint8_t>& data);
+        size_t  sendToAllConnected(const std::vector<uint8_t>& data);                   // same refusals; returns 0
+
+        // Discovery service for the Router: ask a connected neighbor for the records of `wanted` peers (PEX_REQUEST,
+        // at most PexAnnounceCodec::MAX_RECORDS_PER_BATCH ids). The answer arrives as an ordinary PEX_ANNOUNCE and lands
+        // in PeerDirectory like any gossip. False when the neighbor is not connected, the list is empty or too long,
+        // or the send was refused.
+        bool    requestPeerRecords(const PeerId& neighbor, const std::vector<PeerId>& wanted);
 
         std::vector<PeerId>             getConnectedPeers() const;
         size_t                          getConnectedPeerCount() const;
@@ -287,6 +296,7 @@ namespace invilite::Mesh {
 
         // ===== PEX =====
         void processPexAnnounceMessage(const ProtocolMessage& msg);                     // subtype 0x0020
+        void processPexRequestMessage(const ProtocolMessage& msg);                      // subtype 0x0021
 
         // Common insert/update path for HELLO and PEX_ANNOUNCE. Returns true iff the caller
         // should enqueue a PEX broadcast for this record — true only when the record is new,

@@ -2,7 +2,7 @@
 // Network logs to stderr; run `./run_test 2>/dev/null` for quiet output.
 #include <gtest/gtest.h>
 #include "meshlink/network.h"
-#include "test_helpers.h"
+#include "network_test_node.h"
 
 #include <atomic>
 #include <filesystem>
@@ -18,39 +18,6 @@ using namespace invilite::Mesh::TestHelpers;
 using namespace std::chrono_literals;
 
 namespace {
-
-bool waitUntil(const std::function<bool()>& condition, std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (condition()) return true;
-        std::this_thread::sleep_for(50ms);
-    }
-    return condition();
-}
-
-// One mesh node: identity + directory + Network listening on its own loopback port.
-struct TestNode {
-    std::shared_ptr<LocalIdentity> identity  = std::make_shared<LocalIdentity>(LocalIdentity::generate());
-    std::shared_ptr<PeerDirectory> directory = std::make_shared<PeerDirectory>();
-    uint16_t                       port      = pickUnusedPort();
-    std::unique_ptr<Network>       network;
-
-    TestNode(const std::shared_ptr<std::array<uint8_t, 64>>& secret, const std::string& name, const std::function<void(NetworkConfig&)>& adjustConfig = {}) {
-        NetworkConfig config;
-        config.listenPort         = this->port;
-        config.nodeName           = name;
-        config.announcedAddresses = { ipv4("127.0.0.1", this->port) };
-        if (adjustConfig) adjustConfig(config);
-        this->network = std::make_unique<Network>(this->identity, secret, this->directory, config);
-    }
-
-    std::optional<KnownPeer> knownPeer(const TestNode& other) const { return this->directory->findPeer(other.identity->getPeerId()); }
-
-    bool seesAsAvailable(const TestNode& other) const {
-        const auto entry = this->knownPeer(other);
-        return entry && entry->availability == AvailabilityState::Available;
-    }
-};
 
 size_t countOpenFileDescriptors() {
     return static_cast<size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
@@ -79,11 +46,6 @@ struct PeerEventCounter : NetworkEventListener {
     std::atomic<int>  outOfOrder{0};
 };
 
-std::shared_ptr<std::array<uint8_t, 64>> makeSecret() {
-    auto secret = std::make_shared<std::array<uint8_t, 64>>();
-    secret->fill(0x42);
-    return secret;
-}
 
 } // namespace
 
@@ -828,4 +790,64 @@ TEST(NetworkIntegrationTest, RecordIsNotMarkedAnnouncedWhenFloodReachedNobody) {
     EXPECT_EQ(entry->lastAnnouncedAt, std::chrono::steady_clock::time_point{});
 
     for (auto* node : { &fresh, &staller, &frozen, &announcer }) node->network->stop();
+}
+
+// Group 0xFF is Network's own protocol: a frame injected through the public send API would reach the neighbor as a genuine
+// management message (here a GOODBYE that would end the connection).
+TEST(NetworkIntegrationTest, ApplicationCannotSendManagementFrames) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+    alpha.network->start();
+    beta.network->start();
+    beta.network->connectToPeer("127.0.0.1", alpha.port);
+    ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
+
+    const PeerId alphaId = alpha.identity->getPeerId();
+    const std::vector<uint8_t> injectedGoodbye{ 0xFF, 0x00, 0x40, 0x00 };
+    EXPECT_LT(beta.network->sendToPeer(alphaId, injectedGoodbye), 0);
+    EXPECT_EQ(beta.network->sendToAllConnected(injectedGoodbye), 0u);
+    EXPECT_LT(beta.network->sendToPeer(alphaId, { 0x01, 0x00 }), 0);                          // shorter than Group | Subtype
+    EXPECT_GT(beta.network->sendToPeer(alphaId, applicationMessage(0x01, 10)), 0);
+    EXPECT_GT(beta.network->sendToPeer(alphaId, applicationMessage(0xFE, 10)), 0);           // Router control passes (gate comes with C6)
+
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(alpha.network->getConnectedPeerCount(), 1u);
+    EXPECT_EQ(beta.network->getConnectedPeerCount(), 1u);
+
+    beta.network->stop();
+    alpha.network->stop();
+}
+
+// PEX_REQUEST (docs/router.md 4.1): the Router asks the neighbor that forwarded a broadcast for the sender's record.
+// The record here belongs to a node that was never online — it is not gossiped, so only the request can deliver it.
+TEST(NetworkIntegrationTest, PexRequestFetchesRecordTheNeighborHolds) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha", [](NetworkConfig& c) { c.periodicPexMinInterval = 600s; c.periodicPexMaxInterval = 600s; });
+    TestNode beta(secret, "beta", [](NetworkConfig& c) { c.periodicPexMinInterval = 600s; c.periodicPexMaxInterval = 600s; });
+    alpha.network->start();
+    beta.network->start();
+    beta.network->connectToPeer("127.0.0.1", alpha.port);
+    ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
+
+    const auto offline = LocalIdentity::generate();
+    const SignedPeerRecord offlineRecord = makeSignedRecord(offline, { ipv4("192.0.2.1", 7000) }, std::chrono::system_clock::now());
+    beta.directory->upsertPeer(offline.getPeerId(), [&](KnownPeer& kp, bool) { kp.record = offlineRecord; });
+    PeerId unknownId;
+    unknownId.fill(0x77);
+
+    const PeerId betaId = beta.identity->getPeerId();
+    EXPECT_FALSE(alpha.network->requestPeerRecords(betaId, {}));
+    EXPECT_FALSE(alpha.network->requestPeerRecords(unknownId, { offline.getPeerId() }));     // not a neighbor
+    EXPECT_FALSE(alpha.network->requestPeerRecords(betaId, std::vector<PeerId>(PexAnnounceCodec::MAX_RECORDS_PER_BATCH + 1, unknownId)));
+    ASSERT_FALSE(alpha.directory->findPeer(offline.getPeerId()).has_value());
+
+    ASSERT_TRUE(alpha.network->requestPeerRecords(betaId, { unknownId, offline.getPeerId() }));
+    ASSERT_TRUE(waitUntil([&] { return alpha.directory->findPeer(offline.getPeerId()).has_value(); }, 5s));
+    EXPECT_EQ(alpha.directory->findPeer(offline.getPeerId())->record.ed25519Pub, offline.getEd25519Pub());
+    EXPECT_FALSE(alpha.directory->findPeer(unknownId).has_value());
+    EXPECT_EQ(alpha.network->getConnectedPeerCount(), 1u);                                    // a request for unknown ids is no violation
+
+    beta.network->stop();
+    alpha.network->stop();
 }

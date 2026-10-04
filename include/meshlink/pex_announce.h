@@ -45,6 +45,23 @@ namespace invilite::Mesh {
 
     } // namespace PexAnnounceCodec
 
+    // PEX_REQUEST payload format (group 0xFF / subtype 0x0021) — "send me the records of these peers":
+    //
+    //   count        (1B, 1..MAX_RECORDS_PER_BATCH — the reply must fit one PEX_ANNOUNCE)
+    //   count × PeerId (32B)
+    //
+    // The reply is an ordinary PEX_ANNOUNCE carrying the records the responder has; unknown ids are left out.
+    // Used by the Router to fetch the key of a broadcast sender it does not know yet (docs/router.md 4.1).
+    namespace PexRequestCodec {
+
+        // Empty vector when `wanted` is empty or longer than MAX_RECORDS_PER_BATCH.
+        std::vector<uint8_t> serialize(const std::vector<PeerId>& wanted);
+
+        // MalformedEncoding on count 0, count over the cap, truncation or trailing bytes.
+        PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<PeerId>& outWanted);
+
+    } // namespace PexRequestCodec
+
 } // namespace invilite::Mesh
 
 #endif // MESH_PEX_ANNOUNCE_H

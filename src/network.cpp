@@ -46,6 +46,7 @@ namespace invilite::Mesh {
         // Management protocol subtypes
         constexpr uint16_t SUBTYPE_HELLO          = 0x0001;
         constexpr uint16_t SUBTYPE_PEX_ANNOUNCE   = 0x0020;
+        constexpr uint16_t SUBTYPE_PEX_REQUEST    = 0x0021;
         constexpr uint16_t SUBTYPE_GOODBYE        = 0x0040;
 
         // Shared backoff schedule for both probe and connection attempt retries.
@@ -333,7 +334,13 @@ void Network::removeListener(const std::shared_ptr<NetworkEventListener>& listen
     );
 }
 
+// Frames the application / Router may send: a full header, and never Network's own management group
+bool isSendableByCaller(const std::vector<uint8_t>& frame) {
+    return frame.size() >= FRAME_HEADER_SIZE && frame[0] != GROUP_INTERNAL;
+}
+
 ssize_t Network::sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data) {
+    if (!isSendableByCaller(data)) return -1;
     std::shared_ptr<Peer> peer;
     {
         std::shared_lock lock(this->peersMutex);
@@ -345,11 +352,26 @@ ssize_t Network::sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data
 }
 
 size_t Network::sendToAllConnected(const std::vector<uint8_t>& data) {
+    if (!isSendableByCaller(data)) return 0;
     size_t successCount = 0;
     for (auto& peer : this->activePeersSnapshot()) {
         if (this->sendFrameTo(peer, data) > 0) ++successCount;
     }
     return successCount;
+}
+
+bool Network::requestPeerRecords(const PeerId& neighbor, const std::vector<PeerId>& wanted) {
+    const std::vector<uint8_t> payload = PexRequestCodec::serialize(wanted);
+    if (payload.empty()) return false;
+
+    std::shared_ptr<Peer> peer;
+    {
+        std::shared_lock lock(this->peersMutex);
+        const auto it = this->peersById.find(neighbor);
+        if (it == this->peersById.end() || !it->second->isActive()) return false;
+        peer = it->second;
+    }
+    return this->sendFrameTo(peer, buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_REQUEST, payload)) > 0;
 }
 
 std::vector<PeerId> Network::getConnectedPeers() const {
@@ -1193,6 +1215,10 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
             this->processPexAnnounceMessage(msg);
             break;
 
+        case SUBTYPE_PEX_REQUEST:
+            this->processPexRequestMessage(msg);
+            break;
+
         case SUBTYPE_GOODBYE:
             this->processGoodbyeMessage(msg);
             break;
@@ -1591,6 +1617,27 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
     std::cerr << "Network: PEX_ANNOUNCE from " << peerIdShort(senderId)
               << " — " << records.size() << " record(s), " << broadcastCount
               << " broadcasted, knownPeers=" << this->peerDirectory->size() << std::endl;
+}
+
+void Network::processPexRequestMessage(const ProtocolMessage& msg) {
+    std::vector<PeerId> wanted;
+    if (PexRequestCodec::deserialize(msg.payload, wanted) != PexAnnounceStatus::Success) {
+        std::cerr << "Network: PEX_REQUEST from " << peerIdShort(msg.peer->getPeerId()) << " malformed, closing connection" << std::endl;
+        msg.peer->markForClose();
+        return;
+    }
+
+    // Any record we hold, reachable or not: the requester needs the signed keys, not an address it could dial. Our own
+    // record is not in the directory — a neighbor got it in HELLO. A reply is not gossip, so nothing is marked announced.
+    std::vector<SignedPeerRecord> found;
+    for (const PeerId& id : wanted) {
+        if (const auto entry = this->peerDirectory->findPeer(id)) found.push_back(entry->record);
+    }
+    if (found.empty()) return;
+
+    const std::vector<uint8_t> payload = PexAnnounceCodec::serialize(found);
+    if (payload.empty()) return;
+    this->sendFrameTo(msg.peer, buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload));
 }
 
 // ============================================================
