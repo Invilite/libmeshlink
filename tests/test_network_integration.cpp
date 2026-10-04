@@ -791,3 +791,55 @@ TEST(NetworkIntegrationTest, AddressBookStaysWithinLimitUnderGossip) {
     bounded.network->stop();
     gossiper.network->stop();
 }
+
+// B10: a record whose flood reached nobody must not be booked as announced — otherwise anti-entropy treats it as fresh
+// news already spread and picks it last. Here the only flood target (B) has its I/O frozen and its queue full, so the
+// broadcast of D's newly proven record is refused; D's record must stay unannounced.
+TEST(NetworkIntegrationTest, RecordIsNotMarkedAnnouncedWhenFloodReachedNobody) {
+    const auto secret = makeSecret();
+    TestNode announcer(secret, "announcer", [](NetworkConfig& config) { config.sendQueueLimitBytes = 64 * 1024; });
+    TestNode frozen(secret, "frozen");
+    TestNode staller(secret, "staller");
+    TestNode fresh(secret, "fresh");
+
+    // Freezes frozen's I/O thread when staller connects (onPeerConnected runs on the I/O thread)
+    struct StallOnConnect : NetworkEventListener {
+        PeerId            staller{};
+        std::atomic<bool> stalling{false};
+        void onPeerConnected(const PeerIdentity& identity) override {
+            if (identity.getPeerId() != this->staller) return;
+            this->stalling = true;
+            std::this_thread::sleep_for(3s);
+        }
+    };
+    const auto stall = std::make_shared<StallOnConnect>();
+    stall->staller = staller.identity->getPeerId();
+    frozen.network->addListener(stall);
+    for (auto* node : { &announcer, &frozen, &staller, &fresh }) node->network->start();
+
+    announcer.network->connectToPeer("127.0.0.1", frozen.port);
+    ASSERT_TRUE(waitUntil([&] { return announcer.network->getConnectedPeerCount() == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);                                                       // HELLO / PEX settle
+
+    staller.network->connectToPeer("127.0.0.1", frozen.port);
+    ASSERT_TRUE(waitUntil([&] { return stall->stalling.load(); }, 5s));
+
+    // Fill announcer's queue towards frozen until it refuses even a tiny frame (a PEX frame is ~250 B)
+    const PeerId frozenId = frozen.identity->getPeerId();
+    for (const size_t size : { 16 * 1024, 1024, 64 }) {
+        ssize_t result = 1;
+        for (int i = 0; i < 5000 && result > 0; ++i) result = announcer.network->sendToPeer(frozenId, applicationMessage(0x01, size));
+        ASSERT_LT(result, 0) << "queue never filled with " << size << " B messages";
+    }
+
+    // A newly proven record (announcer dials fresh) is flooded — to frozen only, which refuses it
+    announcer.network->connectToPeer("127.0.0.1", fresh.port);
+    ASSERT_TRUE(waitUntil([&] { const auto e = announcer.knownPeer(fresh); return e && e->hasEverConnected; }, 2s));
+    std::this_thread::sleep_for(1500ms);                                                      // the flood queue drains once per second
+
+    const auto entry = announcer.knownPeer(fresh);
+    EXPECT_EQ(entry->announceCount, 0) << "booked as announced although nobody received it";
+    EXPECT_EQ(entry->lastAnnouncedAt, std::chrono::steady_clock::time_point{});
+
+    for (auto* node : { &fresh, &staller, &frozen, &announcer }) node->network->stop();
+}

@@ -1630,6 +1630,13 @@ void Network::sendPendingPexBroadcasts() {
         if (this->sendFrameTo(peer, frame) > 0) ++sent;
     }
 
+    // Nobody got it (no targets, or every send refused, e.g. SendQueueFull): leave the record unannounced (B10). Its
+    // empty lastAnnouncedAt puts it first in line for the next anti-entropy tick — no separate retry loop needed.
+    if (sent == 0) {
+        std::cerr << "Network: PEX_ANNOUNCE for " << peerIdShort(pending.recordPeerId) << " reached nobody, left for anti-entropy" << std::endl;
+        return;
+    }
+
     // Mark as announced — also counts toward anti-entropy ordering. Clear pendingPexBroadcast
     // since this is the first broadcast for the record.
     const auto now = std::chrono::steady_clock::now();
@@ -1689,6 +1696,12 @@ void Network::tickPeriodicPex() {
     size_t sent = 0;
     for (const auto& peer : targets) {
         if (this->sendFrameTo(peer, frame) > 0) ++sent;
+    }
+
+    // Every send refused: the batch keeps its place at the front of the anti-entropy order (B10)
+    if (sent == 0) {
+        std::cerr << "Network: anti-entropy PEX tick — " << batch.size() << " record(s) reached nobody" << std::endl;
+        return;
     }
 
     // Update lastAnnouncedAt for each record in the batch. mutatePeer is a no-op for records
