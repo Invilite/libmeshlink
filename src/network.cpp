@@ -25,6 +25,9 @@ namespace invilite::Mesh {
         constexpr size_t MIN_SEND_QUEUE_LIMIT     = 64 * 1024;                     // Fits the largest 0xFF message (PEX batch of MAX_RECORDS_PER_BATCH records) with room to spare
         constexpr size_t WAKEUP_DRAIN_BUFFER      = 64;
         constexpr int    OUTBOUND_CONNECT_TIMEOUT = 5;
+        // Upper bound of one outbound attempt: TCP connect (5 s) + transport handshake (3 s) + identity verification
+        // (2 × 3 s receive) + registration, with margin. Topology does not redial a peer within this window (R9).
+        constexpr std::chrono::seconds OUTBOUND_ATTEMPT_MAX_DURATION{20};
         constexpr size_t FRAME_HEADER_SIZE        = 3;                                  // group(1) + subtype(2)
         constexpr uint8_t GROUP_INTERNAL          = 0xFF;
 
@@ -1064,9 +1067,15 @@ std::chrono::milliseconds Network::tickTopology() {
     const TopologyDecision decision = this->topologyPlanner.evaluate(connected, candidates, this->config);
 
     if (decision.connectTo) {
-        std::cerr << "Network: topology — dialing " << decision.connectTo->first
-                  << ":" << decision.connectTo->second << std::endl;
-        this->connectToPeer(decision.connectTo->first, decision.connectTo->second);
+        // Take the peer out of the candidate list for as long as the attempt can last (R9) — otherwise the next ticks
+        // (every 3 s) pick it again while the first handshake is still running. A failure overwrites this with the
+        // backoff; a success makes it connected (excluded anyway) and its HELLO clears the field.
+        this->peerDirectory->mutatePeer(decision.connectTo->peerId, [](KnownPeer& entry) {
+            entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + OUTBOUND_ATTEMPT_MAX_DURATION);
+        });
+
+        std::cerr << "Network: topology — dialing " << decision.connectTo->address << ":" << decision.connectTo->port << std::endl;
+        this->connectToPeer(decision.connectTo->address, decision.connectTo->port);
     }
 
     return decision.nextTick;

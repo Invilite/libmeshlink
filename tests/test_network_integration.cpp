@@ -296,3 +296,38 @@ TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
     target.network->stop();
     node.network->stop();
 }
+
+// R9: while a dial is still in progress, Topology (ticking every 3 s) must not pick the same peer again.
+// The target listens with a full accept queue, so the kernel drops our SYNs and connect() hangs for the whole
+// 5 s connect timeout — longer than one Topology tick. One dial → one failure; a redial would add a second.
+TEST(NetworkIntegrationTest, TopologyDoesNotRedialPeerWhileAttemptIsInProgress) {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(listener, 0), 0);
+    socklen_t len = sizeof(addr);
+    ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len);
+    const int filler = ::socket(AF_INET, SOCK_STREAM, 0);                                       // occupies the only accept-queue slot
+    ASSERT_EQ(::connect(filler, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
+
+    const auto secret = makeSecret();
+    TestNode node(secret, "dialer");
+    const auto silent = LocalIdentity::generate();
+    const auto record = makeSignedRecord(silent, { ipv4("127.0.0.1", ntohs(addr.sin_port)) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) {
+        entry.record           = record;
+        entry.hasEverConnected = true;
+        entry.availability     = AvailabilityState::Available;                                  // a Topology candidate
+    });
+    node.network->start();
+
+    ASSERT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveConnectionFailures >= 1; }, 9s));
+    std::this_thread::sleep_for(3500ms);                                                      // a redial started one tick later would fail by now
+    EXPECT_EQ(node.directory->findPeer(record.peerId)->consecutiveConnectionFailures, 1);
+
+    node.network->stop();
+    ::close(filler);
+    ::close(listener);
+}

@@ -33,11 +33,13 @@ TEST(TopologyPlannerTest, DialsCandidateWhenBelowOutboundTarget) {
     NetworkConfig config;
     config.targetOutbound = 2;
 
-    const auto decision = TopologyPlanner{}.evaluate(outboundPeers(1), { candidateAt("192.0.2.10", 5000) }, config);
+    const auto candidate = candidateAt("192.0.2.10", 5000);
+    const auto decision  = TopologyPlanner{}.evaluate(outboundPeers(1), { candidate }, config);
 
     ASSERT_TRUE(decision.connectTo.has_value());
-    EXPECT_EQ(decision.connectTo->first, "192.0.2.10");
-    EXPECT_EQ(decision.connectTo->second, 5000);
+    EXPECT_EQ(decision.connectTo->peerId, candidate.peerId);                                 // the caller tracks the attempt per peer (R9)
+    EXPECT_EQ(decision.connectTo->address, "192.0.2.10");
+    EXPECT_EQ(decision.connectTo->port, 5000);
     EXPECT_EQ(decision.nextTick, 3s);
 }
 

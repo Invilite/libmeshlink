@@ -34,7 +34,7 @@ namespace invilite::Mesh {
         const SignedPeerRecord& chosen = candidates[dist(rng)];
 
         if (!chosen.addresses.empty()) {
-            decision.connectTo = { chosen.addresses.front().address, chosen.addresses.front().port };
+            decision.connectTo = DialTarget{ chosen.peerId, chosen.addresses.front().address, chosen.addresses.front().port };
         }
 
         // disconnect remains nullopt until scoring is available (FoundAnother / churn)

@@ -22,10 +22,17 @@ namespace invilite::Mesh {
         bool    isOutbound;
     };
 
+// Peer chosen to dial: who (so the caller can track the attempt per peer) and where.
+    struct DialTarget {
+        PeerId          peerId;
+        std::string     address;
+        uint16_t        port = 0;
+    };
+
 // Decision returned by TopologyPlanner::evaluate() for one management tick.
     struct TopologyDecision {
         // One candidate to dial next, if outbound count is below target. nullopt = nothing to do.
-        std::optional<std::pair<std::string, uint16_t>> connectTo;
+        std::optional<DialTarget>                       connectTo;
 
         // One peer to disconnect, e.g. for connection churn once scoring is available. nullopt for now.
         std::optional<PeerId>                           disconnect;
