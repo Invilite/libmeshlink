@@ -71,6 +71,11 @@ std::vector<uint8_t> buildFrame(uint8_t group, uint16_t subtype, const std::vect
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
+
+// Order-insensitive comparison — a peer may list the same endpoints in a different order after re-signing.
+bool hasSameAddressSet(const std::vector<PeerAddress>& a, const std::vector<PeerAddress>& b) {
+    return a.size() == b.size() && std::is_permutation(a.begin(), a.end(), b.begin());
+}
 }
 
 // ============================================================
@@ -1173,9 +1178,29 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             return;
         }
 
+        if (record.createdAt > entry.record.createdAt && hasSameAddressSet(record.addresses, entry.record.addresses)) {
+            // Newer version, same addresses (e.g. the peer restarted and re-signed). The version bump says
+            // nothing about reachability, so everything we learned about these addresses stays valid.
+            // Only the gossip bookkeeping restarts, so the fresher version spreads like any new record.
+            entry.record              = std::move(record);
+            entry.announceCount       = 0;
+            entry.pendingPexBroadcast = true;
+            entry.lastAnnouncedAt     = {};
+            if (outboundMatch) {
+                entry.hasEverConnected              = true;
+                entry.availability                  = AvailabilityState::Available;
+                entry.consecutiveConnectionFailures = 0;
+                entry.nextConnectionAttemptAt       = {};
+                entry.consecutiveProbeFailures      = 0;
+                entry.nextProbeAllowedAt            = {};
+            }
+            shouldBroadcast = entry.hasEverConnected;                               // only proven records are gossiped
+            return;
+        }
+
         if (record.createdAt > entry.record.createdAt) {
-            // Newer record — the address set may have changed, so any previous reachability
-            // evidence and any backoff history no longer applies. Reset everything to whatever
+            // Newer record with a changed address set — previous reachability evidence and backoff
+            // history were about other addresses and no longer apply. Reset everything to whatever
             // evidence this update brings. A Probing observer will detect the state change when
             // it tries to commit its result and skip the write.
             entry.record                          = std::move(record);

@@ -134,3 +134,35 @@ TEST(NetworkIntegrationTest, ProbesContinueAfterFastFailingProbe) {
 
     node.network->stop();
 }
+
+// B1: a newer record with the same address set (e.g. the peer restarted and re-signed) carries no new
+// information about reachability — what we learned about those addresses must survive the version bump.
+TEST(NetworkIntegrationTest, NewerRecordWithSameAddressesKeepsReachabilityKnowledge) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+
+    // Beta already knows an older version of Alpha's record and has history with its address.
+    const auto olderCreatedAt = std::chrono::system_clock::now() - 1h;
+    const auto olderRecord    = makeSignedRecord(*alpha.identity, { ipv4("127.0.0.1", alpha.port) }, olderCreatedAt);
+    beta.directory->upsertPeer(olderRecord.peerId, [&](KnownPeer& entry, bool) {
+        entry.record                        = olderRecord;
+        entry.hasEverConnected              = true;
+        entry.availability                  = AvailabilityState::Available;
+        entry.consecutiveConnectionFailures = 2;
+        entry.nextConnectionAttemptAt       = std::chrono::steady_clock::now() + 1h;           // keep Beta's topology from dialing Alpha
+    });
+
+    alpha.network->start();
+    beta.network->start();
+    alpha.network->connectToPeer("127.0.0.1", beta.port);                                          // Beta receives Alpha's fresh record via HELLO (inbound)
+
+    ASSERT_TRUE(waitUntil([&] { const auto e = beta.knownPeer(alpha); return e && e->record.createdAt > olderCreatedAt + 30min; }, 5s));
+    const auto entry = beta.knownPeer(alpha);
+    EXPECT_TRUE(entry->hasEverConnected);
+    EXPECT_EQ(entry->availability, AvailabilityState::Available);
+    EXPECT_EQ(entry->consecutiveConnectionFailures, 2);
+
+    alpha.network->stop();
+    beta.network->stop();
+}
