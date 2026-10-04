@@ -19,20 +19,6 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Ask the kernel for a currently unused TCP port. The socket is closed right away, so the port is free
-// (tiny reuse race, acceptable in tests). Closed and never re-listened, it also serves as a "connection refused" target.
-uint16_t pickUnusedPort() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    socklen_t len = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
-    ::close(fd);
-    return ntohs(addr.sin_port);
-}
-
 bool waitUntil(const std::function<bool()>& condition, std::chrono::milliseconds timeout) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {

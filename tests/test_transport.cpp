@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include "transport/TcpClient.h"
 #include "transport/TcpServer.h"
+#include "test_helpers.h"
 
 #include <atomic>
 #include <fcntl.h>
@@ -13,24 +14,13 @@
 #include <vector>
 
 using namespace invilite::Transport;
+using invilite::Mesh::TestHelpers::pickUnusedPort;
 using namespace std::chrono_literals;
 
 namespace {
 
 size_t countOpenFileDescriptors() {
     return static_cast<size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
-}
-
-uint16_t pickUnusedPort() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in addr{};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    socklen_t len = sizeof(addr);
-    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
-    ::close(fd);
-    return ntohs(addr.sin_port);
 }
 
 // Loopback listener whose only accept-queue slot is taken: the kernel drops further SYNs, so a connect to it hangs
