@@ -714,6 +714,13 @@ bool invilite::Mesh::Connection::isValidFrameHeader(const std::vector<uint8_t>& 
                | (static_cast<uint32_t>(header[4]) << 8)
                |  static_cast<uint32_t>(header[5]);
 
+    // A frame always carries nonce + header + Poly1305 tag; a smaller declared size would make the
+    // ciphertext range in decryptData negative.
+    constexpr size_t tagSize = 16;
+    if (packetSize < nonceSize + headerSize + tagSize) {
+        return false;
+    }
+
     return true;
 }
 
