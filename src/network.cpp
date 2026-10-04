@@ -30,6 +30,15 @@ namespace invilite::Mesh {
         // Upper bound of one outbound attempt: TCP connect (5 s) + transport handshake (3 s) + identity verification
         // (2 × 3 s receive) + registration, with margin. Topology does not redial a peer within this window (R9).
         constexpr std::chrono::seconds OUTBOUND_ATTEMPT_MAX_DURATION{20};
+        // Departure window (B3): the remote normally closes within milliseconds of our GOODBYE; this only bounds a
+        // remote that never does. stop() waits at most this long as well.
+        constexpr std::chrono::seconds DEPARTURE_TIMEOUT{5};
+        // An outbound connection still Active after this was not dismissed (NoSlots arrives within milliseconds).
+        constexpr std::chrono::seconds OUTBOUND_SETTLED_AFTER{5};
+        // Hard bound of an inbound handshake counted from accept() (R1) — not reset by slowly trickling bytes.
+        constexpr std::chrono::seconds INBOUND_HANDSHAKE_DEADLINE{5};
+        // Identity verification waits at most this long per message (also bounded by the remaining deadline).
+        constexpr std::chrono::milliseconds IDENTITY_STEP_TIMEOUT{3000};
         constexpr size_t FRAME_HEADER_SIZE        = 3;                                  // group(1) + subtype(2)
         constexpr uint8_t GROUP_INTERNAL          = 0xFF;
 
@@ -83,6 +92,27 @@ bool hasSameAddressSet(const std::vector<PeerAddress>& a, const std::vector<Peer
     return a.size() == b.size() && std::is_permutation(a.begin(), a.end(), b.begin());
 }
 
+// Key for the per-address inbound limit: the IPv4 address, or the /64 prefix for IPv6 — one IPv6 host usually holds a
+// whole /64 and could otherwise pick a fresh address per connection. IPv4 clients of a dual-stack socket (::ffff:a.b.c.d)
+// are keyed by their IPv4 address.
+std::string addressLimitKeyOf(const sockaddr_storage& address) {
+    char text[INET6_ADDRSTRLEN] = {};
+    if (address.ss_family == AF_INET) {
+        inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in&>(address).sin_addr, text, sizeof(text));
+        return text;
+    }
+    if (address.ss_family != AF_INET6) return {};
+    const in6_addr& v6 = reinterpret_cast<const sockaddr_in6&>(address).sin6_addr;
+    if (IN6_IS_ADDR_V4MAPPED(&v6)) {
+        inet_ntop(AF_INET, &v6.s6_addr[12], text, sizeof(text));
+        return text;
+    }
+    in6_addr prefix{};
+    std::copy_n(v6.s6_addr, 8, prefix.s6_addr);                                     // keep the /64, zero the interface id
+    inet_ntop(AF_INET6, &prefix, text, sizeof(text));
+    return std::string(text) + "/64";
+}
+
 // Reachability evidence: we dialed this peer and reached it at an IP its own record announces.
 bool recordAnnouncesDialedAddress(const SignedPeerRecord& record, const std::string& dialedAddress) {
     if (dialedAddress.empty()) return false;                                        // inbound connection — no evidence about its addresses
@@ -110,8 +140,15 @@ Network::Network(std::shared_ptr<LocalIdentity> selfIdentity,
     if (this->config.sendQueueLimitBytes < MIN_SEND_QUEUE_LIMIT) {
         throw std::invalid_argument("sendQueueLimitBytes is below the minimum needed for management messages");
     }
-    if (this->config.maxTotal < this->config.targetOutbound) {
-        throw std::invalid_argument("maxTotal cannot be less than targetOutbound");
+    const ConnectionLimits& limits = this->config.connectionLimits;
+    if (limits.inbound.soft == 0 || limits.inbound.effectiveHard() < limits.inbound.soft) {
+        throw std::invalid_argument("connectionLimits.inbound: need 0 < soft <= hard");
+    }
+    if (limits.inbound.perAddress == 0) {
+        throw std::invalid_argument("connectionLimits.inbound.perAddress must be at least 1");
+    }
+    if (limits.outbound.min > limits.outbound.soft || limits.outbound.effectiveHard() < limits.outbound.soft) {
+        throw std::invalid_argument("connectionLimits.outbound: need min <= soft <= hard");
     }
 }
 
@@ -122,7 +159,18 @@ Network::~Network() {
 }
 
 void Network::start() {
+    std::lock_guard stopLock(this->stopMutex);                                      // never overlaps a stop() still in progress
     if (this->running.exchange(true)) return;
+    this->stopping.store(false);
+
+    // Queues and the worker list are closed by stop(); open them again so a restarted Network does not spin on them
+    this->messageProtocolQueue.reopen();
+    this->routerMessageQueue.reopen();
+    this->peerLifecycleEvents.reopen();
+    {
+        std::lock_guard lock(this->handshakeWorkersMutex);
+        this->acceptingHandshakeWorkers = true;
+    }
 
     // Build self-attested record — needed before any peer connects.
     // LocalIdentity owns the signing logic; we cache the serialized bytes here for fast HELLO sends.
@@ -170,20 +218,31 @@ void Network::start() {
 }
 
 void Network::stop() {
-    if (!this->running.exchange(false)) return;
+    std::lock_guard stopLock(this->stopMutex);                                      // a second caller (e.g. ~Network) waits until this one is done
+    if (!this->running.load() || this->stopping.exchange(true)) return;
 
     if (this->tcpServer) {
-        this->tcpServer->stop();
+        this->tcpServer->stop();                                                    // no new inbound; stopping blocks new dials and probes
     }
 
-    // Send GOODBYE to all active peers before closing — allows remote side to react gracefully.
-    {
-        std::shared_lock lock(this->peersMutex);
-        for (const auto& [id, peer] : this->peersById) {
-            if (peer->isActive()) this->sendGoodbyeTo(peer, GoodbyeReason::Shutdown);
+    // Departure window (B3) for every connected peer: GOODBYE(Shutdown), half-close, and let the remote close first.
+    // Closing right away with unread data in our receive buffer would send RST, which can discard our GOODBYE at the
+    // remote before it is read. The I/O and management threads keep running meanwhile; listeners get no events.
+    for (const auto& peer : this->activePeersSnapshot()) {
+        if (peer->markDeparting()) this->sendFarewellAndDepart(peer, GoodbyeReason::Shutdown);
+    }
+    this->wakeupIoThread();
+
+    const auto departureDeadline = std::chrono::steady_clock::now() + DEPARTURE_TIMEOUT;
+    while (std::chrono::steady_clock::now() < departureDeadline) {
+        {
+            std::shared_lock lock(this->peersMutex);
+            if (this->peersById.empty()) break;
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    this->running.store(false);
     this->markAllPeersForClose();
     this->wakeupIoThread();
 
@@ -192,17 +251,26 @@ void Network::stop() {
     // Now wake Management and Dispatch — I/O no longer produces messages
     this->messageProtocolQueue.shutdown();
     this->routerMessageQueue.shutdown();
-    this->helloSendQueue.shutdown();
+    this->peerLifecycleEvents.shutdown();
 
     if (this->managementThread.joinable()) this->managementThread.join();
     if (this->dispatchThread.joinable())   this->dispatchThread.join();
 
+    for (auto& worker : this->probeWorkers) {                                       // management thread has exited — safe to touch
+        if (worker->thread.joinable()) worker->thread.join();
+    }
+    this->probeWorkers.clear();
+
+    // Collect the workers under the lock and refuse new ones, so no worker can be added after this join (it would never
+    // be joined and its std::thread would terminate the process); join outside the lock.
+    std::vector<std::unique_ptr<HandshakeWorker>> workersToJoin;
     {
         std::lock_guard lock(this->handshakeWorkersMutex);
-        for (auto& w : this->handshakeWorkers) {
-            if (w->thread.joinable()) w->thread.join();
-        }
-        this->handshakeWorkers.clear();
+        this->acceptingHandshakeWorkers = false;
+        workersToJoin.swap(this->handshakeWorkers);
+    }
+    for (auto& w : workersToJoin) {
+        if (w->thread.joinable()) w->thread.join();
     }
 
     Command cmd;
@@ -221,19 +289,29 @@ void Network::stop() {
 // ============================================================
 
 void Network::connectToPeer(const std::string& address, uint16_t port) {
-    if (!this->running.load()) return;
+    if (!this->running.load() || this->stopping.load()) return;
+
+    // Outbound hard limit (R10) — counts established outbound peers, dials and probes in progress alike
+    auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
+    if (!slot) {
+        std::cerr << "Network: not dialing " << address << ":" << port << " — outbound hard limit reached" << std::endl;
+        return;
+    }
 
     auto  worker    = std::make_unique<HandshakeWorker>();
     auto* workerPtr = worker.get();
 
-    worker->thread = std::thread([this, address, port, workerPtr]() {
-        this->runOutgoingHandshake(address, port, workerPtr);
-    });
-
-    {
-        std::lock_guard lock(this->handshakeWorkersMutex);
-        this->handshakeWorkers.push_back(std::move(worker));
+    std::lock_guard lock(this->handshakeWorkersMutex);                              // started and registered atomically w.r.t. stop()
+    if (!this->acceptingHandshakeWorkers) return;
+    try {
+        worker->thread = std::thread([this, address, port, slot = std::move(*slot), workerPtr]() mutable {
+            this->runOutgoingHandshake(address, port, std::move(slot), workerPtr);
+        });
+    } catch (const std::system_error& e) {
+        std::cerr << "Network: cannot start dial worker: " << e.what() << std::endl;   // slot returns with the lambda
+        return;
     }
+    this->handshakeWorkers.push_back(std::move(worker));
 }
 
 void Network::addListener(std::shared_ptr<NetworkEventListener> listener) {
@@ -256,22 +334,15 @@ ssize_t Network::sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data
     {
         std::shared_lock lock(this->peersMutex);
         const auto it = this->peersById.find(dest);
-        if (it == this->peersById.end()) return -1;
+        if (it == this->peersById.end() || !it->second->isActive()) return -1;
         peer = it->second;
     }
     return this->sendFrameTo(peer, data);
 }
 
 size_t Network::sendToAllConnected(const std::vector<uint8_t>& data) {
-    std::vector<std::shared_ptr<Peer>> snapshot;
-    {
-        std::shared_lock lock(this->peersMutex);
-        snapshot.reserve(this->peersById.size());
-        for (const auto& [id, peer] : this->peersById) snapshot.push_back(peer);
-    }
-
     size_t successCount = 0;
-    for (auto& peer : snapshot) {
+    for (auto& peer : this->activePeersSnapshot()) {
         if (this->sendFrameTo(peer, data) > 0) ++successCount;
     }
     return successCount;
@@ -281,13 +352,15 @@ std::vector<PeerId> Network::getConnectedPeers() const {
     std::shared_lock lock(this->peersMutex);
     std::vector<PeerId> result;
     result.reserve(this->peersById.size());
-    for (const auto& [id, _] : this->peersById) result.push_back(id);
+    for (const auto& [id, peer] : this->peersById) {
+        if (peer->isActive()) result.push_back(id);
+    }
     return result;
 }
 
 size_t Network::getConnectedPeerCount() const {
     std::shared_lock lock(this->peersMutex);
-    return this->peersById.size();
+    return static_cast<size_t>(std::count_if(this->peersById.begin(), this->peersById.end(), [](const auto& entry) { return entry.second->isActive(); }));
 }
 
 std::vector<SignedPeerRecord> Network::getKnownPeers() const {
@@ -364,29 +437,56 @@ void Network::notifyMessageReceived(const NetworkMessage& msg) {
 // ============================================================
 
 void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
-    if (!this->running.load()) {
+    if (!this->running.load() || this->stopping.load() || !addr) {
         ::close(fd);
         return;
     }
 
-    sockaddr_storage addrCopy{};
-    if (addr) addrCopy = *addr;
+    // Admission (R10/R1). Above the inbound hard limit the connection is closed right away with nothing allocated —
+    // no thread, no Connection, no crypto; the cheap total check comes before formatting the address.
+    const ConnectionLimits::Inbound& inbound = this->config.connectionLimits.inbound;
+    if (!this->connectionSlots.inboundHasRoom(inbound.effectiveHard())) {
+        ::close(fd);
+        return;
+    }
+    const std::string remoteAddress = addressLimitKeyOf(*addr);
+    auto slot = this->connectionSlots.tryTakeInbound(remoteAddress, inbound.effectiveHard(), inbound.perAddress);
+    if (!slot) {
+        std::cerr << "Network: refused inbound from " << remoteAddress << " — inbound hard or per-address limit reached" << std::endl;
+        ::close(fd);
+        return;
+    }
 
+    const sockaddr_storage addrCopy = *addr;
     auto  worker    = std::make_unique<HandshakeWorker>();
     auto* workerPtr = worker.get();
 
-    worker->thread = std::thread([this, fd, addrCopy, workerPtr]() {
-        this->runIncomingHandshake(fd, addrCopy, workerPtr);
-    });
-
-    {
-        std::lock_guard lock(this->handshakeWorkersMutex);
-        this->handshakeWorkers.push_back(std::move(worker));
+    std::lock_guard lock(this->handshakeWorkersMutex);                              // started and registered atomically w.r.t. stop()
+    if (!this->acceptingHandshakeWorkers) {
+        ::close(fd);
+        return;
     }
+    try {
+        worker->thread = std::thread([this, fd, addrCopy, slot = std::move(*slot), workerPtr]() mutable {
+            this->runIncomingHandshake(fd, addrCopy, std::move(slot), workerPtr);
+        });
+    } catch (const std::system_error& e) {
+        // Out of threads: refuse this one instead of letting the exception terminate the process (R1)
+        std::cerr << "Network: cannot start handshake worker: " << e.what() << std::endl;
+        ::close(fd);
+        return;
+    }
+    this->handshakeWorkers.push_back(std::move(worker));
 }
 
-void Network::runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorker* self) {
+void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
+
+    // Hard deadline from accept (R1): a client trickling bytes cannot keep this worker alive past it
+    const auto deadline      = std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE;
+    const auto timeRemaining = [deadline] {
+        return std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+    };
 
     std::shared_ptr<Connection> conn;
     try {
@@ -398,7 +498,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorke
         return;
     }
 
-    const int hs = conn->waitForHandshake();
+    const int hs = conn->waitForHandshake(timeRemaining());
     if (hs < 0) {
         std::cerr << "Network: incoming handshake failed, code=" << hs << std::endl;
         conn->close();
@@ -409,7 +509,8 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorke
     PeerIdentity remoteIdentity;
     IdentityFlags remoteFlags;                                                          // 6.1: receive peer intent (probe vs normal)
     const VerificationResult vr = IdentityVerification::runAsResponder(
-            *conn, *this->selfIdentity, this->config.nodeName, remoteIdentity, remoteFlags
+            *conn, *this->selfIdentity, this->config.nodeName, remoteIdentity, remoteFlags,
+            std::min(IDENTITY_STEP_TIMEOUT, timeRemaining())
     );
 
     if (vr != VerificationResult::Success) {
@@ -436,6 +537,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorke
     Command cmd;
     cmd.type = Command::Type::AddPeer;
     cmd.peer = std::move(peer);
+    cmd.slot = std::move(slot);                                                     // the I/O thread keeps it until the peer closes
     this->commandQueue.push(std::move(cmd));
     this->wakeupIoThread();
 
@@ -518,7 +620,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     return result;
 }
 
-void Network::runOutgoingHandshake(std::string address, uint16_t port, HandshakeWorker* self) {
+void Network::runOutgoingHandshake(std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
     // Normal connect — no probe, no special flags
@@ -539,6 +641,7 @@ void Network::runOutgoingHandshake(std::string address, uint16_t port, Handshake
     Command cmd;
     cmd.type = Command::Type::AddPeer;
     cmd.peer = std::move(peer);
+    cmd.slot = std::move(slot);
     this->commandQueue.push(std::move(cmd));
     this->wakeupIoThread();
 
@@ -611,6 +714,14 @@ void Network::demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t cons
     }
 }
 
+void Network::joinFinishedProbeWorkers() {
+    std::erase_if(this->probeWorkers, [](std::unique_ptr<HandshakeWorker>& worker) {
+        if (!worker->done.load(std::memory_order_acquire)) return false;
+        if (worker->thread.joinable()) worker->thread.join();
+        return true;
+    });
+}
+
 void Network::joinFinishedHandshakeWorkers() {
     std::lock_guard lock(this->handshakeWorkersMutex);
     this->handshakeWorkers.erase(
@@ -676,10 +787,19 @@ void Network::ioLoop() {
         fds.push_back({ this->ioWakeup.readHandle(), POLLIN, 0 });
 
         {
+            const auto now = std::chrono::steady_clock::now();
             std::shared_lock lock(this->peersMutex);
             fds.reserve(fds.size() + this->peersBySocket.size());
             for (const auto& [fd, peer] : this->peersBySocket) {
                 if (peer->getState() == PeerState::Closing) continue;               // let cleanClosedPeers reap — no need to poll further
+
+                // Departure window bound (B3): the remote normally closes right after our GOODBYE; one that does not is
+                // closed by us. wasEverDeparting guards the instant between the state change and its timestamp.
+                if (peer->isDeparting() && peer->wasEverDeparting() && now - peer->getDepartingSince() > DEPARTURE_TIMEOUT) {
+                    std::cerr << "Network: peer " << peerIdShort(peer->getPeerId()) << " did not close within the departure window, closing" << std::endl;
+                    peer->markForClose();
+                    continue;
+                }
 
                 // A peer that has not read any of our queued frames for sendStallTimeout is gone or hostile — it would
                 // otherwise pin its full send queue in memory for as long as TCP keeps the connection open.
@@ -735,6 +855,13 @@ void Network::handleWakeup() {
         switch (cmd.type) {
             case Command::Type::AddPeer: {
                 if (!cmd.peer) break;
+                // Every early exit below closes the connection; cmd.slot then returns its place with cmd.
+
+                if (this->stopping.load()) {                                        // stop() is in its departure window — no new peers
+                    cmd.peer->markForClose();
+                    cmd.peer->closeConnection();
+                    break;
+                }
 
                 if (cmd.peer->getPeerId() == this->selfIdentity->getPeerId()) {
                     std::cerr << "Network: rejecting self-connection attempt" << std::endl;
@@ -749,64 +876,76 @@ void Network::handleWakeup() {
                     break;
                 }
 
-                {
-                    std::shared_lock lock(this->peersMutex);
-                    const size_t inboundCount = std::count_if(this->peersById.begin(), this->peersById.end(),
-                                                              [](const auto& kv) { return !kv.second->isOutbound(); });
-                    if (!cmd.peer->isOutbound() && inboundCount >= this->config.maxInbound) {
-                        lock.unlock();
-                        this->sendInitialPexTo(cmd.peer);                                           // give them peers before leaving
-                        this->sendGoodbyeTo(cmd.peer, GoodbyeReason::NoSlots);
-                        cmd.peer->closeConnection();
-                        std::cerr << "Network: rejected inbound peer (NoSlots), maxInbound="
-                                  << static_cast<int>(this->config.maxInbound) << std::endl;
-                        break;
-                    }
-                }
-
-                std::shared_ptr<Peer> insertedPeer;                                 // set if peer was added → schedule HELLO + notify after unlock
-                std::shared_ptr<Peer> replacedPeer;                                 // set if tie-break swapped connections → close after unlock
+                std::shared_ptr<Peer> activatedPeer;                                // became Active → greeting + listener event
+                std::shared_ptr<Peer> dismissedPeer;                                // above inbound.soft → departure window (NoSlots)
+                std::shared_ptr<Peer> replacedPeer;                                 // tie-break swapped connections → close after unlock
+                bool                  rejectedDuplicate = false;
                 {
                     std::unique_lock lock(this->peersMutex);
 
                     const auto existingIt = this->peersById.find(cmd.peer->getPeerId());
                     if (existingIt != this->peersById.end()) {
-                        if (this->shouldReplaceExistingPeer(*existingIt->second, *cmd.peer)) {
+                        // While the existing connection is in its departure window the new one is refused, whatever the
+                        // tie-break says: replacing a dismissed peer would skip the inbound soft limit and leave listeners
+                        // with a disconnect for a peer they never saw. The window lasts seconds; the peer can dial again.
+                        if (!existingIt->second->isDeparting() && this->shouldReplaceExistingPeer(*existingIt->second, *cmd.peer)) {
                             replacedPeer = existingIt->second;
                             replacedPeer->markForClose();
                             this->peersBySocket.erase(replacedPeer->getSocket());
                             existingIt->second = cmd.peer;
                             this->peersBySocket[fd] = cmd.peer;
                             cmd.peer->markActive();
-                            insertedPeer = cmd.peer;
+                            activatedPeer = cmd.peer;
                             std::cerr << "Network: replaced existing peer (tie-break favored new connection)" << std::endl;
                         } else {
-                            lock.unlock();
-                            cmd.peer->markForClose();
-                            cmd.peer->closeConnection();
-                            std::cerr << "Network: rejected duplicate peer (tie-break favored existing)" << std::endl;
+                            rejectedDuplicate = true;
                         }
                     } else {
+                        // Inbound soft limit (R10): above it the peer is still registered — it must be read during the
+                        // departure window — but as Departing: invisible to listeners and Topology, and it gets only a
+                        // farewell (HELLO + PEX + GOODBYE(NoSlots)) sent by the management thread.
+                        const size_t activeInbound = static_cast<size_t>(std::count_if(this->peersById.begin(), this->peersById.end(),
+                                [](const auto& entry) { return !entry.second->isOutbound() && entry.second->isActive(); }));
+                        const bool overInboundSoft = !cmd.peer->isOutbound() && activeInbound >= this->config.connectionLimits.inbound.soft;
+
                         this->peersById[cmd.peer->getPeerId()] = cmd.peer;
                         this->peersBySocket[fd]                = cmd.peer;
-                        cmd.peer->markActive();
-                        insertedPeer = cmd.peer;
-                        std::cerr << "Network: peer added " << peerIdShort(cmd.peer->getPeerId())
-                                  << ", total=" << this->peersById.size() << std::endl;
+                        if (overInboundSoft && cmd.peer->markDeparting()) {
+                            dismissedPeer = cmd.peer;
+                        } else {
+                            cmd.peer->markActive();
+                            activatedPeer = cmd.peer;
+                        }
+                        std::cerr << "Network: peer " << (dismissedPeer ? "registered for dismissal (NoSlots) " : "added ")
+                                  << peerIdShort(cmd.peer->getPeerId()) << ", registered=" << this->peersById.size() << std::endl;
                     }
                 }
 
-                // The replaced peer is no longer in any map, so cleanClosedPeers will never see it — close it here.
-                if (replacedPeer) replacedPeer->closeConnection();
+                if (rejectedDuplicate) {
+                    cmd.peer->markForClose();
+                    cmd.peer->closeConnection();
+                    std::cerr << "Network: rejected duplicate peer (tie-break favored existing)" << std::endl;
+                    break;
+                }
 
-                // Schedule HELLO send from Management thread — keeps actual send off the I/O path. Also on
-                // replacement: a HELLO queued for the old connection is skipped once that peer is Closing.
-                // Notify listeners after Network-internal state is fully consistent (peer in maps,
-                // HELLO scheduled). Listener callbacks run on this I/O thread. A replacement is transparent
-                // to listeners — the peer stays connected, only the underlying connection changed.
-                if (insertedPeer) {
-                    this->scheduleHelloSend(insertedPeer);
-                    if (!replacedPeer) this->notifyPeerConnected(insertedPeer->getIdentity());
+                if (cmd.slot) this->peerSlots.emplace(cmd.peer.get(), std::move(*cmd.slot));   // held until the peer is reaped
+
+                // The replaced peer is no longer in any map, so cleanClosedPeers will never see it — close it here.
+                if (replacedPeer) {
+                    replacedPeer->closeConnection();
+                    this->peerSlots.erase(replacedPeer.get());
+                }
+
+                // The management thread sends greetings and farewells — never this thread (A1 S3/M1). A greeting queued
+                // for a replaced connection is skipped once that peer is Closing.
+                if (dismissedPeer) {
+                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Dismissed, dismissedPeer, GoodbyeReason::NoSlots });
+                }
+                if (activatedPeer) {
+                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Activated, activatedPeer, GoodbyeReason::Shutdown });
+                    // Listener event after Network-internal state is consistent. A replacement is transparent to listeners —
+                    // the peer stays connected, only the underlying connection changed.
+                    if (!replacedPeer) this->notifyPeerConnected(activatedPeer->getIdentity());
                 }
                 break;
             }
@@ -823,7 +962,7 @@ bool Network::handleConnectionReadable(int fd, short revents) {
         peer = it->second;
     }
 
-    if (!peer->isActive()) return false;
+    if (!peer->isActive() && !peer->isDeparting()) return false;                    // Departing peers are still read (B3)
 
     // Terminal socket conditions — remote peer closed, socket error, or fd became invalid.
     // We still want to drain any remaining decoded frames from Connection's internal buffer before
@@ -896,7 +1035,7 @@ void Network::handleConnectionWritable(int fd) {
         peer = it->second;
     }
 
-    if (!peer->isActive()) return;
+    if (!peer->isActive() && !peer->isDeparting()) return;                          // a departing peer's farewell still has to go out
 
     const ssize_t written = peer->writeQueuedFrames();                              // a failure marks the peer for close
     if (written < 0) {
@@ -914,6 +1053,14 @@ void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vect
 
     const uint8_t  group   = message[0];
     const uint16_t subtype = static_cast<uint16_t>(message[1]) << 8 | message[2];
+
+    // In the departure window only the last management messages are expected; anything else is a protocol violation
+    if (peer->isDeparting() && group != GROUP_INTERNAL) {
+        std::cerr << "Network: group 0x" << std::hex << static_cast<int>(group) << std::dec << " from departing peer "
+                  << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
+        peer->markForClose();
+        return;
+    }
     std::vector<uint8_t> payload(message.begin() + FRAME_HEADER_SIZE, message.end());
 
     if (group == GROUP_INTERNAL) {
@@ -949,20 +1096,25 @@ void Network::cleanClosedPeers() {
         }
     }
 
-    for (auto& peer : toClose) peer->closeConnection();
+    for (auto& peer : toClose) {
+        peer->closeConnection();
+        this->peerSlots.erase(peer.get());                                          // the connection's limit slot returns now
+    }
 
-    // Fire disconnect events outside the peersMutex. Skip when not running — Network::stop()
+    // Fire disconnect events outside the peersMutex. Skip while stopping — Network::stop()
     // tears down all peers without per-peer events; listeners treat shutdown as implicit
     // disconnection. This makes the event stream predictable: either the peer leaves while
     // Network is alive (event fires) or Network itself shuts down (no events).
-    if (this->running.load()) {
+    // A peer that went through the departure window was never announced (NoSlots) or stopped being visible when it
+    // entered the window — no event for it here.
+    if (this->running.load() && !this->stopping.load()) {
         for (const auto& peer : toClose) {
-            this->notifyPeerDisconnected(peer->getPeerId());
+            if (!peer->wasEverDeparting()) this->notifyPeerDisconnected(peer->getPeerId());
         }
     }
 
     if (!toClose.empty()) {
-        std::cerr << "Network: closed " << toClose.size() << " peer(s), remaining="
+        std::cerr << "Network: closed " << toClose.size() << " peer(s), connected="
                   << this->getConnectedPeerCount() << std::endl;
     }
 }
@@ -980,18 +1132,22 @@ void Network::managementLoop() {
 
     while (this->running.load()) {
         this->joinFinishedHandshakeWorkers();
+        this->joinFinishedProbeWorkers();
         const auto now = std::chrono::steady_clock::now();
 
-        // Drain helloSendQueue — any peers scheduled for HELLO get the send now
-        std::shared_ptr<Peer> helloTarget;
-        while (this->helloSendQueue.tryPop(helloTarget)) {
-            if (helloTarget && helloTarget->isActive()) {
-                this->sendHelloTo(helloTarget);
-                this->sendInitialPexTo(helloTarget);
+        // Lifecycle facts from the I/O thread: greet new peers (discovery), send farewells to dismissed ones (connections)
+        PeerLifecycleEvent event;
+        while (this->peerLifecycleEvents.tryPop(event)) {
+            if (!event.peer) continue;
+            if (event.type == PeerLifecycleEvent::Type::Activated) {
+                if (event.peer->isActive()) this->greetActivatedPeer(event.peer);   // skip if it closed or is already leaving
+            } else {
+                this->sendFarewellAndDepart(event.peer, event.reason);
             }
         }
 
-        if (now >= topologyNextTick) {
+        if (now >= topologyNextTick && !this->stopping.load()) {
+            this->forgetNoSlotsRejectionsOfSettledPeers();
             topologyNextTick = now + this->tickTopology();
         }
 
@@ -1006,7 +1162,7 @@ void Network::managementLoop() {
         }
 
         // Probe scheduling — at most one in flight, throttled internally
-        this->runPeerProbe();
+        if (!this->stopping.load()) this->runPeerProbe();
 
         // Wait for internal (0xFF) messages with short timeout so periodic tasks aren't starved
         auto msg = this->messageProtocolQueue.waitPop(std::chrono::milliseconds(100));
@@ -1019,7 +1175,10 @@ void Network::managementLoop() {
 }
 
 void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
-    if (!msg.peer || !msg.peer->isActive()) return;
+    // No state check (B9): messages a peer sent right before closing — its farewell PEX, its GOODBYE — are processed
+    // even when the I/O thread has already seen EOF and marked it for close. Records are signed, so they are
+    // trustworthy whatever the connection state; replies to a closed peer simply fail.
+    if (!msg.peer) return;
 
     switch (msg.subtype) {
         case SUBTYPE_HELLO:
@@ -1045,12 +1204,18 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
 std::chrono::milliseconds Network::tickTopology() {
     const PeerId& selfId = this->selfIdentity->getPeerId();
 
+    // Planner sees established connections only; candidates exclude every registered peer, departing ones included —
+    // we are still connected to those, dialing them again would only collide.
     std::vector<ConnectedPeerInfo> connected;
+    std::vector<PeerId>            registered;
     {
         std::shared_lock lock(this->peersMutex);
         connected.reserve(this->peersById.size());
-        for (const auto& [id, peer] : this->peersById)
-            connected.push_back({ id, peer->isOutbound() });
+        registered.reserve(this->peersById.size());
+        for (const auto& [id, peer] : this->peersById) {
+            registered.push_back(id);
+            if (peer->isActive()) connected.push_back({ id, peer->isOutbound() });
+        }
     }
 
     // Snapshot directory once and filter locally — directory release happens before TopologyPlanner runs.
@@ -1067,8 +1232,7 @@ std::chrono::milliseconds Network::tickTopology() {
             if (now < entry.nextConnectionAttemptAt) continue;
             const PeerId& id = entry.record.peerId;
             if (id == selfId) continue;
-            if (std::any_of(connected.begin(), connected.end(),
-                            [&id](const ConnectedPeerInfo& p) { return p.peerId == id; })) continue;
+            if (std::find(registered.begin(), registered.end(), id) != registered.end()) continue;
             if (entry.record.addresses.empty()) continue;
             candidates.push_back(entry.record);
         }
@@ -1095,23 +1259,41 @@ std::chrono::milliseconds Network::tickTopology() {
 // 0xFF protocol: HELLO
 // ============================================================
 
-void Network::scheduleHelloSend(std::shared_ptr<Peer> peer) {
-    this->helloSendQueue.push(std::move(peer));
+std::vector<uint8_t> Network::buildHelloFrame() const {
+    if (this->selfRecordSerialized.empty()) return {};                              // defensive — start() builds this
+    return buildFrame(GROUP_INTERNAL, SUBTYPE_HELLO, this->selfRecordSerialized);
 }
 
-void Network::sendHelloTo(const std::shared_ptr<Peer>& peer) {
-    if (this->selfRecordSerialized.empty()) return;                                 // defensive — start() builds this
-
-    const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_HELLO, this->selfRecordSerialized);
-    const ssize_t sent = this->sendFrameTo(peer, frame);
-
-    if (sent < 0) {
-        std::cerr << "Network: HELLO send to " << peerIdShort(peer->getPeerId())
-                  << " failed (code=" << sent << ")" << std::endl;
-    } else {
-        std::cerr << "Network: sent HELLO to " << peerIdShort(peer->getPeerId())
-                  << " (" << frame.size() << "B)" << std::endl;
+void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer) {
+    const auto hello = this->buildHelloFrame();
+    if (!hello.empty()) {
+        const ssize_t sent = this->sendFrameTo(peer, hello);
+        std::cerr << "Network: HELLO to " << peerIdShort(peer->getPeerId()) << (sent > 0 ? " sent" : " failed, code=") << (sent > 0 ? "" : std::to_string(sent)) << std::endl;
     }
+
+    if (auto pex = this->buildInitialPexFor(peer->getPeerId())) {
+        const ssize_t sent = this->sendFrameTo(peer, pex->frame);
+        if (sent > 0) this->markRecordsAnnounced(pex->recordIds);
+        std::cerr << "Network: initial PEX to " << peerIdShort(peer->getPeerId()) << " (" << pex->recordIds.size() << " record(s))"
+                  << (sent > 0 ? " sent" : " failed") << std::endl;
+    }
+}
+
+void Network::sendFarewellAndDepart(const std::shared_ptr<Peer>& peer, const GoodbyeReason reason) {
+    if (!peer->isDeparting()) return;                                               // already closing — nothing to say
+
+    // A dismissed peer (NoSlots) has never heard from us: tell it who we are and where else to go before leaving
+    if (reason == GoodbyeReason::NoSlots) {
+        const auto hello = this->buildHelloFrame();
+        if (!hello.empty()) peer->sendFarewell(hello);
+        if (auto pex = this->buildInitialPexFor(peer->getPeerId())) {
+            if (peer->sendFarewell(pex->frame) > 0) this->markRecordsAnnounced(pex->recordIds);
+        }
+    }
+
+    this->sendGoodbyeTo(peer, reason);
+    peer->finishSending();                                                          // FIN after the farewell is flushed; we keep reading
+    if (peer->hasQueuedFrames()) this->wakeupIoThread();                            // the I/O thread flushes the rest (and then half-closes)
 }
 
 void Network::processHelloMessage(const ProtocolMessage& msg) {
@@ -1150,7 +1332,7 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
 void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason) {
     const std::vector<uint8_t> payload{ static_cast<uint8_t>(reason) };
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_GOODBYE, payload);
-    this->sendFrameTo(peer, frame);  // best-effort — we're closing anyway, ignore send errors
+    peer->sendFarewell(frame);  // best-effort — we're leaving anyway, ignore send errors
     std::cerr << "Network: sent GOODBYE to " << peerIdShort(peer->getPeerId()) << " reason=" << static_cast<int>(reason) << std::endl;
 }
 
@@ -1160,12 +1342,41 @@ void Network::processGoodbyeMessage(const ProtocolMessage& msg) {
                                  : GoodbyeReason::Shutdown;  // malformed frame — treat as shutdown, close gracefully
 
     std::cerr << "Network: received GOODBYE from " << peerIdShort(msg.peer->getPeerId()) << " reason=" << static_cast<int>(reason) << std::endl;
+
+    // We dialed a peer that is reachable but full: back off with growing intervals on the rejection channel.
+    // Its HELLO, processed just before (same connection, in order), already proved it Available.
+    if (reason == GoodbyeReason::NoSlots && !msg.dialedAddress.empty()) {
+        this->recordNoSlotsRejection(msg.peer->getPeerId());
+    }
+
+    // Every message the peer sent before GOODBYE has been processed (same queue, in order) — close our side now.
     msg.peer->markForClose();
 }
 
-void Network::sendInitialPexTo(const std::shared_ptr<Peer>& peer) {
-    const PeerId targetId = peer->getPeerId();
+void Network::forgetNoSlotsRejectionsOfSettledPeers() {
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& peer : this->activePeersSnapshot()) {
+        if (!peer->isOutbound() || now - peer->getConnectedAt() < OUTBOUND_SETTLED_AFTER) continue;
+        const auto entry = this->peerDirectory->findPeer(peer->getPeerId());
+        if (!entry || entry->consecutiveNoSlotsRejections == 0) continue;           // the common case: nothing to forget
+        this->peerDirectory->mutatePeer(peer->getPeerId(), [](KnownPeer& kp) { kp.consecutiveNoSlotsRejections = 0; });
+    }
+}
 
+void Network::recordNoSlotsRejection(const PeerId& peerId) {
+    uint8_t              rejections = 0;
+    std::chrono::seconds waitDuration{0};
+    this->peerDirectory->mutatePeer(peerId, [&](KnownPeer& entry) {
+        if (entry.consecutiveNoSlotsRejections < BACKOFF_SCHEDULE_LEN) ++entry.consecutiveNoSlotsRejections;
+        rejections   = entry.consecutiveNoSlotsRejections;
+        waitDuration = computeBackoffInterval(rejections);
+        entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + waitDuration);
+    });
+    std::cerr << "Network: " << peerIdShort(peerId) << " has no free slots (rejections=" << static_cast<int>(rejections)
+              << "), next attempt in " << waitDuration.count() << "s" << std::endl;
+}
+
+std::optional<Network::InitialPexBatch> Network::buildInitialPexFor(const PeerId& targetId) const {
     // Snapshot the verified pool, excluding the target itself (no point in telling a peer about itself).
     // PEX promotes peers we have evidence ever worked — hasEverConnected is the gate.
     std::vector<SignedPeerRecord> verifiedPool;
@@ -1179,7 +1390,7 @@ void Network::sendInitialPexTo(const std::shared_ptr<Peer>& peer) {
         }
     }
 
-    if (verifiedPool.empty()) return;                                               // nothing verified to share yet
+    if (verifiedPool.empty()) return std::nullopt;                                  // nothing verified to share yet
 
     // Random sample up to initialPexBatchSize. If the pool is already smaller, take all of it.
     const size_t batchSize = std::min<size_t>(this->config.initialPexBatchSize, verifiedPool.size());
@@ -1195,28 +1406,24 @@ void Network::sendInitialPexTo(const std::shared_ptr<Peer>& peer) {
     }
 
     const std::vector<uint8_t> payload = PexAnnounceCodec::serialize(batch);
-    if (payload.empty()) return;
+    if (payload.empty()) return std::nullopt;
 
-    const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
-    const ssize_t sent = this->sendFrameTo(peer, frame);
+    InitialPexBatch result;
+    result.frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
+    result.recordIds.reserve(batch.size());
+    for (const auto& record : batch) result.recordIds.push_back(record.peerId);
+    return result;
+}
 
-    if (sent <= 0) {
-        std::cerr << "Network: initial PEX send to " << peerIdShort(targetId)
-                  << " failed (code=" << sent << ")" << std::endl;
-        return;
-    }
-
+void Network::markRecordsAnnounced(const std::vector<PeerId>& recordIds) {
     // Mark each sent record as just-announced so periodic anti-entropy doesn't re-pick them immediately.
     const auto now = std::chrono::steady_clock::now();
-    for (const auto& record : batch) {
-        this->peerDirectory->mutatePeer(record.peerId, [now](KnownPeer& kp) {
+    for (const auto& recordId : recordIds) {
+        this->peerDirectory->mutatePeer(recordId, [now](KnownPeer& kp) {
             kp.lastAnnouncedAt = now;
             ++kp.announceCount;
         });
     }
-
-    std::cerr << "Network: sent initial PEX to " << peerIdShort(targetId)
-              << " (" << batch.size() << " record(s), " << frame.size() << "B)" << std::endl;
 }
 
 // ============================================================
@@ -1294,6 +1501,7 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             entry.availability                    = newAvailability;
             entry.consecutiveConnectionFailures   = 0;
             entry.nextConnectionAttemptAt         = {};
+            entry.consecutiveNoSlotsRejections    = 0;
             entry.consecutiveProbeFailures        = 0;
             entry.nextProbeAllowedAt              = {};
             shouldBroadcast = outboundMatch;
@@ -1395,15 +1603,9 @@ void Network::sendPendingPexBroadcasts() {
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
 
     // Snapshot connected peers under lock, then send outside the lock
-    std::vector<std::shared_ptr<Peer>> targets;
-    {
-        std::shared_lock lock(this->peersMutex);
-        targets.reserve(this->peersById.size());
-        for (const auto& [id, peer] : this->peersById) {
-            if (id == pending.excludePeerId) continue;
-            targets.push_back(peer);
-        }
-    }
+    // Connected peers come from the connection layer's service, not its map (A1 S2)
+    std::vector<std::shared_ptr<Peer>> targets = this->activePeersSnapshot();
+    std::erase_if(targets, [&](const std::shared_ptr<Peer>& peer) { return peer->getPeerId() == pending.excludePeerId; });
 
     size_t sent = 0;
     for (const auto& peer : targets) {
@@ -1462,12 +1664,7 @@ void Network::tickPeriodicPex() {
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
 
     // Snapshot connected peers, send outside the lock
-    std::vector<std::shared_ptr<Peer>> targets;
-    {
-        std::shared_lock lock(this->peersMutex);
-        targets.reserve(this->peersById.size());
-        for (const auto& [id, peer] : this->peersById) targets.push_back(peer);
-    }
+    const std::vector<std::shared_ptr<Peer>> targets = this->activePeersSnapshot();   // connection layer's service (A1 S2)
 
     if (targets.empty()) return;                                                    // no one connected — skip the update too
 
@@ -1563,7 +1760,16 @@ void Network::runPeerProbe() {
 
     if (!picked) return;
 
-    // Launch probe worker — same HandshakeWorker infra as other outbound workers
+    // A probe is an outbound connection too — it counts against the outbound hard limit (R10)
+    auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
+    if (!slot) {
+        this->peerDirectory->mutatePeer(pickedId, [&](KnownPeer& kp) {
+            if (kp.availability == AvailabilityState::Probing) kp.availability = pickedPreviousAvailability;
+        });
+        return;                                                                     // retried on a later tick
+    }
+
+    // Launch probe worker — discovery's own worker list (A1 S1)
     auto  worker    = std::make_unique<HandshakeWorker>();
     auto* workerPtr = worker.get();
 
@@ -1575,8 +1781,8 @@ void Network::runPeerProbe() {
     this->probeInFlight.store(true, std::memory_order_release);
 
     try {
-        worker->thread = std::thread([this, pickedId, address, port, workerPtr]() {
-            this->runProbeWorker(pickedId, address, port, workerPtr);
+        worker->thread = std::thread([this, pickedId, address, port, slot = std::move(*slot), workerPtr]() mutable {
+            this->runProbeWorker(pickedId, address, port, std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
         // Thread creation failed (resource exhaustion) — undo the Probing transition so the peer stays eligible.
@@ -1588,16 +1794,13 @@ void Network::runPeerProbe() {
         return;
     }
 
-    {
-        std::lock_guard lock(this->handshakeWorkersMutex);
-        this->handshakeWorkers.push_back(std::move(worker));
-    }
+    this->probeWorkers.push_back(std::move(worker));                                 // management thread only (A1 S1)
 
     std::cerr << "Network: launched probe for " << peerIdShort(pickedId)
               << " at " << address << ":" << port << std::endl;
 }
 
-void Network::runProbeWorker(PeerId expected, std::string address, uint16_t port, HandshakeWorker* self) {
+void Network::runProbeWorker(PeerId expected, std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
     // Establish outbound connection with probe flag set — remote will close after verification.
@@ -1629,6 +1832,7 @@ void Network::runProbeWorker(PeerId expected, std::string address, uint16_t port
 
     // Always close the connection — probe is one-shot.
     if (result.connection) result.connection->close();
+    { auto released = std::move(slot); }                                            // the probe connection is gone — free its outbound slot now
 
     // Commit result to peerDirectory — this also updates the per-peer cooldown.
     this->commitProbeResult(expected, success);
@@ -1710,6 +1914,16 @@ void Network::wakeupIoThread() const {
     this->ioWakeup.notify();
 }
 
+std::vector<std::shared_ptr<Peer>> Network::activePeersSnapshot() const {
+    std::vector<std::shared_ptr<Peer>> snapshot;
+    std::shared_lock lock(this->peersMutex);
+    snapshot.reserve(this->peersById.size());
+    for (const auto& [id, peer] : this->peersById) {
+        if (peer->isActive()) snapshot.push_back(peer);
+    }
+    return snapshot;
+}
+
 void Network::markAllPeersForClose() {
     std::shared_lock lock(this->peersMutex);
     for (auto& [id, peer] : this->peersById) peer->markForClose();
@@ -1719,6 +1933,7 @@ void Network::finalCleanupAllPeers() {
     for (auto& [fd, peer] : this->peersBySocket) peer->closeConnection();
     this->peersBySocket.clear();
     this->peersById.clear();
+    this->peerSlots.clear();                                                        // I/O thread has exited — safe to touch
 }
 
 } // namespace invilite::Mesh

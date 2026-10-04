@@ -11,9 +11,11 @@
 #include "meshlink/topology_planner.h"
 #include "meshlink/signed_peer_record.h"
 #include "meshlink/thread_safe_queue.h"
+#include "meshlink/connection_slots.h"
 #include "transport/TcpServer.h"
 
 #include <array>
+#include <optional>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -29,6 +31,27 @@ namespace invilite::Mesh {
 
     class Connection;
 
+    // Connection limits (roadmap R10). Soft = target, may be exceeded briefly. Hard = never exceeded.
+    // A hard limit left empty is derived from its soft limit — no "magic zero".
+    struct ConnectionLimits {
+        // Healthy number of established connections in both directions — a target, not a limit.
+        uint16_t total = 24;
+
+        struct Inbound {
+            uint16_t                soft = 16;                                          // accepted normally up to here; above → dismissed with GOODBYE(NoSlots)
+            std::optional<uint16_t> hard;                                               // above → closed right after accept(), nothing allocated; default 2 × soft
+            uint16_t                perAddress = 5;                                     // inbound connections (handshakes + established) from one IP
+            [[nodiscard]] uint16_t effectiveHard() const { return this->hard.value_or(static_cast<uint16_t>(2 * this->soft)); }
+        } inbound;
+
+        struct Outbound {
+            uint16_t                min  = 2;                                           // kept even when inbound is full — we pick these ourselves (eclipse protection)
+            uint16_t                soft = 12;                                          // upper bound of Topology's target
+            std::optional<uint16_t> hard;                                               // never exceeded, probes included; default soft + 3
+            [[nodiscard]] uint16_t effectiveHard() const { return this->hard.value_or(static_cast<uint16_t>(this->soft + 3)); }
+        } outbound;
+    };
+
     struct NetworkConfig {
         uint16_t                    listenPort        = 0;
         std::string                 listenAddress     = "::";
@@ -39,9 +62,7 @@ namespace invilite::Mesh {
         // On MVP the user fills this manually; future: auto-discovery via STUN-like protocol.
         std::vector<PeerAddress>    announcedAddresses;
 
-        uint8_t                     targetOutbound    = 8;
-        uint8_t                     maxInbound        = 16;
-        uint8_t                     maxTotal          = 32;
+        ConnectionLimits            connectionLimits;
         int                         backlog           = 16;
 
         // PEX_ANNOUNCE — number of verified peers to share on each new connection right after HELLO.
@@ -137,8 +158,24 @@ namespace invilite::Mesh {
     private:
         struct Command {
             enum class Type { AddPeer };
-            Type                    type;
+            Type                                    type = Type::AddPeer;
+            std::shared_ptr<Peer>                   peer;
+            std::optional<ConnectionSlots::Slot>    slot;                               // resources the connection holds — kept until it closes (R10)
+        };
+
+        // Connection-layer fact handed to the management thread (I/O → Management). Replaces the old "send HELLO"
+        // queue (A1 S3): the I/O thread reports what happened, the management thread decides what to send.
+        struct PeerLifecycleEvent {
+            enum class Type { Activated, Dismissed };
+            Type                    type = Type::Activated;
             std::shared_ptr<Peer>   peer;
+            GoodbyeReason           reason = GoodbyeReason::Shutdown;                   // Dismissed only
+        };
+
+        // Initial PEX for one peer, built by discovery; the caller sends it and then marks the records as announced.
+        struct InitialPexBatch {
+            std::vector<uint8_t>    frame;
+            std::vector<PeerId>     recordIds;
         };
 
         struct HandshakeWorker {
@@ -181,16 +218,32 @@ namespace invilite::Mesh {
 
         // ===== 0xFF protocol handlers =====
         void processHelloMessage(const ProtocolMessage& msg);                           // subtype 0x0001
-        void sendHelloTo(const std::shared_ptr<Peer>& peer);                            // send our selfRecord to given peer
         void processGoodbyeMessage(const ProtocolMessage& msg);                         // subtype 0x0040
-        void sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);
+
+        // ===== Discovery content (who we are, whom we know) — sent by whoever owns the moment =====
+        [[nodiscard]] std::vector<uint8_t> buildHelloFrame() const;                    // empty if selfRecord is missing
+        [[nodiscard]] std::optional<InitialPexBatch> buildInitialPexFor(const PeerId& target) const;
+        void markRecordsAnnounced(const std::vector<PeerId>& recordIds);
+
+        // Discovery's greeting for a peer that became Active: HELLO + initial PEX.
+        void greetActivatedPeer(const std::shared_ptr<Peer>& peer);
+
+        // Departure window (B3), connection-layer side: the peer is already Departing. Sends the farewell (HELLO + PEX
+        // when dismissing with NoSlots, so the dismissed peer still learns where else to go), then GOODBYE, then
+        // half-closes once flushed. The remote closes; the I/O thread enforces DEPARTURE_TIMEOUT.
+        void sendFarewellAndDepart(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);
+
+        // Dial-side reaction to GOODBYE(NoSlots): the peer is reachable but full — growing backoff on its own counter,
+        // so it is never mistaken for failed dials (B8 would demote it). Availability is not touched.
+        void recordNoSlotsRejection(const PeerId& peerId);
+        // An outbound connection that stayed Active past OUTBOUND_SETTLED_AFTER was accepted for good — the peer's
+        // NoSlots rejection count starts over. (Not on HELLO: HELLO always precedes a GOODBYE(NoSlots).)
+        void forgetNoSlotsRejectionsOfSettledPeers();
+        void sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);     // farewell path — peer must be Departing
         // Single path for every frame sent to a peer. Wakes the I/O thread when part of the frame stayed queued, so it
         // starts polling POLLOUT now instead of after the poll timeout.
         ssize_t sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vector<uint8_t>& frame) const;
 
-        // Send a one-shot PEX_ANNOUNCE with a random sample of verifiedReachable peers.
-        // Called from managementLoop right after sendHelloTo — same trigger (peer became Active).
-        void sendInitialPexTo(const std::shared_ptr<Peer>& peer);
 
         // Periodic anti-entropy tick — picks the N least-recently-announced verified records
         // and broadcasts them to all connected peers.
@@ -200,10 +253,6 @@ namespace invilite::Mesh {
         // Falls back to min if max <= min (misconfigured).
         std::chrono::seconds pickRandomPexInterval();
 
-        // Called when a peer transitions to Active (handleWakeup/AddPeer).
-        // Enqueues a HELLO send request into commandQueue (or calls from Management after dequeuing via a sidechannel).
-        // We use a dedicated queue so HELLO sends happen off the I/O thread.
-        void scheduleHelloSend(std::shared_ptr<Peer> peer);
 
         // ===== Listener notification =====
         // Snapshot the listener vector under shared lock, then iterate without the lock so a
@@ -217,15 +266,20 @@ namespace invilite::Mesh {
         bool shouldReplaceExistingPeer(const Peer& existing, const Peer& candidate) const;
 
         // ===== Handshake workers =====
+        // Accept thread (TcpServer): admission against the inbound hard and per-address limits (R10/R1) before
+        // anything is allocated for the connection.
         void onIncomingConnection(int fd, const sockaddr_storage* addr);
-        void runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorker* self);
-        void runOutgoingHandshake(std::string address, uint16_t port, HandshakeWorker* self);
+        void runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlots::Slot slot, HandshakeWorker* self);
+        void runOutgoingHandshake(std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self);
         void joinFinishedHandshakeWorkers();
+        void joinFinishedProbeWorkers();                                                // discovery's own workers (A1 S1)
 
         // ===== Helpers =====
         void wakeupIoThread() const;
         void markAllPeersForClose();
         void finalCleanupAllPeers();
+        // Peers visible as connected — Active only. Joining / Departing / Closing peers are invisible above this layer.
+        [[nodiscard]] std::vector<std::shared_ptr<Peer>> activePeersSnapshot() const;
 
         // ===== PEX =====
         void processPexAnnounceMessage(const ProtocolMessage& msg);                     // subtype 0x0020
@@ -252,7 +306,7 @@ namespace invilite::Mesh {
         // Probe worker body. Establishes an outbound connection with the probe flag set,
         // verifies that the remote PeerId matches `expected`, and commits the result to
         // peerDirectory. Always closes the connection before returning.
-        void runProbeWorker(PeerId expected, std::string address, uint16_t port, HandshakeWorker* self);
+        void runProbeWorker(PeerId expected, std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self);
 
         // Commit a probe's result. Only updates state if still Probing — guards against races
         // where a newer record arrived during the probe and reset the state.
@@ -280,6 +334,8 @@ namespace invilite::Mesh {
 
         // ===== Lifecycle state =====
         std::atomic<bool>                                running{false};
+        std::atomic<bool>                                stopping{false};               // stop() in its departure window: no new connections, no listener events
+        std::mutex                                       stopMutex;                     // a concurrent stop() (e.g. ~Network) waits for the running one
         Transport::Platform::WakeupSignal                ioWakeup;                       // wakes the I/O thread out of its poll
 
         // ===== Transport =====
@@ -293,12 +349,20 @@ namespace invilite::Mesh {
         // ===== Handshake workers =====
         std::mutex                                       handshakeWorkersMutex;
         std::vector<std::unique_ptr<HandshakeWorker>>    handshakeWorkers;
+        bool                                             acceptingHandshakeWorkers = false;   // under handshakeWorkersMutex — false once stop() collects them
+
+        // ===== Probe workers — discovery's own, touched only by the management thread (and stop() after it joined) =====
+        std::vector<std::unique_ptr<HandshakeWorker>>    probeWorkers;
+
+        // ===== Hard connection limits (R10) =====
+        ConnectionSlots                                  connectionSlots;
+        std::unordered_map<const Peer*, ConnectionSlots::Slot> peerSlots;               // I/O thread only: slots of registered peers, released on reap
 
         // ===== Inter-thread queues =====
         ThreadSafeQueue<Command>                         commandQueue;                  // workers → I/O
         ThreadSafeQueue<ProtocolMessage>                 messageProtocolQueue;          // I/O → Management (0xFF protocol)
         ThreadSafeQueue<NetworkMessage>                  routerMessageQueue;            // I/O → Dispatch (router/application layer)
-        ThreadSafeQueue<std::shared_ptr<Peer>>           helloSendQueue;                // I/O → Management (send HELLO to this peer)
+        ThreadSafeQueue<PeerLifecycleEvent>              peerLifecycleEvents;           // I/O → Management (peer activated / dismissed)
 
         // ===== Event listeners =====
         // Subscribers for connection lifecycle and message events. Listed under shared_mutex —

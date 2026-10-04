@@ -194,10 +194,16 @@ int invilite::Mesh::Connection::waitForHandshake(const milliseconds timeout) {
     std::vector<uint8_t> message;
     message.reserve(maxLength);
 
-    // Wait for full handshake receiving
+    // Wait for full handshake receiving. `timeout` bounds the whole wait, not each chunk — otherwise a client sending one
+    // byte just before every timeout keeps the handshake (and its worker thread) alive forever (R1, slowloris).
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     bool handshakeReceived = false;
     while (!handshakeReceived) {
-        const ssize_t received = this->receiveRaw<maxLength>(message, timeout, maxLength);
+        const auto remaining = std::chrono::ceil<milliseconds>(deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            return static_cast<int32_t>(Error::Connection::SocketTimeout);
+        }
+        const ssize_t received = this->receiveRaw<maxLength>(message, remaining, maxLength - static_cast<uint32_t>(message.size()));
 
         if (received < 0) {
             return static_cast<int32_t>(received);
@@ -666,7 +672,7 @@ ssize_t invilite::Mesh::Connection::send(const std::vector<uint8_t>* data) {
 }
 
 ssize_t invilite::Mesh::Connection::checkFrameFitsLocked(const size_t frameSize) const {
-    if (this->clientSocket == -1) return static_cast<int32_t>(Error::Connection::SocketClosed);
+    if (this->clientSocket == -1 || this->sendFinishing) return static_cast<int32_t>(Error::Connection::SocketClosed);
     if (this->sendStreamFailed)   return static_cast<int32_t>(Error::Connection::SocketError);
     if (this->queuedFrameBytes + frameSize > this->sendQueueLimit) {                                                    // Only reachable with frames already queued — an empty queue takes any frame up to the limit
         return static_cast<int32_t>(Error::Connection::SendQueueFull);
@@ -731,7 +737,20 @@ ssize_t invilite::Mesh::Connection::writeQueuedFramesLocked() {
         if (static_cast<size_t>(n) < requested) break;                                                                  // Short write — the kernel buffer is full, skip the EAGAIN round trip
     }
 
+    this->shutDownSendDirectionIfFinishedLocked();
     return static_cast<ssize_t>(totalWritten);
+}
+
+void invilite::Mesh::Connection::shutDownSendDirectionIfFinishedLocked() {
+    if (!this->sendFinishing || !this->sendQueue.empty() || this->sendDirectionShutDown || this->clientSocket == -1) return;
+    ::shutdown(this->clientSocket, SHUT_WR);                                                                            // FIN after the last queued byte
+    this->sendDirectionShutDown = true;
+}
+
+void invilite::Mesh::Connection::finishSending() {
+    std::lock_guard lock(this->sendQueueMutex);
+    this->sendFinishing = true;
+    this->shutDownSendDirectionIfFinishedLocked();                                                                     // Nothing queued → half-close now; otherwise the last flush does it
 }
 
 bool invilite::Mesh::Connection::drainSendQueue(const milliseconds timeout) {

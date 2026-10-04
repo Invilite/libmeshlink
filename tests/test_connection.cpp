@@ -398,8 +398,12 @@ TEST_F(EstablishedConnectionPair, ReportsSendIdleTimeOnlyWhileQueuedFramesMakeNo
     ASSERT_TRUE(client->timeSinceSendProgress().has_value());
     EXPECT_GT(*client->timeSinceSendProgress(), 200ms);
 
-    // Read part of the backlog and wait until the socket takes more: the queue still holds frames, but it moved
-    readRawFromServerSocket(8192);
+    // Read what is in the server socket (part of the backlog) and wait until the client socket takes more: the queue
+    // still holds frames, but it moved
+    int available = 0;
+    ::ioctl(serverFd, FIONREAD, &available);
+    ASSERT_GT(available, 0);
+    readRawFromServerSocket(static_cast<size_t>(available));
     pollfd pfd{ clientFd, POLLOUT, 0 };
     ASSERT_EQ(::poll(&pfd, 1, 2000), 1);
     ASSERT_GT(client->writeQueuedFrames(), 0);
@@ -650,4 +654,44 @@ TEST_F(EstablishedConnectionPair, BackToBackSmallMessagesAreNotDelayed) {
     int available = 0;
     while (static_cast<size_t>(available) < 3 * frameSize && std::chrono::steady_clock::now() - start < 1s) ::ioctl(serverFd, FIONREAD, &available);
     EXPECT_LT(std::chrono::steady_clock::now() - start, 20ms) << "later frames were held back";
+}
+
+// ===== Graceful half-close (departure window, B3) =====
+
+// The leaving side's last frames must all arrive before the remote sees EOF — even when they were still queued when
+// finishSending() was called — and nothing sent afterwards may slip in behind the EOF.
+TEST_F(EstablishedConnectionPair, FinishSendingDeliversQueuedFramesThenEndOfStream) {
+    const uint32_t sent = sendUntilQueued(16 * 1024);
+    ASSERT_TRUE(client->hasQueuedFrames());
+
+    client->finishSending();
+    const std::vector<uint8_t> late(10, 0x01);
+    EXPECT_EQ(client->send(&late), static_cast<ssize_t>(Error::Connection::SocketClosed));
+
+    const auto received = pumpUntilReceived(sent);
+    ASSERT_EQ(received.size(), sent);
+    for (uint32_t i = 0; i < sent; ++i) EXPECT_EQ(received[i], numberedPayload(i, 16 * 1024)) << "frame " << i;
+
+    std::vector<uint8_t> message;
+    ssize_t result = 0;
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(message, 100ms);
+    EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketClosed));                   // EOF only after the last frame
+}
+
+// Half-close, not close: the leaving side keeps reading, so the remote can still deliver its own last messages
+// (and the leaving side does not answer them with RST).
+TEST_F(EstablishedConnectionPair, FinishSendingKeepsReceiving) {
+    client->finishSending();
+
+    std::vector<uint8_t> message;
+    ssize_t result = 0;
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(message, 100ms);
+    ASSERT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketClosed));                   // empty queue → EOF right away
+
+    const auto reply = numberedPayload(3, 200);
+    ASSERT_GT(server->send(&reply), 0);
+    result = 0;
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = client->receive(message, 100ms);
+    ASSERT_GT(result, 0);
+    EXPECT_EQ(message, reply);
 }

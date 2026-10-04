@@ -60,6 +60,8 @@ namespace invilite::Mesh {
         // ── Connection attempt backoff (TopologyPlanner domain) ──
         uint8_t                                     consecutiveConnectionFailures = 0;
         std::chrono::steady_clock::time_point       nextConnectionAttemptAt{};
+        // GOODBYE(NoSlots) refusals — reachable but full. Separate from failures so B8 never demotes such a peer.
+        uint8_t                                     consecutiveNoSlotsRejections  = 0;
 
         // ── Probe backoff (Network/probe domain) ──
         uint8_t                                     consecutiveProbeFailures      = 0;

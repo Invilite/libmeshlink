@@ -19,9 +19,17 @@ namespace invilite::Mesh {
 
         const size_t outboundCount = std::count_if(connected.begin(), connected.end(),
                                                    [](const ConnectedPeerInfo& p) { return p.isOutbound; });
+        const size_t inboundCount  = connected.size() - outboundCount;
 
-        if (outboundCount >= config.targetOutbound || candidates.empty()) {
-            decision.nextTick = (outboundCount >= config.targetOutbound)
+        // Outbound target (R10): fill up to the healthy total with what inbound does not cover, never below min (we pick
+        // those ourselves — eclipse protection) and never above soft. A public node with plenty of inbound keeps only
+        // min outbound; a node behind NAT (no inbound) dials up to soft.
+        const ConnectionLimits::Outbound& outbound = config.connectionLimits.outbound;
+        const size_t uncovered      = config.connectionLimits.total > inboundCount ? config.connectionLimits.total - inboundCount : 0;
+        const size_t outboundTarget = std::clamp<size_t>(uncovered, outbound.min, outbound.soft);
+
+        if (outboundCount >= outboundTarget || candidates.empty()) {
+            decision.nextTick = (outboundCount >= outboundTarget)
                                 ? TICK_SATISFIED
                                 : TICK_WAITING;
             return decision;

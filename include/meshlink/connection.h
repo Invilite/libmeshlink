@@ -53,6 +53,9 @@ public:
 	// Blocks until the send queue is empty (true) or the timeout passes / the stream fails (false). Only for ephemeral
 	// threads (handshake workers) that drive the socket themselves before the I/O thread takes the connection over.
 	bool drainSendQueue(milliseconds timeout);
+	// Graceful half-close: no further frames are accepted, and once everything already queued has been written the
+	// write direction is shut down (the remote reads EOF) — while this side keeps reading. Used by the departure window.
+	void finishSending();
 	bool hasQueuedFrames() const;
 	size_t getQueuedSendBytes() const;																					// Memory held by queued frames (see queuedFrameBytes)
 	// How long queued frames have been waiting without any byte reaching the socket; nullopt when nothing is queued.
@@ -77,6 +80,7 @@ protected:
 	ssize_t sendRaw(const std::vector<uint8_t>* data, size_t offset = 0, milliseconds timeout = milliseconds(100));
 	ssize_t writeQueuedFramesLocked();																					// Caller holds sendQueueMutex
 	ssize_t checkFrameFitsLocked(size_t frameSize) const;																// 0 or the refusal send() returns; caller holds sendQueueMutex
+	void shutDownSendDirectionIfFinishedLocked();																		// SHUT_WR once finishing and drained; caller holds sendQueueMutex
 	ssize_t processFrame(std::vector<uint8_t>& data);
 	std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
 	std::vector<uint8_t> decryptData(const std::vector<uint8_t>& frame, size_t frameSize);
@@ -108,6 +112,8 @@ private:
 	size_t queuedFrameBytes = 0;																						// Full size of every queued frame — the memory actually held (the written part of the front frame is freed only when it pops), checked against sendQueueLimit
 	const size_t sendQueueLimit;
 	bool sendStreamFailed = false;																						// A socket write failed — nothing may be written anymore
+	bool sendFinishing = false;																							// finishSending() called — accept no new frames
+	bool sendDirectionShutDown = false;																					// SHUT_WR done after the queue drained
 	std::chrono::steady_clock::time_point lastSendProgressAt;															// Meaningful only while the queue is not empty
 	const std::array<uint8_t, 64>* networkSecret;
 	std::vector<uint8_t> sessionKey;																					// Session key is negotiated during handshake

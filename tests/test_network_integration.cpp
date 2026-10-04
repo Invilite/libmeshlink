@@ -471,3 +471,280 @@ TEST(NetworkIntegrationTest, FloodingPeerDoesNotStarveOthers) {
 
     for (auto* node : { &staller, &flooder, &quiet, &receiver }) node->network->stop();
 }
+
+namespace {
+
+// Raw TCP client that never completes a handshake — what an attacker (or a slowloris) looks like to the accept path.
+struct RawConnection {
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    explicit RawConnection(uint16_t port) {
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_port        = htons(port);
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        connected = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    }
+    ~RawConnection() { ::close(fd); }
+    // True when the node closed this connection (EOF or reset) within `timeout`.
+    bool closedByRemoteWithin(std::chrono::milliseconds timeout) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            pollfd pfd{ fd, POLLIN, 0 };
+            if (::poll(&pfd, 1, 20) > 0) {
+                char byte;
+                const ssize_t n = ::recv(fd, &byte, 1, MSG_DONTWAIT);
+                if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) return true;
+            }
+        }
+        return false;
+    }
+    bool connected = false;
+};
+
+struct MessageCounter : NetworkEventListener {
+    explicit MessageCounter(PeerId watched) : watched(watched) {}
+    void onMessageReceived(const NetworkMessage& message) override { if (message.source == this->watched) ++this->messages; }
+    PeerId           watched;
+    std::atomic<int> messages{0};
+};
+
+} // namespace
+
+// B3 + B9: a node above inbound.soft is dismissed politely. The dismissed side must get the whole farewell — our HELLO,
+// a PEX sample (so it learns where else to go) and GOODBYE(NoSlots) — even though our half-close makes its I/O see EOF
+// right behind them (B9: those messages used to be dropped once the peer was no longer Active). It then backs off on
+// the rejection channel and keeps the full node Available. The full node never reports it to listeners.
+TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
+    const auto secret = makeSecret();
+    TestNode full(secret, "full", [](NetworkConfig& config) { config.connectionLimits.inbound.soft = 1; });
+    TestNode first(secret, "first");
+    TestNode dismissed(secret, "dismissed");
+
+    // A peer the full node has verified — the farewell PEX should hand it to the dismissed node
+    const auto elsewhere = LocalIdentity::generate();
+    const auto elsewhereRecord = makeSignedRecord(elsewhere, { ipv4("127.0.0.1", pickUnusedPort()) }, std::chrono::system_clock::now());
+    full.directory->upsertPeer(elsewhereRecord.peerId, [&](KnownPeer& entry, bool) { entry.record = elsewhereRecord; entry.hasEverConnected = true; });
+
+    const auto eventsAtFull = std::make_shared<PeerEventCounter>(dismissed.identity->getPeerId());
+    full.network->addListener(eventsAtFull);
+    for (auto* node : { &full, &first, &dismissed }) node->network->start();
+
+    first.network->connectToPeer("127.0.0.1", full.port);
+    ASSERT_TRUE(waitUntil([&] { return full.network->getConnectedPeerCount() == 1; }, 5s));
+    dismissed.network->connectToPeer("127.0.0.1", full.port);
+
+    ASSERT_TRUE(waitUntil([&] { const auto e = dismissed.knownPeer(full); return e && e->consecutiveNoSlotsRejections == 1; }, 5s)) << "GOODBYE(NoSlots) lost";
+    const auto fullAsSeen = dismissed.knownPeer(full);
+    EXPECT_EQ(fullAsSeen->availability, AvailabilityState::Available) << "a full node is reachable — B8 must not demote it";
+    EXPECT_EQ(fullAsSeen->consecutiveConnectionFailures, 0);
+    EXPECT_GT(fullAsSeen->nextConnectionAttemptAt, std::chrono::steady_clock::now() + 5s) << "no backoff after NoSlots";
+    EXPECT_TRUE(dismissed.directory->findPeer(elsewhereRecord.peerId).has_value()) << "farewell PEX lost";
+
+    EXPECT_TRUE(waitUntil([&] { return dismissed.network->getConnectedPeerCount() == 0; }, 5s));
+    EXPECT_EQ(full.network->getConnectedPeerCount(), 1u);
+    EXPECT_EQ(eventsAtFull->connected.load(), 0) << "a dismissed peer must stay invisible to listeners";
+    EXPECT_EQ(eventsAtFull->disconnected.load(), 0);
+
+    // A second refusal backs off longer (connectToPeer dials regardless of backoff)
+    const auto firstBackoffUntil = dismissed.knownPeer(full)->nextConnectionAttemptAt;
+    dismissed.network->connectToPeer("127.0.0.1", full.port);
+    ASSERT_TRUE(waitUntil([&] { return dismissed.knownPeer(full)->consecutiveNoSlotsRejections == 2; }, 5s));
+    EXPECT_GT(dismissed.knownPeer(full)->nextConnectionAttemptAt, firstBackoffUntil + 10s);
+
+    for (auto* node : { &dismissed, &first, &full }) node->network->stop();
+}
+
+// B3: in the departure window only management messages are expected from the departing peer. Application data from it
+// is a protocol violation — it must never reach listeners.
+TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {
+    const auto secret = makeSecret();
+    TestNode full(secret, "full", [](NetworkConfig& config) { config.connectionLimits.inbound.soft = 1; });
+    TestNode first(secret, "first");
+    TestNode dismissed(secret, "dismissed");
+    const auto messagesAtFull = std::make_shared<MessageCounter>(dismissed.identity->getPeerId());
+    full.network->addListener(messagesAtFull);
+
+    // The dismissed node sends application data the moment it considers itself connected
+    struct SendOnConnect : NetworkEventListener {
+        Network*          network = nullptr;
+        std::atomic<bool> sent{false};
+        void onPeerConnected(const PeerIdentity& identity) override { this->sent = this->network->sendToPeer(identity.getPeerId(), applicationMessage(0x01, 50)) > 0; }
+    };
+    const auto sender = std::make_shared<SendOnConnect>();
+    sender->network = dismissed.network.get();
+    dismissed.network->addListener(sender);
+    for (auto* node : { &full, &first, &dismissed }) node->network->start();
+
+    first.network->connectToPeer("127.0.0.1", full.port);
+    ASSERT_TRUE(waitUntil([&] { return full.network->getConnectedPeerCount() == 1; }, 5s));
+    dismissed.network->connectToPeer("127.0.0.1", full.port);
+    // The violation closes the connection at once — possibly before our farewell even goes out
+    ASSERT_TRUE(waitUntil([&] { return sender->sent.load() && dismissed.network->getConnectedPeerCount() == 0; }, 5s));
+    EXPECT_EQ(full.network->getConnectedPeerCount(), 1u);
+    std::this_thread::sleep_for(300ms);
+
+    EXPECT_EQ(messagesAtFull->messages.load(), 0);
+
+    for (auto* node : { &dismissed, &first, &full }) node->network->stop();
+}
+
+// R10/R1: above inbound.hard a connection is closed right after accept() — nothing is allocated for it, so connections
+// that never finish a handshake cannot pile up. Handshakes in progress count towards the limit.
+TEST(NetworkIntegrationTest, InboundAboveHardLimitIsClosedImmediately) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "guarded", [](NetworkConfig& config) { config.connectionLimits.inbound = { .soft = 1, .hard = 2, .perAddress = 5 }; });
+    node.network->start();
+
+    {
+        RawConnection firstHandshake(node.port), secondHandshake(node.port);
+        ASSERT_TRUE(firstHandshake.connected && secondHandshake.connected);
+        std::this_thread::sleep_for(100ms);                                                   // both admitted, handshakes waiting
+
+        RawConnection overLimit(node.port);
+        EXPECT_TRUE(overLimit.closedByRemoteWithin(500ms));
+        EXPECT_FALSE(firstHandshake.closedByRemoteWithin(200ms)) << "admitted handshakes must not be cut by the limit";
+    }                                                                                         // close before stop(): stop() waits for handshake workers
+
+    // Their slots come back once those connections are gone — a leak would lock the node out for good
+    std::this_thread::sleep_for(200ms);
+    {
+        RawConnection afterwards(node.port), another(node.port);
+        EXPECT_FALSE(afterwards.closedByRemoteWithin(200ms));
+        EXPECT_FALSE(another.closedByRemoteWithin(200ms));
+    }
+
+    node.network->stop();
+}
+
+// R1: one address cannot take all inbound capacity — other addresses (and the node's LAN neighbours) still get in.
+TEST(NetworkIntegrationTest, InboundPerAddressLimitClosesExcessFromSameAddress) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "guarded", [](NetworkConfig& config) { config.connectionLimits.inbound = { .soft = 8, .hard = 16, .perAddress = 2 }; });
+    node.network->start();
+
+    {
+        RawConnection first(node.port), second(node.port);
+        std::this_thread::sleep_for(100ms);
+        RawConnection third(node.port);
+        EXPECT_TRUE(third.closedByRemoteWithin(500ms));
+        EXPECT_FALSE(first.closedByRemoteWithin(200ms));
+    }
+
+    node.network->stop();
+}
+
+// R1: the handshake deadline counts from accept(). A client trickling a byte now and then (slowloris) used to reset the
+// wait each time and hold a worker thread forever; now it is cut at the deadline (5 s) and its slot returns.
+TEST(NetworkIntegrationTest, SlowHandshakeIsCutAtDeadline) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "guarded", [](NetworkConfig& config) { config.connectionLimits.inbound = { .soft = 1, .hard = 1, .perAddress = 5 }; });
+    node.network->start();
+
+    RawConnection slow(node.port);
+    ASSERT_TRUE(slow.connected);
+    const auto start = std::chrono::steady_clock::now();
+    bool closed = false;
+    while (!closed && std::chrono::steady_clock::now() - start < 8s) {
+        const char byte = 0x00;
+        ::send(slow.fd, &byte, 1, MSG_NOSIGNAL);                                              // one byte per second keeps a per-chunk timeout alive
+        closed = slow.closedByRemoteWithin(1s);
+    }
+    EXPECT_TRUE(closed);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 6500ms);
+
+    {
+        RawConnection next(node.port);                                                        // the slot came back: admitted, not closed at once
+        EXPECT_FALSE(next.closedByRemoteWithin(300ms));
+    }
+
+    node.network->stop();
+}
+
+// R10: the outbound hard limit is never exceeded — not even by explicit connectToPeer calls.
+TEST(NetworkIntegrationTest, OutboundHardLimitIsNeverExceeded) {
+    const auto secret = makeSecret();
+    TestNode dialer(secret, "dialer", [](NetworkConfig& config) { config.connectionLimits.outbound = { .min = 0, .soft = 1, .hard = 1 }; });
+    TestNode one(secret, "one");
+    TestNode two(secret, "two");
+    for (auto* node : { &dialer, &one, &two }) node->network->start();
+
+    dialer.network->connectToPeer("127.0.0.1", one.port);
+    dialer.network->connectToPeer("127.0.0.1", two.port);
+    std::this_thread::sleep_for(1500ms);
+
+    EXPECT_EQ(dialer.network->getConnectedPeerCount(), 1u);
+    EXPECT_EQ(one.network->getConnectedPeerCount() + two.network->getConnectedPeerCount(), 1u);
+
+    for (auto* node : { &dialer, &one, &two }) node->network->stop();
+}
+
+// B3 (Shutdown): stop() says GOODBYE and lets the remote close first. It returns quickly when the remote cooperates,
+// and the remote sees an orderly disconnect.
+TEST(NetworkIntegrationTest, StopDepartsGracefullyAndQuickly) {
+    const auto secret = makeSecret();
+    TestNode leaving(secret, "leaving");
+    TestNode staying(secret, "staying");
+    const auto eventsAtStaying = std::make_shared<PeerEventCounter>(leaving.identity->getPeerId());
+    staying.network->addListener(eventsAtStaying);
+    leaving.network->start();
+    staying.network->start();
+    leaving.network->connectToPeer("127.0.0.1", staying.port);
+    ASSERT_TRUE(waitUntil([&] { return eventsAtStaying->connected == 1; }, 5s));
+
+    const auto start = std::chrono::steady_clock::now();
+    leaving.network->stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 1s);
+    EXPECT_TRUE(waitUntil([&] { return eventsAtStaying->disconnected == 1; }, 2s));
+    EXPECT_EQ(staying.network->getConnectedPeerCount(), 0u);
+
+    staying.network->stop();
+}
+
+
+// B3: a peer that refused us before but now keeps our connection has room again — once the connection has settled, its
+// refusal count starts over, so a later refusal starts from the shortest backoff instead of where the old series ended.
+TEST(NetworkIntegrationTest, SettledConnectionResetsNoSlotsRejections) {
+    const auto secret = makeSecret();
+    TestNode dialer(secret, "dialer");
+    TestNode target(secret, "target");
+    const auto record = makeSignedRecord(*target.identity, { ipv4("127.0.0.1", target.port) }, std::chrono::system_clock::now());
+    dialer.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) {
+        entry.record = record; entry.hasEverConnected = true; entry.availability = AvailabilityState::Available;
+        entry.consecutiveNoSlotsRejections = 3;
+        entry.nextConnectionAttemptAt      = std::chrono::steady_clock::now() + 1h;           // Topology stays away; we dial explicitly
+    });
+    dialer.network->start();
+    target.network->start();
+    dialer.network->connectToPeer("127.0.0.1", target.port);
+    ASSERT_TRUE(waitUntil([&] { return dialer.network->getConnectedPeerCount() == 1; }, 5s));
+    EXPECT_EQ(dialer.directory->findPeer(record.peerId)->consecutiveNoSlotsRejections, 3) << "reset before the connection settled";
+
+    EXPECT_TRUE(waitUntil([&] { return dialer.directory->findPeer(record.peerId)->consecutiveNoSlotsRejections == 0; }, 20s));
+
+    dialer.network->stop();
+    target.network->stop();
+}
+
+// stop() closes the internal queues; start() must open them again, so a restarted node works (and does not spin).
+TEST(NetworkIntegrationTest, RestartAfterStopWorks) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "restarting");
+    TestNode other(secret, "other");
+    other.network->start();
+    node.network->start();
+    node.network->stop();
+
+    node.network->start();
+    node.network->connectToPeer("127.0.0.1", other.port);
+    EXPECT_TRUE(waitUntil([&] { return node.network->getConnectedPeerCount() == 1 && other.knownPeer(node).has_value(); }, 5s)) << "HELLO not processed after restart";
+
+    // Queues left closed still hand out items, so everything above works — but every waitPop returns at once and the
+    // management and dispatch threads spin. An idle process must stay well below one core.
+    const auto cpuTime = [] { timespec t{}; ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t); return std::chrono::seconds(t.tv_sec) + std::chrono::nanoseconds(t.tv_nsec); };
+    const auto cpuBefore = cpuTime();
+    std::this_thread::sleep_for(1s);
+    EXPECT_LT(cpuTime() - cpuBefore, 300ms) << "a thread spins after restart";
+
+    node.network->stop();
+    other.network->stop();
+}

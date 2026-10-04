@@ -65,6 +65,13 @@ public:
         this->cv.notify_all();
     }
 
+    // Accept waiters again after shutdown() — Network::start() after stop(). Leftover items are dropped.
+    void reopen() {
+        std::lock_guard lock(this->mutex);
+        this->shuttingDown = false;
+        this->queue = {};
+    }
+
     size_t size() const {
         std::lock_guard lock(this->mutex);
         return this->queue.size();
