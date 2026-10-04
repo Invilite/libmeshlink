@@ -20,6 +20,9 @@ namespace invilite::Mesh {
 class Connection {
 public:
 	Connection(int clientSocket, const sockaddr_storage* clientAddress, const std::array<uint8_t, 64>* networkSecret);
+	~Connection();																										// Closes the socket if still open — Connection owns it
+	Connection(const Connection&)            = delete;																	// Unique socket ownership: copying would double-close
+	Connection& operator=(const Connection&) = delete;
 	int initHandshake();																								// Client initiates a handshake
 	int waitForHandshake(milliseconds timeout = milliseconds(3000));													// Server waits for a client to start a handshake
 	ssize_t receive(std::vector<uint8_t>& data, milliseconds timeout = milliseconds(100));								// Wait for incoming packet of data and decrypt it

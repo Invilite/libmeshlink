@@ -8,6 +8,8 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
 
 using namespace invilite::Mesh;
 using namespace std::chrono_literals;
@@ -160,4 +162,14 @@ TEST_F(EstablishedConnectionPair, RejectsFrameShorterThanMinimumFrameSize) {
     for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(received, 100ms);
 
     EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::InvalidFrameHeader));
+}
+
+// A Connection owns its socket: destroying it without an explicit close() must not leak the descriptor.
+TEST_F(EstablishedConnectionPair, DestructorClosesSocket) {
+    const int fd = clientFd;
+    client.reset();
+
+    errno = 0;
+    EXPECT_EQ(::fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(errno, EBADF);
 }

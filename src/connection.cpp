@@ -796,6 +796,10 @@ uint16_t invilite::Mesh::Connection::getRemoteClientPort() const {
     return remoteClientPort;
 }
 
+invilite::Mesh::Connection::~Connection() {
+    this->close();
+}
+
 void invilite::Mesh::Connection::close() {
     if (this->clientSocket != -1) {
         ::shutdown(this->clientSocket, SHUT_WR);
