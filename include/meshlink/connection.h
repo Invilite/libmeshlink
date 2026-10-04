@@ -18,6 +18,11 @@
 
 using std::chrono::milliseconds;
 
+namespace Botan {
+	class AEAD_Mode;
+	class MessageAuthenticationCode;
+}
+
 namespace invilite::Mesh {
 
 // Transport layer protocol
@@ -74,7 +79,7 @@ public:
 protected:
 	int validateHandshake(const std::vector<uint8_t>* message);
 	int finishHandshake(const std::vector<uint8_t>* message);
-	bool isValidFrameHeader(const std::vector<uint8_t> &frame, uint32_t &packetSize, uint8_t &flags) const;
+	bool isValidFrameHeader(std::span<const uint8_t> frame, uint32_t &packetSize, uint8_t &flags) const;
 	template <uint16_t bufferSize> ssize_t receiveRaw(std::vector<uint8_t>& data, milliseconds timeout = milliseconds(100), uint32_t maxDataLength = 104857600);
 	// Blocking send for handshake messages only — runs on an ephemeral worker before the connection carries frames.
 	ssize_t sendRaw(const std::vector<uint8_t>* data, size_t offset = 0, milliseconds timeout = milliseconds(100));
@@ -83,7 +88,8 @@ protected:
 	void shutDownSendDirectionIfFinishedLocked();																		// SHUT_WR once finishing and drained; caller holds sendQueueMutex
 	ssize_t processFrame(std::vector<uint8_t>& data);
 	std::vector<uint8_t> encryptData(const std::vector<uint8_t>& data);
-	std::vector<uint8_t> decryptData(const std::vector<uint8_t>& frame, size_t frameSize);
+	std::vector<uint8_t> decryptData(std::span<const uint8_t> frame);													// `frame` is exactly one whole frame
+	void compactFrameBuffer();																							// Move the unprocessed tail to the front
 	template <std::size_t nonceLength> static std::array<uint8_t, 8> calculateHeaderMask(const std::array<uint8_t, nonceLength>& nonce, const std::array<uint8_t, 64>* secret);
 	template <std::size_t nonceLength> static std::array<uint8_t, 8> calculateHeaderMask(const std::array<uint8_t, nonceLength>& nonce, const std::vector<uint8_t>& secret);
 	template<std::uint8_t length> static std::array<uint8_t, length> generateNonce();
@@ -93,6 +99,7 @@ protected:
 
 	const sockaddr_storage clientAddress;
 	std::vector<uint8_t> frameBuffer;
+	size_t frameBufferOffset = 0;																						// Start of unprocessed bytes — frames are consumed by advancing it, not by moving the rest
     uint32_t frameLength = 0;
     uint8_t  frameFlags = 0;
 
@@ -117,11 +124,23 @@ private:
 	std::chrono::steady_clock::time_point lastSendProgressAt;															// Meaningful only while the queue is not empty
 	const std::array<uint8_t, 64>* networkSecret;
 	std::vector<uint8_t> sessionKey;																					// Session key is negotiated during handshake
+
+	// Frame crypto, created and keyed once when the handshake sets the session key — creating and keying these per frame
+	// cost ~14 µs, far more than the cipher itself. The send side is shared by sender threads (encryptMutex); the receive
+	// side has a single reader (I/O thread, or the handshake worker before it).
+	void keyFrameCrypto();
+	std::array<uint8_t, 8> frameHeaderMask(Botan::MessageAuthenticationCode& mac, std::span<const uint8_t> nonce) const;
+	std::mutex encryptMutex;
+	std::unique_ptr<Botan::AEAD_Mode> frameEncryptor;
+	std::unique_ptr<Botan::MessageAuthenticationCode> sendHeaderMac;
+	std::unique_ptr<Botan::AEAD_Mode> frameDecryptor;
+	std::unique_ptr<Botan::MessageAuthenticationCode> receiveHeaderMac;
 	std::shared_ptr<void> privateKey;																					// Only for client-node (that started connection)
 
 	constexpr static uint8_t handshakeMaxPadding = 255;																	// Max padding for handshake request and reply
 	constexpr static uint32_t bufferMinSize = 1024;																		// Frame buffer initial size
 	constexpr static uint32_t bufferSoftLimit = 3145728;																// Frame buffer will shrink to this size (3MB) after receive large packet over bufferSoftLimit
+	constexpr static uint32_t receiveReadAhead = 65536;																	// Max bytes read past the current frame in one receive() — bounds the buffer of small frames
 	constexpr static uint32_t messageHardLimit = 16777216;																// Largest possible frame size (16MB) that can be transferred
 };
 

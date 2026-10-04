@@ -6,3 +6,4 @@
 *.log
 run_test
 *.d
+run_bench

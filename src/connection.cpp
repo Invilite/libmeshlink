@@ -12,6 +12,7 @@
 #include <botan/pubkey.h>
 #include <botan/pk_keys.h>
 #include <botan/auto_rng.h>
+#include <botan/system_rng.h>
 #include <botan/stream_cipher.h>
 
 #include <poll.h>
@@ -293,6 +294,7 @@ int invilite::Mesh::Connection::validateHandshake(const std::vector<uint8_t>* me
     const Botan::PK_Key_Agreement keyAgreement(privateKeyB, rng, "Raw");
     const Botan::secure_vector<uint8_t> sharedSecret = keyAgreement.derive_key(56, pubKeyA.raw_public_key_bits()).bits_of();
     this->sessionKey = deriveEncryptionKey(replyNonce, sharedSecret);
+    this->keyFrameCrypto();
 
     // Prepare reply header
     std::array<uint8_t, 24> replyHeader{};                                                                              // Reserve 24 bytes for header
@@ -391,6 +393,7 @@ int invilite::Mesh::Connection::finishHandshake(const std::vector<uint8_t>* mess
     const Botan::PK_Key_Agreement keyAgreement(*static_cast<Botan::X448_PrivateKey*>(this->privateKey.get()), rng, "Raw");
     const Botan::secure_vector<uint8_t> sharedSecret = keyAgreement.derive_key(56, pubKeyB.raw_public_key_bits()).bits_of();
     this->sessionKey = deriveEncryptionKey(nonce, sharedSecret);
+    this->keyFrameCrypto();
 
     // Clean private key from memory
     this->privateKey.reset();
@@ -533,14 +536,18 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
         return buffered;
     }
 
-    // Need more data — read from socket
+    // Need more data — read from socket. Only the start of one incomplete frame is left in the buffer now; moving it to
+    // the front here, once per socket read, keeps consuming frames free of copies (moving the rest after every frame
+    // was quadratic in the buffered amount).
+    this->compactFrameBuffer();
     if (this->frameBuffer.size() >= messageHardLimit) {                                                                 // Buffer full and still no valid frame — stream is unrecoverable
         return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
     }
 
-    const uint32_t toRead = (this->frameLength > 0)
-        ? static_cast<uint32_t>(this->frameLength - this->frameBuffer.size())                                           // We know the frame size — read exactly what's missing
-        : static_cast<uint32_t>(messageHardLimit - this->frameBuffer.size());                                           // Unknown frame size yet — read up to hard limit
+    // Read what the current frame still needs, plus a bounded read-ahead for the frames behind it (one syscall serves
+    // many small frames without pulling megabytes into the buffer)
+    const size_t missing = (this->frameLength > this->frameBuffer.size()) ? this->frameLength - this->frameBuffer.size() : 0;
+    const auto   toRead  = static_cast<uint32_t>(std::max<size_t>(missing, receiveReadAhead));
 
     const ssize_t receivedLength = this->receiveRaw<16384>(this->frameBuffer, timeout, toRead);
 
@@ -558,8 +565,9 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
 
 bool invilite::Mesh::Connection::hasBufferedFrameData() const {
     constexpr size_t packetMinSize = 24 + 8 + 16;                                                                       // nonce + header + tag
-    if (this->frameBuffer.size() < packetMinSize) return false;
-    return this->frameLength == 0 || this->frameBuffer.size() >= this->frameLength;                                    // header not parsed yet, or the whole frame is here
+    const size_t available = this->frameBuffer.size() - this->frameBufferOffset;
+    if (available < packetMinSize) return false;
+    return this->frameLength == 0 || available >= this->frameLength;                                                    // header not parsed yet, or the whole frame is here
 }
 
 // Returns: > 0 complete frame decrypted, 0 incomplete, < 0 error
@@ -570,13 +578,15 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
     constexpr size_t packetMinSize = nonceSize + headerSize + tagSize;
 
     // Not enough data to even attempt processing
-    if (this->frameBuffer.size() < packetMinSize) {
+    const size_t available = this->frameBuffer.size() - this->frameBufferOffset;
+    if (available < packetMinSize) {
         return 0;
     }
 
     // Parse header if we haven't yet
     if (this->frameLength == 0) {
-        if (!isValidFrameHeader(this->frameBuffer, this->frameLength, this->frameFlags)) {
+        const std::span<const uint8_t> pending(this->frameBuffer.data() + this->frameBufferOffset, available);
+        if (!isValidFrameHeader(pending, this->frameLength, this->frameFlags)) {
             return static_cast<int32_t>(Error::Connection::InvalidFrameHeader);
         }
 
@@ -584,19 +594,21 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
             return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
         }
 
-        if (this->frameLength > this->frameBuffer.capacity()) {                                                         // Reserve exact size upfront — receiveRaw will write directly without reallocation
-            this->frameBuffer.reserve(this->frameLength);
+        if (this->frameLength > available && this->frameBufferOffset + this->frameLength > this->frameBuffer.capacity()) {
+            this->compactFrameBuffer();                                                                                 // Large frame: start it at the front, then reserve its exact size —
+            this->frameBuffer.reserve(this->frameLength);                                                               // receiveRaw will write directly without reallocation
         }
     }
 
     // Frame is not complete yet
-    if (this->frameBuffer.size() < this->frameLength) {
+    if (this->frameBuffer.size() - this->frameBufferOffset < this->frameLength) {
         return 0;
     }
 
     // We have a complete frame — decrypt it
     try {
-        std::vector<uint8_t> decryptedData = this->decryptData(this->frameBuffer, this->frameLength);                   // Decrypt frame data
+        const std::span<const uint8_t> frame(this->frameBuffer.data() + this->frameBufferOffset, this->frameLength);
+        std::vector<uint8_t> decryptedData = this->decryptData(frame);
 
         // TODO: Implement compression in the future
         // if (this->frameFlags) { }
@@ -604,23 +616,15 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
         const ssize_t finalDataSize = static_cast<ssize_t>(decryptedData.size());
         data = std::move(decryptedData);                                                                                // Move decrypted data to output buffer — no copy
 
-        // Shift remaining data (next frame) to the front of the buffer
-        const size_t remaining = this->frameBuffer.size() - this->frameLength;
-        if (remaining > 0) {
-            std::memmove(
-                this->frameBuffer.data(),
-                this->frameBuffer.data() + this->frameLength,
-                remaining
-            );
-        }
-        this->frameBuffer.resize(remaining);
-
-        // Shrink buffer back to softLimit if it grew large after processing a big frame
-        if (this->frameBuffer.capacity() > bufferSoftLimit) {
-            std::vector<uint8_t> shrunk;
-            shrunk.reserve(bufferSoftLimit);
-            shrunk.insert(shrunk.end(), this->frameBuffer.begin(), this->frameBuffer.end());                         // Preserve remaining data (next frame)
-            this->frameBuffer = std::move(shrunk);
+        // Consume the frame by advancing the offset; once everything is consumed, start over at the front for free
+        this->frameBufferOffset += this->frameLength;
+        if (this->frameBufferOffset == this->frameBuffer.size()) {
+            this->frameBuffer.clear();
+            this->frameBufferOffset = 0;
+            if (this->frameBuffer.capacity() > bufferSoftLimit) {                                                       // Give back memory after a large frame
+                std::vector<uint8_t>().swap(this->frameBuffer);
+                this->frameBuffer.reserve(bufferMinSize);
+            }
         }
 
         this->frameLength = 0;
@@ -632,6 +636,14 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
     } catch (const std::exception&) {
         return static_cast<int32_t>(Error::Connection::DecryptionError);
     }
+}
+
+void invilite::Mesh::Connection::compactFrameBuffer() {
+    if (this->frameBufferOffset == 0) return;
+    const size_t remaining = this->frameBuffer.size() - this->frameBufferOffset;
+    if (remaining > 0) std::memmove(this->frameBuffer.data(), this->frameBuffer.data() + this->frameBufferOffset, remaining);
+    this->frameBuffer.resize(remaining);
+    this->frameBufferOffset = 0;
 }
 
 ssize_t invilite::Mesh::Connection::send(const std::vector<uint8_t>* data) {
@@ -791,49 +803,68 @@ std::optional<std::chrono::steady_clock::duration> invilite::Mesh::Connection::t
     return std::chrono::steady_clock::now() - this->lastSendProgressAt;
 }
 
-std::vector<uint8_t> invilite::Mesh::Connection::encryptData(const std::vector<uint8_t>& data) {
-    constexpr size_t tagSize = 16;
-    const std::array<uint8_t, 24> nonce = generateNonce<24>();                                                          // Generate 24 bytes random nonce (initialization vector for XChaCha20)
-    const std::array<uint8_t, 8>  headerMask = calculateHeaderMask(nonce, this->sessionKey);                            // Generate 8 bytes header mask (from session key)
-    std::array<uint8_t, 8> header{};                                                                                    // Reserve 8 bytes for frame header
+void invilite::Mesh::Connection::keyFrameCrypto() {
+    this->frameEncryptor = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Encryption);   // 24-byte nonce → XChaCha20
+    this->frameEncryptor->set_key(this->sessionKey);
+    this->frameDecryptor = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Decryption);
+    this->frameDecryptor->set_key(this->sessionKey);
+    this->sendHeaderMac = Botan::MessageAuthenticationCode::create_or_throw("BLAKE2b(64)");
+    this->sendHeaderMac->set_key(this->sessionKey);
+    this->receiveHeaderMac = Botan::MessageAuthenticationCode::create_or_throw("BLAKE2b(64)");
+    this->receiveHeaderMac->set_key(this->sessionKey);
+}
 
-    // Calculate total packet length (nonce + header + data + tag)
-    const auto frameLen = static_cast<uint32_t>(nonce.size() + header.size() + data.size() + tagSize);
+std::array<uint8_t, 8> invilite::Mesh::Connection::frameHeaderMask(Botan::MessageAuthenticationCode& mac, const std::span<const uint8_t> nonce) const {
+    mac.update(nonce.data(), nonce.size());
+    const auto digest = mac.final();                                                                                    // final() also resets the MAC for the next frame, keeping the key
+    std::array<uint8_t, 8> mask{};
+    std::copy_n(digest.begin(), mask.size(), mask.begin());
+    return mask;
+}
+
+std::vector<uint8_t> invilite::Mesh::Connection::encryptData(const std::vector<uint8_t>& data) {
+    constexpr size_t nonceSize  = 24;
+    constexpr size_t headerSize = 8;
+    constexpr size_t tagSize    = 16;
+    const std::array<uint8_t, nonceSize> nonce = generateNonce<nonceSize>();                                            // Random 24-byte nonce (XChaCha20)
+
+    // Frame layout: nonce | masked header | ciphertext | tag — built in one buffer, the payload copied in once and
+    // encrypted in place
+    const auto frameLen = static_cast<uint32_t>(nonceSize + headerSize + data.size() + tagSize);
+    std::vector<uint8_t> frame(frameLen);
+    std::ranges::copy(nonce, frame.begin());
+
+    uint8_t* header = frame.data() + nonceSize;
     header[0] = 0x01;                                                                                                   // Protocol version
     header[1] = 0x00;                                                                                                   // Flags (compression?)
     header[2] = (frameLen >> 24) & 0xFF;                                                                                // Packet length (big-endian)
     header[3] = (frameLen >> 16) & 0xFF;
     header[4] = (frameLen >> 8) & 0xFF;
     header[5] =  frameLen & 0xFF;
-
-    const uint16_t crc = calculateCRC16(header, 0, header.size() - 2);                                                  // Calculate CRC checksum for frame header
-    header[6] = (crc >> 8) & 0xFF;                                                                                      // Add CRC checksum to the header
+    const uint16_t crc = calculateCRC16(frame, nonceSize, nonceSize + headerSize - 2);                                 // CRC over the first 6 header bytes
+    header[6] = (crc >> 8) & 0xFF;
     header[7] = crc & 0xFF;
 
-    // Mask the header
-    for (size_t i = 0; i < 8; i++) {
-        header[i] ^= headerMask[i];
+    uint8_t* body = frame.data() + nonceSize + headerSize;
+    std::copy(data.begin(), data.end(), body);
+
+    std::lock_guard lock(this->encryptMutex);                                                                           // senders on several threads share the keyed objects
+    const std::array<uint8_t, 8> headerMask = this->frameHeaderMask(*this->sendHeaderMac, nonce);
+    for (size_t i = 0; i < headerSize; i++) {
+        header[i] ^= headerMask[i];                                                                                     // Mask the header (DPI resistance)
     }
 
-    const auto aead = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Encryption);
-    aead->set_key(this->sessionKey);
-    aead->set_associated_data(header.data(), header.size());
-    aead->start(nonce.data(), nonce.size());
-
-    Botan::secure_vector<uint8_t> cipherData;
-    cipherData.assign(data.begin(), data.end());
-    aead->finish(cipherData);                                                                                           // Add Poly1305 tag
-
-    std::vector<uint8_t> frame(nonce.size() + header.size() + cipherData.size());
-    auto it = frame.begin();
-    it = std::ranges::copy(nonce, it).out;                                                                              // Copy nonce (initialization vector)
-    it = std::ranges::copy(header, it).out;                                                                             // Copy header
-    std::ranges::copy(cipherData, it);                                                                                  // Copy encrypted data + Poly1305
+    this->frameEncryptor->set_associated_data(header, headerSize);                                                     // must precede start(): the masked header is authenticated
+    this->frameEncryptor->start(nonce.data(), nonce.size());
+    this->frameEncryptor->process(body, data.size());                                                                  // encrypt in place
+    Botan::secure_vector<uint8_t> tag;
+    this->frameEncryptor->finish(tag);                                                                                  // empty final block → only the Poly1305 tag
+    std::copy(tag.begin(), tag.end(), body + data.size());
 
     return frame;
 }
 
-bool invilite::Mesh::Connection::isValidFrameHeader(const std::vector<uint8_t>& frame, uint32_t& packetSize, uint8_t& flags) const {
+bool invilite::Mesh::Connection::isValidFrameHeader(const std::span<const uint8_t> frame, uint32_t& packetSize, uint8_t& flags) const {
     constexpr size_t nonceSize  = 24;
     constexpr size_t headerSize = 8;
 
@@ -846,7 +877,7 @@ bool invilite::Mesh::Connection::isValidFrameHeader(const std::vector<uint8_t>& 
     std::array<uint8_t, headerSize> header{};
     std::copy_n(frame.begin(), nonce.size(), nonce.begin());                                                            // Unpack nonce (initialization vector) from frame
     std::copy_n(frame.begin() + nonce.size(), header.size(), header.begin());                                           // Unpack frame header
-    const std::array<uint8_t, 8> headerMask = calculateHeaderMask(nonce, this->sessionKey);                             // Generate 8 bytes header mask (from session key)
+    const std::array<uint8_t, 8> headerMask = this->frameHeaderMask(*this->receiveHeaderMac, nonce);                    // keyed once with the session key
 
     // Unmask the header
     for (size_t i = 0; i < 8; i++) {
@@ -883,30 +914,31 @@ bool invilite::Mesh::Connection::isValidFrameHeader(const std::vector<uint8_t>& 
     return true;
 }
 
-std::vector<uint8_t> invilite::Mesh::Connection::decryptData(const std::vector<uint8_t>& frame, const size_t frameSize) {
+std::vector<uint8_t> invilite::Mesh::Connection::decryptData(const std::span<const uint8_t> frame) {
+    const size_t frameSize = frame.size();
     constexpr size_t nonceSize = 24;
     constexpr size_t headerSize = 8;
     constexpr size_t tagSize = 16;
     constexpr size_t packetMinSize = nonceSize + headerSize + tagSize;
 
     // Check is packet have minimal required size to decrypt
-    if (frame.size() < packetMinSize) {
+    if (frameSize < packetMinSize) {
         throw std::runtime_error("Packet is incomplete, unable to decrypt.");
     }
 
-    Botan::secure_vector<uint8_t> cipherData(frame.begin() + nonceSize + headerSize, frame.begin() + frameSize);
+    // One copy: the ciphertext into the output, decrypted there in place; the tag is verified separately
+    const auto bodyBegin = frame.begin() + nonceSize + headerSize;
+    const auto tagBegin  = frame.begin() + static_cast<std::ptrdiff_t>(frameSize - tagSize);
+    std::vector<uint8_t> plain(bodyBegin, tagBegin);
+    Botan::secure_vector<uint8_t> tag(tagBegin, tagBegin + tagSize);
 
     try {
-        const auto aead = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Decryption);
-        aead->set_key(this->sessionKey);
-        aead->set_associated_data(frame.data() + nonceSize, headerSize);
-        aead->start(frame.data(), nonceSize);
-        aead->finish(cipherData);                                                                                       // Decrypt, verify and remove Poly1305 tag from data
-
-        return std::vector<uint8_t>(cipherData.begin(), cipherData.end());
-        
+        this->frameDecryptor->set_associated_data(frame.data() + nonceSize, headerSize);
+        this->frameDecryptor->start(frame.data(), nonceSize);
+        this->frameDecryptor->process(plain.data(), plain.size());
+        this->frameDecryptor->finish(tag);                                                                              // verifies the tag — throws when the frame was tampered with
+        return plain;
     } catch (const Botan::Exception& e) {
-        printf("Decryption error: %s\n", e.what());
         throw std::runtime_error(std::string("Decryption failed: ") + e.what());
     }
 }
@@ -1013,9 +1045,10 @@ template <typename Container> uint16_t invilite::Mesh::Connection::calculateCRC1
 
 template<std::uint8_t length>
 std::array<uint8_t, length> invilite::Mesh::Connection::generateNonce() {
-    Botan::AutoSeeded_RNG rng;
+    // The OS CSPRNG (getrandom): ~40 ns, thread-safe, stateless. AutoSeeded_RNG cost ~6 µs per call even when reused
+    // (it mixes extra input and updates its DRBG on every request) and ~5 µs more to construct — per frame.
     std::array<uint8_t, length> nonce{};
-    rng.randomize(nonce.data(), nonce.size());
+    Botan::system_rng().randomize(nonce.data(), nonce.size());
 
     return nonce;
 }

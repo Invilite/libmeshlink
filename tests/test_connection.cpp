@@ -35,7 +35,7 @@ protected:
 
         const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
         ASSERT_GE(listener, 0);
-        setSmallSocketBuffers(listener);                                                       // inherited by the accepted socket
+        if (smallSocketBuffers) setSmallSocketBuffers(listener);                              // inherited by the accepted socket
         sockaddr_in addr{};
         addr.sin_family      = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -45,7 +45,7 @@ protected:
         ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &addrLen), 0);
 
         clientFd = ::socket(AF_INET, SOCK_STREAM, 0);
-        setSmallSocketBuffers(clientFd);
+        if (smallSocketBuffers) setSmallSocketBuffers(clientFd);
         ASSERT_EQ(::connect(clientFd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)), 0);
         sockaddr_storage peerAddr{};
         socklen_t peerAddrLen = sizeof(peerAddr);
@@ -56,7 +56,7 @@ protected:
         sockaddr_storage clientView{};
         std::memcpy(&clientView, &addr, sizeof(addr));
         client = std::make_shared<Connection>(clientFd, &clientView, &secret, clientSendQueueLimit);
-        server = std::make_shared<Connection>(serverFd, &peerAddr, &secret);
+        server = this->makeServer(serverFd, &peerAddr);
 
         ASSERT_EQ(client->initHandshake(), 0);
         ASSERT_GT(server->waitForHandshake(2000ms), 0);                                       // responder: > 0
@@ -67,6 +67,8 @@ protected:
         if (client) client->close();
         if (server) server->close();
     }
+
+    virtual std::shared_ptr<Connection> makeServer(int fd, const sockaddr_storage* address) { return std::make_shared<Connection>(fd, address, &secret); }
 
     static void setSmallSocketBuffers(int fd) {
         const int size = 4096;
@@ -129,10 +131,29 @@ protected:
 
     std::array<uint8_t, 64>     secret{};
     size_t                      clientSendQueueLimit = Connection::defaultSendQueueLimit;
+    bool                        smallSocketBuffers   = true;
     int                         clientFd = -1;
     int                         serverFd = -1;
     std::shared_ptr<Connection> client;
     std::shared_ptr<Connection> server;
+};
+
+// Exposes how many received bytes wait in the Connection's buffer.
+class InspectableConnection : public Connection {
+public:
+    using Connection::Connection;
+    [[nodiscard]] size_t bufferedBytes() const { return this->frameBuffer.size() - this->frameBufferOffset; }
+};
+
+// Same pair with the kernel's default (autotuned) socket buffers, so a large backlog can pile up in the socket.
+class LargeSocketBuffersPair : public EstablishedConnectionPair {
+protected:
+    LargeSocketBuffersPair() { smallSocketBuffers = false; clientSendQueueLimit = 64 * 1024 * 1024; }
+    std::shared_ptr<Connection> makeServer(int fd, const sockaddr_storage* address) override {
+        inspectableServer = std::make_shared<InspectableConnection>(fd, address, &secret);
+        return inspectableServer;
+    }
+    std::shared_ptr<InspectableConnection> inspectableServer;
 };
 
 // Same pair with a small client send queue, so the limit is reached with a handful of frames.
@@ -694,4 +715,42 @@ TEST_F(EstablishedConnectionPair, FinishSendingKeepsReceiving) {
     for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = client->receive(message, 100ms);
     ASSERT_GT(result, 0);
     EXPECT_EQ(message, reply);
+}
+
+// A backlog of small frames sitting in the socket must be consumed in linear time and bounded memory. receive() used to
+// pull up to 16 MB into its buffer in one go and then move the whole remainder to the front after every frame —
+// quadratic (~400 µs per 64-byte frame in the benchmark). Now a frame is consumed by advancing an offset and the
+// read-ahead is bounded: the buffer never holds more than the current frame plus 64 KB. The reader starts late, so the
+// server socket holds far more than 64 KB when it does.
+TEST_F(LargeSocketBuffersPair, LargeBacklogOfSmallFramesIsConsumedInBoundedMemory) {
+    constexpr uint32_t FRAMES = 20000;
+    constexpr size_t   FRAME_ON_WIRE = NONCE_SIZE + HEADER_SIZE + 64 + TAG_SIZE;
+    for (uint32_t i = 0; i < FRAMES; ++i) {
+        const auto payload = numberedPayload(i, 64);
+        ASSERT_GT(client->send(&payload), 0);
+    }
+    std::thread flusher([&] { client->drainSendQueue(10s); });                                // the backlog moves into the server socket
+    std::this_thread::sleep_for(200ms);
+    int pendingAtStart = 0;
+    ::ioctl(serverFd, FIONREAD, &pendingAtStart);
+
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> message;
+    uint32_t received = 0;
+    size_t   maxBuffered = 0;
+    bool     intact = true;
+    while (received < FRAMES && intact && std::chrono::steady_clock::now() - start < 10s) {
+        const ssize_t n = server->receive(message, 10ms);
+        maxBuffered = std::max(maxBuffered, inspectableServer->bufferedBytes());
+        if (n < 0 || (n > 0 && message != numberedPayload(received, 64))) intact = false;
+        if (n > 0) ++received;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    flusher.join();                                                                           // before any ASSERT — a joinable thread must not be destroyed
+
+    ASSERT_GT(static_cast<size_t>(pendingAtStart), 65536 + FRAME_ON_WIRE) << "precondition: the socket must hold more than the read-ahead";
+    EXPECT_TRUE(intact) << "frame " << received << " corrupted or receive failed";
+    EXPECT_EQ(received, FRAMES);
+    EXPECT_LE(maxBuffered, 65536 + FRAME_ON_WIRE) << "receive() read far past the current frame";
+    EXPECT_LT(elapsed, 2s) << "consuming buffered frames is not linear";
 }

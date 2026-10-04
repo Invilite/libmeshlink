@@ -38,9 +38,17 @@ tests: $(TEST_OBJECTS) $(STATIC_LIB)
 tests/%.o: tests/%.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
-.PHONY: clean
+# Frame throughput benchmark (optimized build of the library)
+bench: CXXFLAGS += -O2
+bench: bench/bench_connection.o $(STATIC_LIB)
+	$(CXX) $(CXXFLAGS) -o run_bench bench/bench_connection.o $(STATIC_LIB) $(LDFLAGS) -lpthread
+
+bench/%.o: bench/%.cpp
+	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
+
+.PHONY: clean bench
 
 clean:
-	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY) $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY) bench/*.o bench/*.d run_bench $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
 
 -include $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
