@@ -15,6 +15,7 @@
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 namespace invilite::Mesh {
@@ -1423,9 +1424,10 @@ void Network::runPeerProbe() {
     // Snapshot all peers; filter eligible candidates locally without holding the directory lock.
     const auto allPeers = this->peerDirectory->listPeers();
 
-    PeerId      pickedId{};
-    PeerAddress pickedAddr;
-    bool        picked = false;
+    PeerId            pickedId{};
+    PeerAddress       pickedAddr;
+    AvailabilityState pickedPreviousAvailability = AvailabilityState::Unknown;    // restored if the worker cannot be started
+    bool              picked = false;
 
     for (const auto& entry : allPeers) {
         if (entry.availability == AvailabilityState::Probing)   continue;
@@ -1444,6 +1446,7 @@ void Network::runPeerProbe() {
             if (kp.availability == AvailabilityState::Available) return;
             if (now < kp.nextProbeAllowedAt)                     return;
             if (kp.record.addresses.empty())                     return;
+            pickedPreviousAvailability = kp.availability;
             kp.availability = AvailabilityState::Probing;
             transitioned    = true;
         });
@@ -1465,16 +1468,28 @@ void Network::runPeerProbe() {
     const std::string address = pickedAddr.address;
     const uint16_t    port    = pickedAddr.port;
 
-    worker->thread = std::thread([this, pickedId, address, port, workerPtr]() {
-        this->runProbeWorker(pickedId, address, port, workerPtr);
-    });
+    // Raise the in-flight flag BEFORE the worker exists: the worker clears it when done, and a fast-failing
+    // probe (e.g. connection refused) could otherwise clear it before we set it, leaving it stuck at true forever.
+    this->probeInFlight.store(true, std::memory_order_release);
+
+    try {
+        worker->thread = std::thread([this, pickedId, address, port, workerPtr]() {
+            this->runProbeWorker(pickedId, address, port, workerPtr);
+        });
+    } catch (const std::system_error& e) {
+        // Thread creation failed (resource exhaustion) — undo the Probing transition so the peer stays eligible.
+        this->peerDirectory->mutatePeer(pickedId, [&](KnownPeer& kp) {
+            if (kp.availability == AvailabilityState::Probing) kp.availability = pickedPreviousAvailability;
+        });
+        this->probeInFlight.store(false, std::memory_order_release);
+        std::cerr << "Network: failed to start probe worker for " << peerIdShort(pickedId) << ": " << e.what() << std::endl;
+        return;
+    }
 
     {
         std::lock_guard lock(this->handshakeWorkersMutex);
         this->handshakeWorkers.push_back(std::move(worker));
     }
-
-    this->probeInFlight.store(true, std::memory_order_release);
 
     std::cerr << "Network: launched probe for " << peerIdShort(pickedId)
               << " at " << address << ":" << port << std::endl;
