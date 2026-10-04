@@ -17,6 +17,8 @@ enum class Connection : int32_t {
     MissingEncryptionKey	= -10,	// Missing session encryption key
     InvalidFrameHeader	    = -11,	// Frame header has invalid CRC
     DecryptionError	        = -12,
+    SendQueueFull			= -13,	// Send queue has no room for the frame — dropped, stream intact (transient back-pressure)
+    MessageTooLarge			= -14,	// Message can never fit a frame or the send queue — dropped, stream intact
 };
 
 } // namespace invilite::Mesh::Error

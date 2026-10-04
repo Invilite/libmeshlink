@@ -9,7 +9,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 namespace invilite::Mesh {
@@ -24,7 +23,7 @@ enum class PeerState : uint8_t {
 
 // Peer — high-level abstraction over a single mesh connection.
 // Owns a Connection (transport) + PeerIdentity (who we're talking to) + state.
-// Methods are thread-safe where documented; send() uses an internal mutex.
+// Methods are thread-safe where documented; send() never blocks (Connection queues what the socket cannot take).
 class Peer {
 public:
     Peer(std::shared_ptr<Connection> connection, PeerIdentity identity, bool outbound);
@@ -58,13 +57,20 @@ public:
     // ===== Statistics =====
     [[nodiscard]] std::chrono::steady_clock::time_point getConnectedAt() const { return this->connectedAt; }
 
-    // ===== Send (thread-safe — serialized via sendMutex) =====
-    // Returns bytes sent on success, negative error code on failure.
-    // Returns error immediately if peer is not in Active state.
+    // ===== Send (thread-safe, non-blocking) =====
+    // Returns bytes accepted (written or queued) on success, negative error code on failure.
+    // Returns error immediately if peer is not in Active state. A failure that leaves the stream unusable marks the peer
+    // for close — the peer owns its lifecycle, so callers only see the error.
     ssize_t send(const std::vector<uint8_t>& data);
 
-    // Close underlying Connection. Called by I/O thread during reap,
-    // holds sendMutex to wait for any in-flight send to complete.
+    // ===== Send queue — driven by the I/O thread =====
+    [[nodiscard]] bool hasQueuedFrames() const { return this->connection && this->connection->hasQueuedFrames(); }
+    [[nodiscard]] std::optional<std::chrono::steady_clock::duration> timeSinceSendProgress() const { return this->connection ? this->connection->timeSinceSendProgress() : std::nullopt; }
+    // Flush queued frames when the socket is writable. Same error contract as send().
+    ssize_t writeQueuedFrames();
+
+    // Close underlying Connection. Thread-safe: Connection serializes close with in-flight writes
+    // and drops any unsent frames.
     void closeConnection();
 
 private:
@@ -74,7 +80,6 @@ private:
     const std::chrono::steady_clock::time_point     connectedAt;
 
     std::atomic<PeerState>                          state{PeerState::Joining};
-    std::mutex                                      sendMutex;                      // serializes Connection::send, also held during close
 };
 
 } // namespace invilite::Mesh

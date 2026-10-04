@@ -22,23 +22,25 @@ void invilite::Mesh::Peer::markForClose() {
 }
 
 ssize_t invilite::Mesh::Peer::send(const std::vector<uint8_t>& data) {
-    std::lock_guard<std::mutex> lock(this->sendMutex);
-
-    // Check state under sendMutex — guarantees no race with closeConnection.
-    // If peer is Joining or Closing, refuse to send.
-    if (this->getState() != PeerState::Active) {
+    // Joining peers are not driven by the I/O thread yet, Closing ones are being torn down. A close racing with this check
+    // is harmless: Connection then reports SocketClosed.
+    if (this->getState() != PeerState::Active || !this->connection) {
         return static_cast<ssize_t>(Error::Connection::SocketClosed);
     }
 
-    if (!this->connection) {
-        return static_cast<ssize_t>(Error::Connection::SocketClosed);
-    }
+    const ssize_t result = this->connection->send(&data);
+    if (result == static_cast<ssize_t>(Error::Connection::SocketError)) this->markForClose();
+    return result;
+}
 
-    return this->connection->send(&data);
+ssize_t invilite::Mesh::Peer::writeQueuedFrames() {
+    if (!this->connection) return static_cast<ssize_t>(Error::Connection::SocketClosed);
+    const ssize_t result = this->connection->writeQueuedFrames();
+    if (result < 0) this->markForClose();
+    return result;
 }
 
 void invilite::Mesh::Peer::closeConnection() {
-    std::lock_guard<std::mutex> lock(this->sendMutex);                              // wait for any in-flight send to finish
     if (this->connection) {
         this->connection->close();
     }

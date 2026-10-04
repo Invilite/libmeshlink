@@ -22,6 +22,7 @@ namespace invilite::Mesh {
 
     namespace {
         constexpr int    POLL_TIMEOUT_MS          = 100;
+        constexpr size_t MIN_SEND_QUEUE_LIMIT     = 64 * 1024;                     // Fits the largest 0xFF message (PEX batch of MAX_RECORDS_PER_BATCH records) with room to spare
         constexpr size_t WAKEUP_DRAIN_BUFFER      = 64;
         constexpr int    OUTBOUND_CONNECT_TIMEOUT = 5;
         constexpr size_t FRAME_HEADER_SIZE        = 3;                                  // group(1) + subtype(2)
@@ -95,6 +96,9 @@ Network::Network(std::shared_ptr<LocalIdentity> selfIdentity,
     if (!this->networkSecret) throw std::invalid_argument("Network requires a valid network secret");
     if (!this->peerDirectory) throw std::invalid_argument("Network requires a valid PeerDirectory");
 
+    if (this->config.sendQueueLimitBytes < MIN_SEND_QUEUE_LIMIT) {
+        throw std::invalid_argument("sendQueueLimitBytes is below the minimum needed for management messages");
+    }
     if (this->config.maxTotal < this->config.targetOutbound) {
         throw std::invalid_argument("maxTotal cannot be less than targetOutbound");
     }
@@ -257,7 +261,7 @@ ssize_t Network::sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data
         if (it == this->peersById.end()) return -1;
         peer = it->second;
     }
-    return peer->send(data);
+    return this->sendFrameTo(peer, data);
 }
 
 size_t Network::sendToAllConnected(const std::vector<uint8_t>& data) {
@@ -270,7 +274,7 @@ size_t Network::sendToAllConnected(const std::vector<uint8_t>& data) {
 
     size_t successCount = 0;
     for (auto& peer : snapshot) {
-        if (peer->send(data) > 0) ++successCount;
+        if (this->sendFrameTo(peer, data) > 0) ++successCount;
     }
     return successCount;
 }
@@ -388,7 +392,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, HandshakeWorke
 
     std::shared_ptr<Connection> conn;
     try {
-        conn = std::make_shared<Connection>(fd, &addr, this->networkSecret.get());
+        conn = std::make_shared<Connection>(fd, &addr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
         std::cerr << "Network: incoming Connection construction failed: " << e.what() << std::endl;
         ::close(fd);
@@ -471,7 +475,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     // ── Transport handshake ───────────────────────────────────────────────────
     std::shared_ptr<Connection> connection;
     try {
-        connection = std::make_shared<Connection>(fd, &remoteAddr, this->networkSecret.get());
+        connection = std::make_shared<Connection>(fd, &remoteAddr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
         std::cerr << "Network: outgoing Connection construction failed: " << e.what() << std::endl;
         ::close(fd);
@@ -651,7 +655,18 @@ void Network::ioLoop() {
             fds.reserve(fds.size() + this->peersBySocket.size());
             for (const auto& [fd, peer] : this->peersBySocket) {
                 if (peer->getState() == PeerState::Closing) continue;               // let cleanClosedPeers reap — no need to poll further
-                fds.push_back({ fd, POLLIN, 0 });
+
+                // A peer that has not read any of our queued frames for sendStallTimeout is gone or hostile — it would
+                // otherwise pin its full send queue in memory for as long as TCP keeps the connection open.
+                const auto sendIdle = peer->timeSinceSendProgress();                // nullopt — nothing queued
+                if (sendIdle && *sendIdle > this->config.sendStallTimeout) {
+                    std::cerr << "Network: peer " << peerIdShort(peer->getPeerId()) << " stopped reading (send stalled), closing" << std::endl;
+                    peer->markForClose();
+                    continue;
+                }
+
+                const short events = sendIdle ? static_cast<short>(POLLIN | POLLOUT) : POLLIN;   // POLLOUT only with data waiting, or poll() spins
+                fds.push_back({ fd, events, 0 });
             }
         }
 
@@ -667,6 +682,8 @@ void Network::ioLoop() {
                 if (pfd.fd == this->wakeupPipe[0]) {
                     if (pfd.revents & POLLIN) this->handleWakeup();
                 } else {
+                    if (pfd.revents & POLLOUT) this->handleConnectionWritable(pfd.fd);
+
                     // For connection fds, treat POLLIN/HUP/ERR/NVAL uniformly — all imply
                     // either incoming data or a terminal state we must react to.
                     if (pfd.revents & CONN_READY_FLAGS) {
@@ -826,6 +843,23 @@ void Network::handleConnectionReadable(int fd, short revents) {
             peer->markForClose();
         }
         return;
+    }
+}
+
+void Network::handleConnectionWritable(int fd) {
+    std::shared_ptr<Peer> peer;
+    {
+        std::shared_lock lock(this->peersMutex);
+        const auto it = this->peersBySocket.find(fd);
+        if (it == this->peersBySocket.end()) return;
+        peer = it->second;
+    }
+
+    if (!peer->isActive()) return;
+
+    const ssize_t written = peer->writeQueuedFrames();                              // a failure marks the peer for close
+    if (written < 0) {
+        std::cerr << "Network: send error " << written << " to peer " << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
     }
 }
 
@@ -1021,7 +1055,7 @@ void Network::sendHelloTo(const std::shared_ptr<Peer>& peer) {
     if (this->selfRecordSerialized.empty()) return;                                 // defensive — start() builds this
 
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_HELLO, this->selfRecordSerialized);
-    const ssize_t sent = peer->send(frame);
+    const ssize_t sent = this->sendFrameTo(peer, frame);
 
     if (sent < 0) {
         std::cerr << "Network: HELLO send to " << peerIdShort(peer->getPeerId())
@@ -1074,7 +1108,7 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
 void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason) {
     const std::vector<uint8_t> payload{ static_cast<uint8_t>(reason) };
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_GOODBYE, payload);
-    peer->send(frame);  // best-effort — we're closing anyway, ignore send errors
+    this->sendFrameTo(peer, frame);  // best-effort — we're closing anyway, ignore send errors
     std::cerr << "Network: sent GOODBYE to " << peerIdShort(peer->getPeerId()) << " reason=" << static_cast<int>(reason) << std::endl;
 }
 
@@ -1122,7 +1156,7 @@ void Network::sendInitialPexTo(const std::shared_ptr<Peer>& peer) {
     if (payload.empty()) return;
 
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
-    const ssize_t sent = peer->send(frame);
+    const ssize_t sent = this->sendFrameTo(peer, frame);
 
     if (sent <= 0) {
         std::cerr << "Network: initial PEX send to " << peerIdShort(targetId)
@@ -1337,7 +1371,7 @@ void Network::sendPendingPexBroadcasts() {
 
     size_t sent = 0;
     for (const auto& peer : targets) {
-        if (peer->send(frame) > 0) ++sent;
+        if (this->sendFrameTo(peer, frame) > 0) ++sent;
     }
 
     // Mark as announced — also counts toward anti-entropy ordering. Clear pendingPexBroadcast
@@ -1403,7 +1437,7 @@ void Network::tickPeriodicPex() {
 
     size_t sent = 0;
     for (const auto& peer : targets) {
-        if (peer->send(frame) > 0) ++sent;
+        if (this->sendFrameTo(peer, frame) > 0) ++sent;
     }
 
     // Update lastAnnouncedAt for each record in the batch. mutatePeer is a no-op for records
@@ -1629,6 +1663,12 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
 // ============================================================
 // Helpers
 // ============================================================
+
+ssize_t Network::sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vector<uint8_t>& frame) const {
+    const ssize_t result = peer->send(frame);
+    if (result > 0 && peer->hasQueuedFrames()) this->wakeupIoThread();
+    return result;
+}
 
 void Network::wakeupIoThread() const {
     if (this->wakeupPipe[1] == -1) return;

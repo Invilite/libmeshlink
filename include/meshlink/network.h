@@ -55,6 +55,13 @@ namespace invilite::Mesh {
         std::chrono::seconds        periodicPexMinInterval  = std::chrono::seconds(20);
         std::chrono::seconds        periodicPexMaxInterval  = std::chrono::seconds(120);
 
+        // Per-connection send queue: encrypted frames the kernel could not take yet. Bounds the memory one slow reader can
+        // hold; once full, sends to that peer fail with SendQueueFull. Also the largest message that can be sent.
+        // Minimum 64 KB (validated in the Network constructor).
+        size_t                      sendQueueLimitBytes     = Connection::defaultSendQueueLimit;
+        // A peer whose queued frames made no progress for this long has stopped reading — its connection is closed.
+        std::chrono::seconds        sendStallTimeout        = std::chrono::seconds(15);
+
         // Probe backoff and connection attempt backoff are tracked per-peer in KnownPeer
         // (consecutiveProbeFailures + nextProbeAllowedAt, consecutiveConnectionFailures + nextConnectionAttemptAt).
         // The schedule is shared between both — see computeBackoffInterval() in network.cpp.
@@ -155,6 +162,7 @@ namespace invilite::Mesh {
         // ===== I/O thread internals =====
         void handleWakeup();
         void handleConnectionReadable(int fd, short revents);
+        void handleConnectionWritable(int fd);                                          // POLLOUT — flush the peer's send queue
         void cleanClosedPeers();
         void parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vector<uint8_t> message);
 
@@ -167,6 +175,9 @@ namespace invilite::Mesh {
         void sendHelloTo(const std::shared_ptr<Peer>& peer);                            // send our selfRecord to given peer
         void processGoodbyeMessage(const ProtocolMessage& msg);                         // subtype 0x0040
         void sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);
+        // Single path for every frame sent to a peer. Wakes the I/O thread when part of the frame stayed queued, so it
+        // starts polling POLLOUT now instead of after the poll timeout.
+        ssize_t sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vector<uint8_t>& frame) const;
 
         // Send a one-shot PEX_ANNOUNCE with a random sample of verifiedReachable peers.
         // Called from managementLoop right after sendHelloTo — same trigger (peer became Active).

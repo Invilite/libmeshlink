@@ -112,7 +112,9 @@ VerificationResult IdentityVerification::runAsInitiator(
     msg1.insert(msg1.end(), selfIdentity.getX25519Pub().begin(),    selfIdentity.getX25519Pub().end());
     msg1.insert(msg1.end(), packedName.begin(),                     packedName.end());
 
-    if (conn.send(&msg1) <= 0) {
+    // send() never blocks and may leave part of the message queued; the I/O thread does not own this connection yet,
+    // so this worker pushes it out itself (blocking is fine on an ephemeral handshake thread).
+    if (conn.send(&msg1) <= 0 || !conn.drainSendQueue(timeout)) {
         return VerificationResult::ConnectionError;
     }
 
@@ -152,7 +154,7 @@ VerificationResult IdentityVerification::runAsInitiator(
     const std::vector<uint8_t> sigI = selfIdentity.sign(payloadI);
 
     std::vector<uint8_t> msg3(sigI.begin(), sigI.end());
-    if (conn.send(&msg3) <= 0) {
+    if (conn.send(&msg3) <= 0 || !conn.drainSendQueue(timeout)) {
         return VerificationResult::ConnectionError;
     }
 
@@ -212,7 +214,7 @@ VerificationResult IdentityVerification::runAsResponder(
     msg2.insert(msg2.end(), sigR.begin(),                          sigR.end());
     msg2.insert(msg2.end(), packedName.begin(),                    packedName.end());
 
-    if (conn.send(&msg2) <= 0) { std::cerr << "IV responder: ConnectionError at MSG2 send" << std::endl; return VerificationResult::ConnectionError; }
+    if (conn.send(&msg2) <= 0 || !conn.drainSendQueue(timeout)) { std::cerr << "IV responder: ConnectionError at MSG2 send" << std::endl; return VerificationResult::ConnectionError; }
 
     // ── Msg3: receive initiator's signature ───────────────────────────────────
     std::vector<uint8_t> msg3;
