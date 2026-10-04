@@ -29,7 +29,7 @@ $(SHARED_LIB): $(OBJECTS)
 	$(CXX) -shared -o $@ $^ $(LDFLAGS)
 
 tests: $(TEST_OBJECTS) $(STATIC_LIB)
-	$(CXX) $(CXXFLAGS) -o $(TEST_BINARY) $(TEST_OBJECTS) -L. -lmeshlink -lgtest_main -lgtest -lpthread
+	$(CXX) $(CXXFLAGS) -o $(TEST_BINARY) $(TEST_OBJECTS) $(STATIC_LIB) $(LDFLAGS) -lgtest_main -lgtest -lpthread
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDE) -c $< -o $@
@@ -40,4 +40,4 @@ tests/%.o: tests/%.cpp
 .PHONY: clean
 
 clean:
-	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB)
+	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY)
