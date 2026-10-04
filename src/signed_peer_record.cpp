@@ -132,7 +132,6 @@ std::vector<uint8_t> serialize(const SignedPeerRecord& record) {
 SignedRecordStatus deserialize(
     std::span<const uint8_t> data,
     SignedPeerRecord& outRecord,
-    std::chrono::seconds maxAge,
     std::chrono::seconds maxClockSkew)
 {
     size_t offset = 0;
@@ -177,13 +176,12 @@ SignedRecordStatus deserialize(
     // ── Verify PeerId — derived from (ed25519Pub || x25519Pub) ──────────────
     outRecord.peerId = LocalIdentity::derivePeerId(outRecord.ed25519Pub, outRecord.x25519Pub);
 
-    // ── Verify timestamp freshness ──────────────────────────────────────────
+    // ── Verify timestamp is not in the future ───────────────────────────────
+    // Records never expire: createdAt only orders versions of the same peer's record. A future-dated record
+    // (misconfigured clock) would otherwise shadow the owner's own later, correctly dated records.
     const auto now = std::chrono::system_clock::now();
     if (outRecord.createdAt > now + maxClockSkew) {
-        return SignedRecordStatus::TimestampOutOfRange;                             // too far in future
-    }
-    if (now - outRecord.createdAt > maxAge) {
-        return SignedRecordStatus::TimestampOutOfRange;                             // too old
+        return SignedRecordStatus::TimestampOutOfRange;
     }
 
     // ── Verify Ed25519 signature over signed portion ────────────────────────

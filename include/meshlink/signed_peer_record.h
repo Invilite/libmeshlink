@@ -61,7 +61,7 @@ enum class SignedRecordStatus : int {
     MalformedEncoding      = -1,                                                    // truncated, bad addrType, etc.
     PeerIdMismatch         = -2,                                                    // derived PeerId differs from sender's claim
     SignatureInvalid       = -3,                                                    // signature verification failed
-    TimestampOutOfRange    = -4,                                                    // createdAt too old or too far in future
+    TimestampOutOfRange    = -4,                                                    // createdAt too far in the future (records never expire)
 };
 
 // Serialization / deserialization helpers.
@@ -80,11 +80,10 @@ namespace SignedPeerRecordCodec {
     std::vector<uint8_t> serialize(const SignedPeerRecord& record);
 
     // Deserialize and verify a record received from the wire.
-    // Populates outRecord on success. Accepted timestamp tolerance: ±maxClockSkew.
+    // Populates outRecord on success. Records never expire; createdAt may lead local time by at most maxClockSkew.
     SignedRecordStatus deserialize(
         std::span<const uint8_t> data,
         SignedPeerRecord& outRecord,
-        std::chrono::seconds maxAge        = std::chrono::hours(24),
         std::chrono::seconds maxClockSkew  = std::chrono::minutes(5)
     );
 

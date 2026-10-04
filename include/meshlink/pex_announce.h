@@ -39,7 +39,7 @@ namespace invilite::Mesh {
 
         // Deserialize and verify each record in the batch.
         // Framing errors abort and return MalformedEncoding — outRecords will be empty or partial, do not use.
-        // Individual record verification failures (bad signature, stale timestamp, peerId mismatch) are
+        // Individual record verification failures (bad signature, future-dated timestamp) are
         // skipped silently — invalid records simply do not appear in outRecords.
         PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<SignedPeerRecord>& outRecords);
 

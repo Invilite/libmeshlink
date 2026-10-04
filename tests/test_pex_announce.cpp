@@ -76,7 +76,7 @@ TEST(PexAnnounceCodecTest, RejectsTruncatedBatch) {
 
 TEST(PexAnnounceCodecTest, SkipsInvalidRecordButKeepsTheRest) {
     auto records = makeFreshRecords(3);
-    records[1] = makeSignedRecord(LocalIdentity::generate(), { ipv4("192.0.2.10", 5000) }, std::chrono::system_clock::now() - 48h);   // stale
+    records[1].signature[0] ^= 0x01;                                                         // tampered
 
     std::vector<SignedPeerRecord> decoded;
     ASSERT_EQ(PexAnnounceCodec::deserialize(PexAnnounceCodec::serialize(records), decoded), PexAnnounceStatus::Success);
