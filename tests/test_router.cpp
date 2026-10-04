@@ -1,9 +1,11 @@
-// Router integration tests: real Network instances in one process over loopback TCP, a Router on top.
+// Router integration tests: real Network instances in one process over loopback TCP, a Router on top of each.
 // Network and Router log to stderr; run `./run_test 2>/dev/null` for quiet output.
 #include <gtest/gtest.h>
 #include "meshlink/router.h"
 #include "meshlink/router_wire.h"
 #include "network_test_node.h"
+
+#include <mutex>
 
 using namespace invilite::Mesh;
 using namespace invilite::Mesh::TestHelpers;
@@ -24,7 +26,121 @@ void connect(TestNode& dialer, TestNode& listener) {
     ASSERT_TRUE(waitUntil([&] { return dialer.network->getConnectedPeerCount() == dialerBefore + 1; }, 5s));
 }
 
+struct DeliveryRecorder : RouterEventListener {
+    void onMessageDelivered(const RoutedDelivery& delivery) override {
+        std::lock_guard lock(this->mutex);
+        this->deliveries.push_back(delivery);
+    }
+
+    size_t countOf(const PeerId& sender, uint64_t msgId) const {
+        std::lock_guard lock(this->mutex);
+        return static_cast<size_t>(std::count_if(this->deliveries.begin(), this->deliveries.end(), [&](const RoutedDelivery& d) { return d.sender == sender && d.msgId == msgId; }));
+    }
+
+    std::optional<RoutedDelivery> find(const PeerId& sender, uint64_t msgId) const {
+        std::lock_guard lock(this->mutex);
+        for (const auto& d : this->deliveries) if (d.sender == sender && d.msgId == msgId) return d;
+        return std::nullopt;
+    }
+
+    size_t total() const {
+        std::lock_guard lock(this->mutex);
+        return this->deliveries.size();
+    }
+
+    mutable std::mutex           mutex;
+    std::vector<RoutedDelivery>  deliveries;
+};
+
+using Edge = std::pair<size_t, size_t>;                                                       // (dialer, listener)
+
+// Nodes in a fixed topology: each node may dial exactly its own edges (outbound soft = hard = its out-degree), so Topology
+// adds no connections of its own and the graph stays as declared. Every node runs a Router with a delivery recorder.
+struct RouterMesh {
+    std::shared_ptr<std::array<uint8_t, 64>>        secret = makeSecret();
+    std::vector<std::unique_ptr<TestNode>>          nodes;
+    std::vector<std::unique_ptr<Router>>            routers;
+    std::vector<std::shared_ptr<DeliveryRecorder>>  recorders;
+    bool                                            ready = false;
+
+    RouterMesh(size_t count, const std::vector<Edge>& edges, const std::function<void(size_t, RouterConfig&)>& adjustRouter = {}) {
+        std::vector<uint16_t> outDegree(count, 0);
+        std::vector<size_t>   degree(count, 0);
+        for (const auto& [dialer, listener] : edges) { ++outDegree[dialer]; ++degree[dialer]; ++degree[listener]; }
+
+        for (size_t i = 0; i < count; ++i) {
+            this->nodes.push_back(std::make_unique<TestNode>(this->secret, "node" + std::to_string(i), [&](NetworkConfig& c) {
+                c.connectionLimits.outbound = { .min = 0, .soft = outDegree[i], .hard = outDegree[i] };
+                c.periodicPexMinInterval = 600s;
+                c.periodicPexMaxInterval = 600s;
+            }));
+            this->nodes.back()->network->start();
+        }
+
+        // Dial the last edges first: a node uses its outbound slots before gossip tells it about anyone else
+        for (auto it = edges.rbegin(); it != edges.rend(); ++it) {
+            TestNode& dialer = *this->nodes[it->first];
+            const size_t before = dialer.network->getConnectedPeerCount();
+            dialer.network->connectToPeer("127.0.0.1", this->nodes[it->second]->port);
+            if (!waitUntil([&] { return dialer.network->getConnectedPeerCount() > before; }, 5s)) return;
+        }
+
+        for (size_t i = 0; i < count; ++i) {
+            RouterConfig config;
+            if (adjustRouter) adjustRouter(i, config);
+            this->routers.push_back(std::make_unique<Router>(*this->nodes[i]->network, this->nodes[i]->directory, this->nodes[i]->identity, config));
+            this->recorders.push_back(std::make_shared<DeliveryRecorder>());
+            this->routers.back()->addListener(this->recorders.back());
+            this->routers.back()->start();
+        }
+
+        // Every node sees exactly its declared neighbors. Records of distant nodes are not required: gossip spreads a
+        // record only after someone dialed it successfully, so distant senders are usually verified via PEX_REQUEST.
+        this->ready = waitUntil([&] {
+            for (size_t i = 0; i < count; ++i) if (this->routers[i]->getNeighbors().size() != degree[i]) return false;
+            return true;
+        }, 10s);
+    }
+
+    ~RouterMesh() {
+        for (auto& router : this->routers) router->stop();
+        for (auto& node : this->nodes) node->network->stop();
+    }
+
+    PeerId id(size_t i) const { return this->nodes[i]->identity->getPeerId(); }
+
+    // Every node except `sender` delivered (sender, msgId) at least once
+    bool allOthersDelivered(size_t sender, uint64_t msgId) const {
+        for (size_t i = 0; i < this->nodes.size(); ++i) if (i != sender && this->recorders[i]->countOf(this->id(sender), msgId) == 0) return false;
+        return true;
+    }
+};
+
+std::vector<Edge> lineEdges(size_t count) {
+    std::vector<Edge> edges;
+    for (size_t i = 0; i + 1 < count; ++i) edges.push_back({ i, i + 1 });
+    return edges;
+}
+
+// A broadcast built by hand — for frames a well-behaved Router would never send (forgeries, replays)
+RoutedMessage craftBroadcast(const PeerId& claimedSender, const LocalIdentity& signer, std::vector<uint8_t> payload) {
+    RoutedMessage m;
+    m.group             = 0x10;
+    m.subtype           = 0x0001;
+    m.mode              = RoutingMode::Broadcast;
+    m.ttlInitial        = 16;
+    m.ttlRemaining      = 16;
+    m.msgId             = 0x5EED0000ULL + payload.size();
+    m.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    m.sender            = claimedSender;
+    m.payload           = std::move(payload);
+    m.signature         = signer.sign(RouterWire::bytesToSign(m));
+    return m;
+}
+
 } // namespace
+
+// ── Skeleton (R-2) ──────────────────────────────────────────────────────────
 
 TEST(RouterTest, TracksNeighborsFromNetworkEvents) {
     const auto secret = makeSecret();
@@ -34,7 +150,7 @@ TEST(RouterTest, TracksNeighborsFromNetworkEvents) {
     alpha.network->start();
     beta.network->start();
     gamma.network->start();
-    Router router(*alpha.network);
+    Router router(*alpha.network, alpha.directory, alpha.identity);
     router.start();
 
     connect(beta, alpha);
@@ -59,7 +175,7 @@ TEST(RouterTest, StartSeesNeighborsAlreadyConnectedAndRestartWorks) {
     connect(beta, alpha);
     ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1; }, 5s));
 
-    Router router(*alpha.network);
+    Router router(*alpha.network, alpha.directory, alpha.identity);
     router.start();
     EXPECT_TRUE(hasExactlyNeighbors(router, { beta.identity->getPeerId() }));
 
@@ -84,7 +200,7 @@ TEST(RouterTest, BadRoutedAndControlFramesDoNotDisturbRouterOrConnection) {
     alpha.network->start();
     beta.network->start();
     gamma.network->start();
-    Router router(*alpha.network);
+    Router router(*alpha.network, alpha.directory, alpha.identity);
     router.start();
     connect(beta, alpha);
 
@@ -100,4 +216,245 @@ TEST(RouterTest, BadRoutedAndControlFramesDoNotDisturbRouterOrConnection) {
     gamma.network->stop();
     beta.network->stop();
     alpha.network->stop();
+}
+
+// ── BROADCAST as flooding (R-3) ─────────────────────────────────────────────
+
+TEST(RouterTest, BroadcastCrossesLineAndEveryNodeDeliversOnce) {
+    RouterMesh mesh(5, lineEdges(5));
+    ASSERT_TRUE(mesh.ready);
+
+    const auto msgId = mesh.routers[0]->broadcast(0x10, 0x0102, { 'h', 'i' });
+    ASSERT_TRUE(msgId.has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, *msgId); }, 5s));
+    std::this_thread::sleep_for(300ms);                                                       // room for any duplicate to show up
+
+    EXPECT_EQ(mesh.recorders[0]->total(), 0u);                                                // own broadcast is not delivered back
+    for (size_t i = 1; i < 5; ++i) {
+        EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), *msgId), 1u) << "node " << i;
+        const auto delivery = mesh.recorders[i]->find(mesh.id(0), *msgId);
+        ASSERT_TRUE(delivery.has_value());
+        EXPECT_EQ(delivery->hopsTraveled, i);
+        EXPECT_EQ(delivery->group, 0x10);
+        EXPECT_EQ(delivery->subtype, 0x0102);
+        EXPECT_EQ(delivery->payload, (std::vector<uint8_t>{ 'h', 'i' }));
+    }
+}
+
+// In a full mesh every node receives each broadcast from several neighbors: duplicates must be suppressed
+TEST(RouterTest, BroadcastInFullMeshIsDeliveredExactlyOnce) {
+    std::vector<Edge> edges;
+    for (size_t i = 0; i < 5; ++i) for (size_t j = i + 1; j < 5; ++j) edges.push_back({ i, j });
+    RouterMesh mesh(5, edges);
+    ASSERT_TRUE(mesh.ready);
+
+    std::vector<uint64_t> ids;
+    for (size_t i = 0; i < 5; ++i) ids.push_back(mesh.routers[i]->broadcast(0x10, 0, { static_cast<uint8_t>(i) }).value());
+    for (size_t i = 0; i < 5; ++i) ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(i, ids[i]); }, 5s));
+    std::this_thread::sleep_for(300ms);
+
+    for (size_t receiver = 0; receiver < 5; ++receiver) {
+        EXPECT_EQ(mesh.recorders[receiver]->total(), 4u) << "node " << receiver;
+        for (size_t sender = 0; sender < 5; ++sender) {
+            if (sender != receiver) { EXPECT_EQ(mesh.recorders[receiver]->countOf(mesh.id(sender), ids[sender]), 1u); }
+        }
+    }
+}
+
+TEST(RouterTest, BroadcastFromLeafReachesOtherLeavesThroughHub) {
+    RouterMesh mesh(5, { { 1, 0 }, { 2, 0 }, { 3, 0 }, { 4, 0 } });
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[1]->broadcast(0x10, 0, { 1 }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(1, msgId); }, 5s));
+    EXPECT_EQ(mesh.recorders[0]->find(mesh.id(1), msgId)->hopsTraveled, 1);
+    for (size_t leaf = 2; leaf < 5; ++leaf) EXPECT_EQ(mesh.recorders[leaf]->find(mesh.id(1), msgId)->hopsTraveled, 2);
+}
+
+TEST(RouterTest, TtlLimitsHowFarBroadcastTravels) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t node, RouterConfig& c) { if (node == 0) c.broadcastTtl = 2; });
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 1 }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), msgId), 1u);
+    EXPECT_EQ(mesh.recorders[3]->countOf(mesh.id(0), msgId), 0u);                            // third hop is beyond TTL 2
+}
+
+// A forgery dies at the first hop: neither delivered nor forwarded, and it does not occupy the msgId of anything genuine
+TEST(RouterTest, ForgedBroadcastIsDroppedAtFirstHop) {
+    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& c) { c.unknownSenderWait = 300ms; });
+    ASSERT_TRUE(mesh.ready);
+    const PeerId toNode1 = mesh.id(1);
+
+    // Node 0 claims node 2 as the sender but can only sign with its own key
+    const RoutedMessage impersonation = craftBroadcast(mesh.id(2), *mesh.nodes[0]->identity, { 'f', 'a', 'k', 'e' });
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(toNode1, RouterWire::encode(impersonation)), 0);
+
+    // A sender nobody knows: node 1 asks node 0 for the record, gets nothing, gives up after unknownSenderWait
+    const auto stranger = LocalIdentity::generate();
+    const RoutedMessage fromStranger = craftBroadcast(stranger.getPeerId(), stranger, { 's', 't', 'r', 'a', 'n', 'g', 'e', 'r' });
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(toNode1, RouterWire::encode(fromStranger)), 0);
+
+    // A genuine broadcast after them still gets through — the Router kept working
+    const uint64_t genuine = mesh.routers[0]->broadcast(0x10, 0, { 'o', 'k' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), genuine) == 1; }, 5s));
+    std::this_thread::sleep_for(600ms);
+
+    for (size_t i = 1; i < 3; ++i) {
+        EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(2), impersonation.msgId), 0u) << "node " << i;
+        EXPECT_EQ(mesh.recorders[i]->countOf(stranger.getPeerId(), fromStranger.msgId), 0u) << "node " << i;
+        EXPECT_EQ(mesh.recorders[i]->total(), 1u) << "node " << i;
+    }
+}
+
+TEST(RouterTest, ReplayedBroadcastIsDeliveredOnce) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    const RoutedMessage genuine = craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, { 'r', 'e' });
+    const std::vector<uint8_t> frame = RouterWire::encode(genuine);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), genuine.msgId) == 1; }, 5s));
+
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);                      // the same frame again
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), genuine.msgId), 1u);
+    EXPECT_EQ(mesh.recorders[2]->countOf(mesh.id(0), genuine.msgId), 1u);
+}
+
+// docs/router.md 4.1: a node that lacks the sender's record asks the neighbor that forwarded the broadcast (PEX_REQUEST)
+TEST(RouterTest, UnknownSenderRecordIsFetchedFromForwardingNeighbor) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    mesh.nodes[2]->directory->removePeer(mesh.id(0));
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'k', 'e', 'y' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 3s));
+    EXPECT_TRUE(mesh.nodes[2]->directory->findPeer(mesh.id(0)).has_value());
+}
+
+// Flooding sends each broadcast to every neighbor except the one it came from: on a line that is one full send per node
+TEST(RouterTest, FloodingNeverSendsBackToWhereMessageCameFrom) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 1 }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, msgId); }, 5s));
+    std::this_thread::sleep_for(300ms);
+    for (size_t i = 0; i < 2; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().fullMessagesSent, 1u) << "node " << i;
+    EXPECT_EQ(mesh.routers[2]->getStatistics().fullMessagesSent, 0u);
+    for (size_t i = 0; i < 3; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().duplicatesDropped, 0u) << "node " << i;
+}
+
+// After a restart the duplicate memory is empty: our own old broadcast coming back must still not be delivered to us
+TEST(RouterTest, OwnBroadcastComingBackIsNotDelivered) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+
+    const RoutedMessage echo = craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, { 'e', 'c', 'h', 'o' });
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(echo)), 0);
+    const uint64_t control = mesh.routers[1]->broadcast(0x10, 0, { 1 }).value();               // sent after the echo, same link
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(1), control) == 1; }, 5s));
+    EXPECT_EQ(mesh.recorders[0]->countOf(mesh.id(0), echo.msgId), 0u);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().duplicatesDropped, 1u);                        // recognized at once, no record lookup
+}
+
+// The originator already has its message: a node that got it from someone else does not send it to the originator
+TEST(RouterTest, ForwardingSkipsOriginatorAmongNeighbors) {
+    RouterMesh mesh(3, { { 0, 1 }, { 0, 2 }, { 1, 2 } });
+    ASSERT_TRUE(mesh.ready);
+
+    // Node 1 relays node 0's broadcast to node 2; node 2's other neighbor is the originator itself
+    const RoutedMessage relayed = craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, { 'r' });
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(2), RouterWire::encode(relayed)), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), relayed.msgId) == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[2]->getStatistics().fullMessagesSent, 0u);
+}
+
+// A message waiting for a record that never comes leaves the bounded verification queue after unknownSenderWait
+TEST(RouterTest, ExpiredWaitFreesVerificationQueue) {
+    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& c) { c.unknownSenderWait = 300ms; c.pendingVerificationLimit = 1; });
+    ASSERT_TRUE(mesh.ready);
+
+    // Node 1 hands node 2 a broadcast from a stranger nobody knows: it occupies node 2's only verification slot
+    const auto stranger = LocalIdentity::generate();
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(2), RouterWire::encode(craftBroadcast(stranger.getPeerId(), stranger, { 's' }))), 0);
+    std::this_thread::sleep_for(700ms);
+
+    // Node 2 lacks node 0's record too; with the slot free again it can wait for it
+    mesh.nodes[2]->directory->removePeer(mesh.id(0));
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 1 }).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 3s));
+}
+
+// "Seen" is recorded only after the signature checks out: a forgery sent first must not squat the genuine message's id
+TEST(RouterTest, ForgeryCannotSquatGenuineMessageId) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    const RoutedMessage genuine = craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, { 'g', 'o', 'o', 'd' });
+    RoutedMessage forged = genuine;
+    forged.payload = { 'e', 'v', 'i', 'l' };                                                  // same msgId and length, signature no longer matches
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(forged)), 0);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(genuine)), 0);
+
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), genuine.msgId) == 1; }, 5s));
+    for (size_t i = 1; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->find(mesh.id(0), genuine.msgId)->payload, genuine.payload) << "node " << i;
+}
+
+// One neighbor flooding broadcasts from unknown senders fills only its own share of the verification queue
+TEST(RouterTest, OneNeighborCannotFillVerificationQueue) {
+    RouterMesh mesh(3, { { 1, 0 }, { 2, 0 } }, [](size_t, RouterConfig& c) { c.pendingVerificationLimit = 4; c.pendingVerificationPerNeighbor = 2; c.unknownSenderWait = 2s; });
+    ASSERT_TRUE(mesh.ready);
+
+    // Node 1 parks more stranger broadcasts at node 0 than the whole queue holds; only its share is taken
+    for (uint8_t i = 0; i < 5; ++i) {
+        const auto stranger = LocalIdentity::generate();
+        ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(craftBroadcast(stranger.getPeerId(), stranger, { i }))), 0);
+    }
+    std::this_thread::sleep_for(200ms);
+
+    // Node 2 relays a broadcast from a sender whose record only node 2 holds: node 0 still has room to wait for it
+    const auto behindTwo = LocalIdentity::generate();
+    mesh.nodes[2]->directory->upsertPeer(behindTwo.getPeerId(), [&](KnownPeer& kp, bool) { kp.record = makeSignedRecord(behindTwo, { ipv4("192.0.2.9", 7000) }, std::chrono::system_clock::now()); });
+    const RoutedMessage relayed = craftBroadcast(behindTwo.getPeerId(), behindTwo, { 'o', 'k' });
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(0), RouterWire::encode(relayed)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(behindTwo.getPeerId(), relayed.msgId) == 1; }, 1500ms));
+}
+
+// After the duplicate memory overflowed, a replay of a message it had to forget is still refused
+TEST(RouterTest, ReplayAfterDuplicateMemoryOverflowIsRefused) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& c) { c.duplicateCacheCapacity = 2; });
+    ASSERT_TRUE(mesh.ready);
+
+    std::vector<RoutedMessage> sent;
+    for (uint8_t size = 1; size <= 3; ++size) {                                               // craftBroadcast derives msgId from the payload size
+        sent.push_back(craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, std::vector<uint8_t>(size, 0x42)));
+        ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(sent.back())), 0);
+    }
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->total() == 3; }, 5s));
+
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(sent.front())), 0);   // its key was evicted
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), sent.front().msgId), 1u);
+}
+
+// The same message parked twice would waste the neighbor's share of the verification queue
+TEST(RouterTest, RepeatedWaitingMessageTakesOneVerificationSlot) {
+    RouterMesh mesh(2, { { 1, 0 } }, [](size_t, RouterConfig& c) { c.pendingVerificationPerNeighbor = 2; });
+    ASSERT_TRUE(mesh.ready);
+
+    const auto stranger = LocalIdentity::generate();
+    const auto strangerFrame = RouterWire::encode(craftBroadcast(stranger.getPeerId(), stranger, { 's' }));
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), strangerFrame), 0);
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), strangerFrame), 0);
+
+    const auto known = LocalIdentity::generate();                                             // node 1 holds its record, node 0 does not
+    mesh.nodes[1]->directory->upsertPeer(known.getPeerId(), [&](KnownPeer& kp, bool) { kp.record = makeSignedRecord(known, { ipv4("192.0.2.9", 7000) }, std::chrono::system_clock::now()); });
+    const RoutedMessage relayed = craftBroadcast(known.getPeerId(), known, { 'o', 'k' });
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(relayed)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(known.getPeerId(), relayed.msgId) == 1; }, 1500ms));
 }

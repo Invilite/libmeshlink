@@ -3,11 +3,18 @@
 #ifndef MESH_ROUTER_H
 #define MESH_ROUTER_H
 
-#include "meshlink/peer_directory.h"                                         // PeerIDHash
+#include "meshlink/identity.h"
+#include "meshlink/peer_directory.h"
+#include "meshlink/router_events.h"
+#include "meshlink/router_wire.h"
+#include "meshlink/seen_message_cache.h"
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -17,19 +24,37 @@ namespace invilite::Mesh {
     class Network;
     struct NetworkMessage;
 
+    // Router parameters (docs/router.md 5, initial values)
+    struct RouterConfig {
+        uint8_t                     broadcastTtl            = 16;                   // hops a broadcast may travel; 1 = direct neighbors only
+        std::chrono::seconds        maxClockSkew            = std::chrono::minutes(5);    // accepted sentAt distance from local time
+        std::chrono::seconds        duplicateWindow         = std::chrono::minutes(10);   // > 2 × maxClockSkew: a replay is remembered or too old
+        size_t                      duplicateCacheCapacity  = 65536;
+        std::chrono::milliseconds   unknownSenderWait       = std::chrono::seconds(2);    // how long a message waits for its sender's record
+        size_t                      pendingVerificationLimit = 256;                 // messages waiting for a sender's record, all senders together
+        size_t                      pendingVerificationPerNeighbor = 32;            // share of one neighbor — it cannot starve the others
+    };
+
+    // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
+    struct RouterStatistics {
+        uint64_t    fullMessagesSent   = 0;                                         // routed frames handed to Network, own and forwarded
+        uint64_t    duplicatesDropped  = 0;                                         // already-seen messages received again, our own included
+    };
+
     // Router (docs/router.md): delivers messages beyond direct neighbors — broadcast to every node, or to one node by
     // per-hop decisions, source route or flood. Sits on top of Network: receives through a NetworkEventListener and sends
     // with Network::sendToPeer. Network knows nothing about the Router beyond the reserved Group 0xFE.
     //
-    // Threading: one Router thread owns all routing state. Network's threads only push events into the Router's queue and
-    // return — the Router never runs on, and never blocks, a Network thread. The Router thread itself is shared by every
-    // peer, so it must never block either (sends are non-blocking since B7).
+    // Threading: one Router thread owns all routing state. Network's threads and application threads only push events into
+    // the Router's queue and return — the Router never runs on, and never blocks, a Network thread. The Router thread itself
+    // is shared by every peer, so it must never block either (sends are non-blocking since B7).
     //
     // Lifetime: stop() before the Network is destroyed; Network keeps only the queue-owning listener alive, so a late
     // event after stop() lands in a queue nobody drains instead of touching a destroyed Router.
     class Router {
     public:
-        explicit Router(Network& network);
+        // PeerDirectory supplies the senders' public keys; LocalIdentity signs this node's messages.
+        Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config = {});
         ~Router();
 
         Router(const Router&)            = delete;
@@ -39,26 +64,66 @@ namespace invilite::Mesh {
         void start();
         void stop();
 
+        // Send to every node. Signed here, on the caller's thread; sent by the Router thread. Returns the message id, or
+        // nothing when the Router is not running or `group` is not a user group (0x00..0xFD). Not delivered locally.
+        std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload);
+
+        void addListener(std::shared_ptr<RouterEventListener> listener);
+        void removeListener(const std::shared_ptr<RouterEventListener>& listener);
+
         // Directly connected peers as the Router sees them (its own view, updated from Network events)
         std::vector<PeerId> getNeighbors() const;
+
+        RouterStatistics getStatistics() const;
 
     private:
         class EventInbox;                                                           // NetworkEventListener → Router queue
         struct Event;
 
+        // A broadcast whose sender's record we do not have yet; waits for the PEX_REQUEST answer (docs/router.md 4.1)
+        struct PendingVerification {
+            RoutedMessage                           message;
+            PeerId                                  receivedFrom{};
+            std::chrono::steady_clock::time_point   deadline;
+        };
+
         void routerLoop();
         void processEvent(Event& event);
         void handleRouterControl(const NetworkMessage& message);                   // Group 0xFE, neighbor-only
         void handleRoutedMessage(const NetworkMessage& message);                   // Group 0x00..0xFD, routing header
+        void handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom);
+        void awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom);
+        void retryPendingVerifications();
+        [[nodiscard]] bool isAlreadySeen(const RoutedMessage& message) const;
+        void acceptBroadcastWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
+        void sendOwnBroadcast(const RoutedMessage& message);
+        void forwardBroadcast(RoutedMessage message, const PeerId& receivedFrom);
+        void deliverLocally(const RoutedMessage& message);
+        [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 
         Network&                                    network;
+        std::shared_ptr<PeerDirectory>              peerDirectory;
+        std::shared_ptr<LocalIdentity>              selfIdentity;
+        const RouterConfig                          config;
+
         std::shared_ptr<EventInbox>                 inbox;
         std::thread                                 routerThread;
         std::atomic<bool>                           running{false};
 
+        // Router thread only
+        SeenMessageCache                            seenMessages;
+        std::vector<PendingVerification>            pendingVerifications;
+        std::chrono::steady_clock::time_point       nextPendingRetryAt{};
+
         // Written by the Router thread (and by start() before the thread runs); read by getNeighbors()
         mutable std::mutex                          neighborsMutex;
         std::unordered_set<PeerId, PeerIDHash>      neighbors;
+
+        std::atomic<uint64_t>                       fullMessagesSent{0};
+        std::atomic<uint64_t>                       duplicatesDropped{0};
+
+        mutable std::shared_mutex                   listenersMutex;
+        std::vector<std::shared_ptr<RouterEventListener>> listeners;
     };
 
 } // namespace invilite::Mesh
