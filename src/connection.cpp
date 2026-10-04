@@ -510,7 +510,6 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
 
     // Need more data — read from socket
     if (this->frameBuffer.size() >= messageHardLimit) {                                                                 // Buffer full and still no valid frame — stream is unrecoverable
-        this->close();
         return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
     }
 
@@ -521,7 +520,6 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
     const ssize_t receivedLength = this->receiveRaw<16384>(this->frameBuffer, timeout, toRead);
 
     if (receivedLength < 0) {                                                                                           // Error occurred during data reception
-        this->close();
         return receivedLength;
     }
 
@@ -548,12 +546,10 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
     // Parse header if we haven't yet
     if (this->frameLength == 0) {
         if (!isValidFrameHeader(this->frameBuffer, this->frameLength, this->frameFlags)) {
-            this->close();
             return static_cast<int32_t>(Error::Connection::InvalidFrameHeader);
         }
 
         if (this->frameLength > messageHardLimit) {                                                                     // Reject frames exceeding hard limit — we can't recover stream sync
-            this->close();
             return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
         }
 
@@ -603,7 +599,6 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
         return finalDataSize;
 
     } catch (const std::exception&) {
-        this->close();
         return static_cast<int32_t>(Error::Connection::DecryptionError);
     }
 }

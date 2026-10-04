@@ -173,3 +173,33 @@ TEST_F(EstablishedConnectionPair, DestructorClosesSocket) {
     EXPECT_EQ(::fcntl(fd, F_GETFD), -1);
     EXPECT_EQ(errno, EBADF);
 }
+
+// B6: receive() reports errors but never closes the socket itself. Closing belongs to the owner (Peer/Network),
+// which serializes it with in-flight sends; a self-close on the I/O thread raced with Peer::send on another thread.
+TEST_F(EstablishedConnectionPair, ReceiveErrorLeavesClosingToTheOwner) {
+    const std::vector<uint8_t> payload(8, 0xEE);
+    ASSERT_GT(client->send(&payload), 0);
+    auto frame = readRawFromServerSocket(NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE);
+    ASSERT_EQ(frame.size(), NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE);
+    frame.back() ^= 0x01;                                                                     // break the Poly1305 tag
+    writeRawFromClientSocket(frame);
+
+    std::vector<uint8_t> received;
+    ssize_t result = 0;
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(received, 100ms);
+
+    ASSERT_EQ(result, static_cast<ssize_t>(Error::Connection::DecryptionError));
+    EXPECT_NE(server->getSocket(), -1);
+    EXPECT_NE(::fcntl(serverFd, F_GETFD), -1);
+}
+
+TEST_F(EstablishedConnectionPair, ReceiveReportsRemoteCloseWithoutClosingSocket) {
+    client->close();
+
+    std::vector<uint8_t> received;
+    ssize_t result = 0;
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(received, 100ms);
+
+    EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketClosed));
+    EXPECT_NE(server->getSocket(), -1);
+}

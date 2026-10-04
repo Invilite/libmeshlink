@@ -25,6 +25,8 @@ public:
 	Connection& operator=(const Connection&) = delete;
 	int initHandshake();																								// Client initiates a handshake
 	int waitForHandshake(milliseconds timeout = milliseconds(3000));													// Server waits for a client to start a handshake
+	// receive() never closes the socket. A negative result means the stream is unusable — the owner must close().
+	// Closing stays with the owner so it can be serialized with sends running on other threads.
 	ssize_t receive(std::vector<uint8_t>& data, milliseconds timeout = milliseconds(100));								// Wait for incoming packet of data and decrypt it
     ssize_t send(const std::vector<uint8_t>* data);																		// Encrypt data and send it
 	int getSocket() const;
