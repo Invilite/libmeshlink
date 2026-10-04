@@ -35,6 +35,10 @@ public:
 	// receive() never closes the socket. A negative result means the stream is unusable — the owner must close().
 	// Closing stays with the owner so it can be serialized with sends running on other threads.
 	ssize_t receive(std::vector<uint8_t>& data, milliseconds timeout = milliseconds(100));								// Wait for incoming packet of data and decrypt it
+	// True when receive() may complete a frame from bytes already read into the frame buffer — poll() cannot see those,
+	// so an owner that stops reading early must call receive() again without waiting for a socket event.
+	// Conservative: may be true for an unparsed header that turns out incomplete; false means socket data is needed.
+	bool hasBufferedFrameData() const;
 	// send() encrypts the message and hands it to the socket without ever blocking. Thread-safe.
 	// Nothing queued → the frame is written straight away and only the part the kernel did not take is queued (no extra
 	// copy, syscall or wakeup on this path). Frames already queued → the new frame is appended behind them, keeping order.

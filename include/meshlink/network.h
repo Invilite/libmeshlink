@@ -168,7 +168,9 @@ namespace invilite::Mesh {
 
         // ===== I/O thread internals =====
         void handleWakeup();
-        void handleConnectionReadable(int fd, short revents);
+        // Reads and dispatches frames from one peer within a per-round budget (R5). Returns true when the budget ran out
+        // with complete frames still in the Connection's buffer — the I/O loop must come back without a poll() event.
+        bool handleConnectionReadable(int fd, short revents);
         void handleConnectionWritable(int fd);                                          // POLLOUT — flush the peer's send queue
         void cleanClosedPeers();
         void parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vector<uint8_t> message);

@@ -21,6 +21,10 @@ namespace invilite::Mesh {
 
     namespace {
         constexpr int    POLL_TIMEOUT_MS          = 100;
+        // Per-peer receive budget for one poll() round (R5): a peer that keeps sending must not starve the others.
+        // Whole frames are counted, so a frame is never cut in half; the rest waits for the next round.
+        constexpr size_t RECEIVE_BUDGET_FRAMES    = 64;
+        constexpr size_t RECEIVE_BUDGET_BYTES     = 256 * 1024;
         constexpr size_t MIN_SEND_QUEUE_LIMIT     = 64 * 1024;                     // Fits the largest 0xFF message (PEX batch of MAX_RECORDS_PER_BATCH records) with room to spare
         constexpr int    OUTBOUND_CONNECT_TIMEOUT = 5;
         // Upper bound of one outbound attempt: TCP connect (5 s) + transport handshake (3 s) + identity verification
@@ -662,6 +666,11 @@ void Network::ioLoop() {
     // returning the fd as ready, but we only reacted to POLLIN, so the peer never gets marked for close.
     constexpr short CONN_READY_FLAGS = POLLIN | POLLHUP | POLLERR | POLLNVAL;
 
+    // Peers whose receive budget ran out with frames left in their Connection buffer. poll() only sees the socket, so
+    // these are served in the next round even without an event — and that round must not sleep in poll().
+    std::vector<int> socketsWithBufferedFrames;
+    std::vector<int> stillBuffered;
+
     while (this->running.load()) {
         fds.clear();
         fds.push_back({ this->ioWakeup.readHandle(), POLLIN, 0 });
@@ -686,14 +695,16 @@ void Network::ioLoop() {
             }
         }
 
-        const int ready = Transport::Platform::waitForSockets(fds.data(), fds.size(), POLL_TIMEOUT_MS);
+        const int pollTimeout = socketsWithBufferedFrames.empty() ? POLL_TIMEOUT_MS : 0;
+        const int ready = Transport::Platform::waitForSockets(fds.data(), fds.size(), pollTimeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
             std::cerr << "Network::ioLoop: poll() failed errno=" << errno << std::endl;
             break;
         }
 
-        if (ready > 0) {
+        if (ready > 0 || !socketsWithBufferedFrames.empty()) {
+            stillBuffered.clear();
             for (const auto& pfd : fds) {
                 if (pfd.fd == this->ioWakeup.readHandle()) {
                     if (pfd.revents & POLLIN) this->handleWakeup();
@@ -702,11 +713,14 @@ void Network::ioLoop() {
 
                     // For connection fds, treat POLLIN/HUP/ERR/NVAL uniformly — all imply
                     // either incoming data or a terminal state we must react to.
-                    if (pfd.revents & CONN_READY_FLAGS) {
-                        this->handleConnectionReadable(pfd.fd, pfd.revents);
+                    const bool socketEvent = (pfd.revents & CONN_READY_FLAGS) != 0;
+                    const bool carriedOver = std::find(socketsWithBufferedFrames.begin(), socketsWithBufferedFrames.end(), pfd.fd) != socketsWithBufferedFrames.end();
+                    if ((socketEvent || carriedOver) && this->handleConnectionReadable(pfd.fd, pfd.revents)) {
+                        stillBuffered.push_back(pfd.fd);
                     }
                 }
             }
+            socketsWithBufferedFrames.swap(stillBuffered);                      // closed peers are not in fds, so they drop out here
         }
 
         this->cleanClosedPeers();
@@ -800,16 +814,16 @@ void Network::handleWakeup() {
     }
 }
 
-void Network::handleConnectionReadable(int fd, short revents) {
+bool Network::handleConnectionReadable(int fd, short revents) {
     std::shared_ptr<Peer> peer;
     {
         std::shared_lock lock(this->peersMutex);
         const auto it = this->peersBySocket.find(fd);
-        if (it == this->peersBySocket.end()) return;
+        if (it == this->peersBySocket.end()) return false;
         peer = it->second;
     }
 
-    if (!peer->isActive()) return;
+    if (!peer->isActive()) return false;
 
     // Terminal socket conditions — remote peer closed, socket error, or fd became invalid.
     // We still want to drain any remaining decoded frames from Connection's internal buffer before
@@ -817,7 +831,17 @@ void Network::handleConnectionReadable(int fd, short revents) {
     // regardless — no more data will ever arrive on this socket.
     const bool terminalEvent = (revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
 
+    size_t framesThisRound = 0;
+    size_t bytesThisRound  = 0;
+
     while (true) {
+        // Budget spent: yield to the other peers. Data still in the socket makes poll() report us again; frames already
+        // in the Connection buffer are invisible to poll(), so tell the loop to come back. A terminal event is handled
+        // once the buffer is drained — poll() keeps reporting it until then.
+        if (framesThisRound >= RECEIVE_BUDGET_FRAMES || bytesThisRound >= RECEIVE_BUDGET_BYTES) {
+            return peer->getConnection()->hasBufferedFrameData();
+        }
+
         std::vector<uint8_t> message;
         ssize_t              n;
 
@@ -827,15 +851,17 @@ void Network::handleConnectionReadable(int fd, short revents) {
             std::cerr << "Network: receive threw exception for peer "
                       << peerIdShort(peer->getPeerId()) << ": " << e.what() << std::endl;
             peer->markForClose();
-            return;
+            return false;
         } catch (...) {
             std::cerr << "Network: receive threw unknown exception for peer "
                       << peerIdShort(peer->getPeerId()) << std::endl;
             peer->markForClose();
-            return;
+            return false;
         }
 
         if (n > 0) {
+            ++framesThisRound;
+            bytesThisRound += static_cast<size_t>(n);
             this->parseAndDispatchFrame(peer, std::move(message));
             continue;                                                               // keep draining buffered frames
         }
@@ -844,7 +870,7 @@ void Network::handleConnectionReadable(int fd, short revents) {
             std::cerr << "Network: receive error " << n << " from peer "
                       << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
             peer->markForClose();
-            return;
+            return false;
         }
 
         // n == 0 — no complete frame available right now. Two sub-cases:
@@ -857,7 +883,7 @@ void Network::handleConnectionReadable(int fd, short revents) {
                       << "), closing" << std::endl;
             peer->markForClose();
         }
-        return;
+        return false;
     }
 }
 

@@ -388,3 +388,86 @@ TEST(NetworkIntegrationTest, NonNumericListenAddressFailsToStart) {
     TestNode node(secret, "misconfigured", [](NetworkConfig& config) { config.listenAddress = "localhost"; });
     EXPECT_THROW(node.network->start(), std::runtime_error);
 }
+
+namespace {
+
+// Observes, on node A, how one flooding peer and one quiet peer are served. onPeerConnected runs on A's I/O thread,
+// so stalling it for the "staller" peer freezes A's I/O long enough for both peers' data to pile up in A's sockets.
+struct ReceiveFairnessObserver : NetworkEventListener {
+    PeerId            flooder{}, quiet{}, staller{};
+    std::atomic<bool> stalling{false};
+    std::atomic<int>  flooderMessages{0};
+    std::atomic<int>  flooderMessagesBeforeQuiet{-1};
+    std::atomic<std::chrono::steady_clock::rep> quietArrivedAt{0};
+    std::atomic<std::chrono::steady_clock::rep> lastFloodArrivedAt{0};
+
+    void onPeerConnected(const PeerIdentity& identity) override {
+        if (identity.getPeerId() != this->staller) return;
+        this->stalling = true;
+        std::this_thread::sleep_for(500ms);
+    }
+    void onMessageReceived(const NetworkMessage& message) override {                         // dispatch thread, in I/O processing order
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (message.source == this->flooder) {
+            ++this->flooderMessages;
+            this->lastFloodArrivedAt = now;
+        } else if (message.source == this->quiet && this->flooderMessagesBeforeQuiet < 0) {
+            this->flooderMessagesBeforeQuiet = this->flooderMessages.load();
+            this->quietArrivedAt = now;
+        }
+    }
+};
+
+std::vector<uint8_t> applicationMessage(uint8_t group, size_t payloadSize) {
+    std::vector<uint8_t> frame{ group, 0x00, 0x01 };                                          // group | subtype (2 B BE) | payload
+    frame.resize(3 + payloadSize, 0xAB);
+    return frame;
+}
+
+} // namespace
+
+// R5: a peer that has a lot to say must not make A ignore everybody else. With A's I/O frozen, the flooder queues
+// 3000 messages and the quiet peer one. Once A resumes, the quiet peer's message must come after at most a few
+// receive budgets of the flooder — not after its whole backlog. And none of the flooder's messages may get stuck:
+// frames already read into A's buffer are invisible to poll(), so the I/O loop must come back for them on its own.
+// (The flooder connects last: with libstdc++'s unordered_map it is then served first in each round, which is the
+// order that exposed the starvation.)
+TEST(NetworkIntegrationTest, FloodingPeerDoesNotStarveOthers) {
+    const auto secret = makeSecret();
+    TestNode receiver(secret, "receiver");
+    TestNode quiet(secret, "quiet");
+    TestNode flooder(secret, "flooder");
+    TestNode staller(secret, "staller");
+    const auto observer = std::make_shared<ReceiveFairnessObserver>();
+    observer->flooder = flooder.identity->getPeerId();
+    observer->quiet   = quiet.identity->getPeerId();
+    observer->staller = staller.identity->getPeerId();
+    receiver.network->addListener(observer);
+    for (auto* node : { &receiver, &quiet, &flooder, &staller }) node->network->start();
+
+    quiet.network->connectToPeer("127.0.0.1", receiver.port);
+    ASSERT_TRUE(waitUntil([&] { return receiver.network->getConnectedPeerCount() == 1; }, 5s));
+    flooder.network->connectToPeer("127.0.0.1", receiver.port);
+    ASSERT_TRUE(waitUntil([&] { return receiver.network->getConnectedPeerCount() == 2 && flooder.network->getConnectedPeerCount() == 1 && quiet.network->getConnectedPeerCount() == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);                                                       // HELLO / PEX settle
+
+    staller.network->connectToPeer("127.0.0.1", receiver.port);
+    ASSERT_TRUE(waitUntil([&] { return observer->stalling.load(); }, 5s));
+
+    constexpr int FLOOD = 3000;
+    const PeerId receiverId = receiver.identity->getPeerId();
+    for (int i = 0; i < FLOOD; ++i) ASSERT_GT(flooder.network->sendToPeer(receiverId, applicationMessage(0x01, 100)), 0);
+    std::this_thread::sleep_for(50ms);                                                        // the flood reaches receiver's socket first
+    ASSERT_GT(quiet.network->sendToPeer(receiverId, applicationMessage(0x01, 10)), 0);
+
+    ASSERT_TRUE(waitUntil([&] { return observer->flooderMessagesBeforeQuiet.load() >= 0; }, 5s));
+    EXPECT_LT(observer->flooderMessagesBeforeQuiet.load(), 500) << "quiet peer waited behind the flooder's backlog";
+    ASSERT_TRUE(waitUntil([&] { return observer->flooderMessages.load() == FLOOD; }, 5s)) << "buffered frames got stuck: " << observer->flooderMessages.load();
+    // The rest of the backlog is already in receiver's buffers when the quiet message arrives; draining it takes
+    // milliseconds. Frames left in the Connection buffer without a socket event would wait for unrelated traffic
+    // (PEX, ~1 s later) — the time bound is what catches that.
+    const auto drainTime = std::chrono::steady_clock::duration(observer->lastFloodArrivedAt.load() - observer->quietArrivedAt.load());
+    EXPECT_LT(drainTime, 500ms) << "frames already in receiver's buffer waited for an unrelated socket event";
+
+    for (auto* node : { &staller, &flooder, &quiet, &receiver }) node->network->stop();
+}

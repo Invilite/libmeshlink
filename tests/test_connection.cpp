@@ -9,6 +9,7 @@
 #include <memory>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -580,4 +581,53 @@ TEST_F(EstablishedConnectionPair, PeerMarksItselfForCloseWhenItsStreamBreaks) {
 
     EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketError));
     EXPECT_EQ(peer.getState(), PeerState::Closing);
+}
+
+// ===== Buffered frames invisible to poll() (R5) =====
+
+// One socket read can pull several frames into the Connection buffer. An owner that stops after one frame (receive
+// budget) must learn that more frames are already here — poll() will not report them. A half frame is not "here":
+// it needs socket data, which poll() does report.
+TEST_F(EstablishedConnectionPair, ReportsFramesBufferedBeyondTheOneReturned) {
+    EXPECT_FALSE(server->hasBufferedFrameData());
+
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto payload = numberedPayload(i, 100);
+        ASSERT_GT(client->send(&payload), 0);
+    }
+    // Wait until all three frames sit in the server socket (Nagle may hold the 2nd and 3rd back for a delayed ACK)
+    const size_t frameSize = NONCE_SIZE + HEADER_SIZE + 100 + TAG_SIZE;
+    int available = 0;
+    for (int attempt = 0; attempt < 200 && static_cast<size_t>(available) < 3 * frameSize; ++attempt) {
+        ::ioctl(serverFd, FIONREAD, &available);
+        std::this_thread::sleep_for(5ms);
+    }
+    ASSERT_GE(static_cast<size_t>(available), 3 * frameSize);
+
+    std::vector<uint8_t> received;
+    ASSERT_GT(server->receive(received, 0ms), 0);                                             // one read takes all three into the buffer
+    EXPECT_TRUE(server->hasBufferedFrameData());
+    ASSERT_GT(server->receive(received, 0ms), 0);
+    ASSERT_GT(server->receive(received, 0ms), 0);
+    EXPECT_EQ(received, numberedPayload(2, 100));
+    EXPECT_FALSE(server->hasBufferedFrameData());
+}
+
+TEST_F(EstablishedConnectionPair, HalfFrameInBufferNeedsSocketData) {
+    const auto payload = numberedPayload(7, 500);
+    ASSERT_GT(client->send(&payload), 0);
+    const auto frame = readRawFromServerSocket(NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE);
+    ASSERT_EQ(frame.size(), NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE);
+
+    writeRawFromClientSocket(std::vector<uint8_t>(frame.begin(), frame.begin() + 200));
+    std::vector<uint8_t> received;
+    ssize_t result = 0;
+    for (int attempt = 0; attempt < 5; ++attempt) result = server->receive(received, 50ms);  // header parsed, body incomplete
+    ASSERT_EQ(result, 0);
+    EXPECT_FALSE(server->hasBufferedFrameData());
+
+    writeRawFromClientSocket(std::vector<uint8_t>(frame.begin() + 200, frame.end()));
+    for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(received, 100ms);
+    ASSERT_GT(result, 0);
+    EXPECT_EQ(received, payload);
 }

@@ -547,6 +547,12 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
     return this->processFrame(data);
 }
 
+bool invilite::Mesh::Connection::hasBufferedFrameData() const {
+    constexpr size_t packetMinSize = 24 + 8 + 16;                                                                       // nonce + header + tag
+    if (this->frameBuffer.size() < packetMinSize) return false;
+    return this->frameLength == 0 || this->frameBuffer.size() >= this->frameLength;                                    // header not parsed yet, or the whole frame is here
+}
+
 // Returns: > 0 complete frame decrypted, 0 incomplete, < 0 error
 ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
     constexpr size_t nonceSize    = 24;
