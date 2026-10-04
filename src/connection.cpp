@@ -1,5 +1,6 @@
 #include "meshlink/connection.h"
 #include "meshlink/errors.h"
+#include "transport/platform.h"
 
 #include <botan/hex.h>
 #include <botan/mac.h>
@@ -14,7 +15,6 @@
 #include <botan/stream_cipher.h>
 
 #include <poll.h>
-#include <fcntl.h>
 #include <climits>
 #include <memory>
 #include <iomanip>
@@ -115,13 +115,8 @@ invilite::Mesh::Connection::Connection(const int clientSocket, const sockaddr_st
     }
 
     // Switch socket to non-blocking mode
-    const int flags = fcntl(clientSocket, F_GETFL, 0);                                                         // Get existing socket flags
-    if (flags == -1) {
-        throw std::runtime_error("Unable to get socket flags, fcntl F_GETFL failed");
-    }
-
-    if (fcntl(clientSocket, F_SETFL, flags | O_NONBLOCK) == -1) {                                              // Add O_NONBLOCK flag (socket in non-blocking mode)
-        throw std::runtime_error("Unable to set socket flags, fcntl F_SETFL O_NONBLOCK failed");
+    if (!Transport::Platform::setNonBlocking(clientSocket)) {
+        throw std::runtime_error("Unable to switch socket to non-blocking mode");
     }
 
 #if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
@@ -405,7 +400,7 @@ template <uint16_t bufferSize> ssize_t invilite::Mesh::Connection::receiveRaw(st
     pfd.events = POLLIN;
 
     // Wait for data
-    const int pollResult = ::poll(&pfd, 1, timeout.count());
+    const int pollResult = Transport::Platform::waitForSockets(&pfd, 1, static_cast<int>(timeout.count()));
 
     // Poll error occurred
     if (pollResult < 0) {
@@ -488,7 +483,7 @@ ssize_t invilite::Mesh::Connection::sendRaw(const std::vector<uint8_t>* data, co
         pfd.events = POLLOUT;
 
         // Wait until the socket is ready for writing
-        const int pollResult = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
+        const int pollResult = Transport::Platform::waitForSockets(&pfd, 1, static_cast<int>(timeout.count()));
 
         if (pollResult < 0) {
             return static_cast<int32_t>(Error::Connection::SelectFailed);                                               // Error occurred in poll
@@ -748,7 +743,7 @@ bool invilite::Mesh::Connection::drainSendQueue(const milliseconds timeout) {
         if (left.count() <= 0) return false;
 
         pollfd pfd{ socket, POLLOUT, 0 };
-        if (::poll(&pfd, 1, static_cast<int>(left.count())) < 0 && errno != EINTR) return false;
+        if (Transport::Platform::waitForSockets(&pfd, 1, static_cast<int>(left.count())) < 0 && errno != EINTR) return false;
     }
 }
 

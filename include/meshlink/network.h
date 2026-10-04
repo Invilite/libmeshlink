@@ -278,7 +278,7 @@ namespace invilite::Mesh {
 
         // ===== Lifecycle state =====
         std::atomic<bool>                                running{false};
-        int                                              wakeupPipe[2] = { -1, -1 };
+        Transport::Platform::WakeupSignal                ioWakeup;                       // wakes the I/O thread out of its poll
 
         // ===== Transport =====
         std::unique_ptr<Transport::TcpServer>            tcpServer;

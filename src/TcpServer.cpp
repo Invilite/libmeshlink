@@ -1,12 +1,13 @@
 #include "transport/TcpServer.h"
 
+#include <cerrno>
+#include <chrono>
+
 invilite::Transport::TcpServer::TcpServer(std::string listenAddress, const int port, const int backlog)
     : listenAddress(std::move(listenAddress)), serverPort(port), backlog(backlog), serverSocket(-1) {}
 
 invilite::Transport::TcpServer::~TcpServer() {
-    if (serverSocket != -1) {
-        close(serverSocket);
-    }
+    this->stop();                                                                   // a still-running listener thread would std::terminate on destruction
 }
 
 int invilite::Transport::TcpServer::start() {
@@ -83,78 +84,79 @@ int invilite::Transport::TcpServer::start() {
         return -7;
     }
 
+    // Non-blocking accept: a client that resets between poll() and accept() must not leave the thread stuck in accept()
+    if (!Platform::setNonBlocking(this->serverSocket)) {
+        std::cerr << "Error: Cannot set listening socket non-blocking" << std::endl;
+        return -9;
+    }
+
+    try {
+        this->stopSignal.open();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -10;
+    }
+
     // Start server accept thread
     this->stopServer = false;
     this->serverThread = std::thread(&TcpServer::serverListener, this);
-    pthread_setname_np(this->serverThread.native_handle(), "TcpServer");
+    Platform::setThreadName(this->serverThread, "TcpServer");
 
     return 0;
 }
 
 void invilite::Transport::TcpServer::stop() {
-    // Stop server thread
+    // Wake the listener explicitly and wait for it — only then close the socket, so the thread never polls or
+    // accepts on a closed (or already reused) descriptor.
     this->stopServer = true;
+    this->stopSignal.notify();
 
-    // Shutdown socket
-    if (this->serverSocket != -1) {
-        shutdown(this->serverSocket, SHUT_RDWR);
-    }
-
-    // Wait for server thread to finish
     if (this->serverThread.joinable()) {
         this->serverThread.join();
     }
 
-    // Close server socket
-    close(this->serverSocket);
-    this->serverSocket = -1;
+    if (this->serverSocket != -1) {
+        close(this->serverSocket);
+        this->serverSocket = -1;
+    }
+    this->stopSignal.close();
 }
 
 void invilite::Transport::TcpServer::serverListener() {
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd == -1) {
-        std::cerr << "Error: Cannot create epoll" << std::endl;
-        return;
-    }
-
-    const int MAX_EVENTS = 25;
-    struct epoll_event ev, events[MAX_EVENTS];
-    ev.events = EPOLLIN;
-    ev.data.fd = this->serverSocket;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, this->serverSocket, &ev) == -1) {
-        std::cerr << "Error: Cannot add server socket to epoll" << std::endl;
-        close(epoll_fd);
-        return;
-    }
+    pollfd watched[2] = {
+        { this->serverSocket,           POLLIN, 0 },
+        { this->stopSignal.readHandle(), POLLIN, 0 },
+    };
 
     while (!this->stopServer) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 500); // Timeout 500 ms
-        if (nfds == -1) {
-            std::cerr << "Error: epoll_wait" << std::endl;
-            continue;
+        const int ready = Platform::waitForSockets(watched, 2, 500);                // timeout is only a safety net — stop() wakes us
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            std::cerr << "Error: poll on listening socket failed, errno=" << errno << std::endl;
+            break;                                                                  // retrying a failing poll would spin at 100% CPU
         }
+        if (ready == 0 || !(watched[0].revents & POLLIN)) continue;
 
-        for (int n = 0; n < nfds; ++n) {
-            if (events[n].data.fd == this->serverSocket) {
-                // New connection
-                sockaddr_storage clientAddress{};
-                socklen_t clientAddressLength = sizeof(clientAddress);
-                const int clientSocket = accept(this->serverSocket, reinterpret_cast<struct sockaddr *>(&clientAddress), &clientAddressLength);
+        // Accept everything that is pending — one readiness event may cover several connections
+        while (!this->stopServer) {
+            sockaddr_storage clientAddress{};
+            socklen_t clientAddressLength = sizeof(clientAddress);
+            const int clientSocket = accept(this->serverSocket, reinterpret_cast<sockaddr*>(&clientAddress), &clientAddressLength);
 
-                // If we have an error, but it's causing by stoping server stop this loop
-                if (clientSocket < 0 && this->stopServer) {
-                    break;
-                }
+            if (clientSocket < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;                 // queue drained
+                if (errno == EINTR || errno == ECONNABORTED) continue;              // transient, try the next one
+                // Out of descriptors (EMFILE/ENFILE) or similar: the connection stays queued and poll() keeps reporting it.
+                // Back off briefly instead of spinning; a burst of refused clients is better than a pegged CPU.
+                std::cerr << "Error: Cannot accept client connection, errno=" << errno << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                break;
+            }
 
-                if (clientSocket < 0) {
-                    std::cerr << "Error: Cannot accept client connection" << std::endl;
-                    continue;
-                }
-
-                if (this->on_connect_callback_) {
-                    this->on_connect_callback_(clientSocket, &clientAddress);
-                }
+            if (this->on_connect_callback_) {
+                this->on_connect_callback_(clientSocket, &clientAddress);
+            } else {
+                close(clientSocket);                                                // nobody takes ownership — do not leak it
             }
         }
     }

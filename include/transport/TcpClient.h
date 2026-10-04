@@ -22,11 +22,10 @@ namespace invilite::Transport {
         //   1    already connected
         //   2    address resolution (getaddrinfo) failed
         //   3    socket() failed
-        //   10   fcntl F_GETFL failed
-        //   11   fcntl F_SETFL failed
+        //   11   switching the socket to non-blocking failed
         //   14   setsockopt SO_KEEPALIVE failed
         //   100  connect attempt failed
-        //   101  select failed
+        //   101  poll failed
         //   102  connection timed out
         //   103  connect error reported by SO_ERROR
         uint8_t connect(const std::string& address, int port, std::chrono::seconds timeout = std::chrono::seconds(5));

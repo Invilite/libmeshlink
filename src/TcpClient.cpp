@@ -1,13 +1,12 @@
 #include "transport/TcpClient.h"
+#include "transport/platform.h"
 
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
-#include <fcntl.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <iostream>
 
@@ -53,14 +52,7 @@ uint8_t TcpClient::connect(const std::string& address, int port, std::chrono::se
         }
 
         // Non-blocking for timeout-based connect
-        const int flags = ::fcntl(sock, F_GETFL, 0);
-        if (flags < 0) {
-            ::close(sock);
-            sock = -1;
-            lastError = 10;
-            continue;
-        }
-        if (::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        if (!Platform::setNonBlocking(sock)) {
             ::close(sock);
             sock = -1;
             lastError = 11;
@@ -82,23 +74,21 @@ uint8_t TcpClient::connect(const std::string& address, int port, std::chrono::se
             continue;
         }
 
-        // EINPROGRESS — wait for socket to become writable within timeout
-        fd_set writeFds;
-        FD_ZERO(&writeFds);
-        FD_SET(sock, &writeFds);
+        // EINPROGRESS — wait for socket to become writable within timeout (poll: no FD_SETSIZE limit, unlike select)
+        pollfd pending{ sock, POLLOUT, 0 };
+        int pollResult;
+        do {
+            pollResult = Platform::waitForSockets(&pending, 1, static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(timeout).count()));
+        } while (pollResult < 0 && errno == EINTR);
 
-        timeval tv;
-        tv.tv_sec  = timeout.count();
-        tv.tv_usec = 0;
-
-        const int selResult = ::select(sock + 1, nullptr, &writeFds, nullptr, &tv);
-        if (selResult < 0) {
+        if (pollResult < 0) {
             ::close(sock);
             sock = -1;
             lastError = 101;
             continue;
         }
-        if (selResult == 0) {
+
+        if (pollResult == 0) {
             ::close(sock);
             sock = -1;
             lastError = 102;

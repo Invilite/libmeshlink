@@ -10,8 +10,9 @@
 #include <iostream>
 #include <functional>
 #include <arpa/inet.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
+
+#include "transport/platform.h"
 
 namespace invilite::Transport {
 
@@ -39,6 +40,7 @@ private:
     int serverSocket;
     std::atomic<bool> stopServer = false;
     std::thread serverThread;
+    Platform::WakeupSignal stopSignal;                                                  // wakes serverListener on stop() — no reliance on shutdown() waking poll()
 
     OnConnectCallback on_connect_callback_;
 };

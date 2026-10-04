@@ -1,0 +1,152 @@
+// Transport layer: TcpServer / TcpClient on top of the platform seam (poll, wakeup signal).
+#include <gtest/gtest.h>
+#include "transport/TcpClient.h"
+#include "transport/TcpServer.h"
+
+#include <atomic>
+#include <fcntl.h>
+#include <filesystem>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+using namespace invilite::Transport;
+using namespace std::chrono_literals;
+
+namespace {
+
+size_t countOpenFileDescriptors() {
+    return static_cast<size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
+}
+
+uint16_t pickUnusedPort() {
+    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    socklen_t len = sizeof(addr);
+    ::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len);
+    ::close(fd);
+    return ntohs(addr.sin_port);
+}
+
+// Loopback listener whose only accept-queue slot is taken: the kernel drops further SYNs, so a connect to it hangs
+// until the caller's timeout — the one case where TcpClient really waits in poll().
+struct BlackholeListener {
+    int      listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    int      filler   = ::socket(AF_INET, SOCK_STREAM, 0);
+    uint16_t port     = 0;
+
+    BlackholeListener() {
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::listen(listener, 0);
+        socklen_t len = sizeof(addr);
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&addr), &len);
+        port = ntohs(addr.sin_port);
+        ::connect(filler, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
+    ~BlackholeListener() { ::close(filler); ::close(listener); }
+};
+
+// Occupies descriptors until the next one the process gets is at least `minimum`, so the code under test works with
+// a high-numbered socket. Released on destruction.
+struct HighDescriptorFloor {
+    std::vector<int> held;
+    explicit HighDescriptorFloor(int minimum) {
+        while (true) {
+            const int fd = ::open("/dev/null", O_RDONLY);
+            if (fd < 0) break;
+            held.push_back(fd);
+            if (fd >= minimum) break;
+        }
+    }
+    ~HighDescriptorFloor() { for (const int fd : held) ::close(fd); }
+};
+
+} // namespace
+
+// R8: select() is undefined for descriptors >= FD_SETSIZE (1024) — FD_SET writes past the fd_set and corrupts memory.
+// With poll() a high-numbered socket must behave exactly like a low one: connect succeeds, and a hanging connect
+// times out cleanly.
+TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
+    HighDescriptorFloor floor(1100);
+    if (floor.held.empty() || floor.held.back() < 1100) GTEST_SKIP() << "cannot open enough descriptors (RLIMIT_NOFILE)";
+
+    const uint16_t serverPort = pickUnusedPort();
+    TcpServer listening("127.0.0.1", serverPort, 16);
+    std::atomic<int> accepted{0};
+    listening.onConnect([&](int fd, const sockaddr_storage*) { ++accepted; ::close(fd); });
+    ASSERT_EQ(listening.start(), 0);
+
+    TcpClient client;
+    ASSERT_EQ(client.connect("127.0.0.1", serverPort, 2s), 0);
+    const int fd = client.release();
+    EXPECT_GE(fd, 1100);
+    ::close(fd);
+
+    BlackholeListener blackhole;
+    TcpClient hanging;
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_EQ(hanging.connect("127.0.0.1", blackhole.port, 1s), 102);                         // 102 = timed out
+    EXPECT_GE(std::chrono::steady_clock::now() - start, 900ms);
+
+    listening.stop();
+}
+
+// R8: stop() wakes the listener explicitly instead of relying on shutdown() of the listening socket waking poll()
+// (Linux does, macOS/BSD may not). It must return promptly, not after the 500 ms safety timeout.
+TEST(TcpServerTest, StopReturnsPromptly) {
+    TcpServer server("127.0.0.1", pickUnusedPort(), 16);
+    ASSERT_EQ(server.start(), 0);
+    std::this_thread::sleep_for(50ms);                                                        // let the listener enter poll()
+
+    const auto start = std::chrono::steady_clock::now();
+    server.stop();
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 250ms);
+}
+
+// R8: the epoll descriptor used to leak on every start/stop. Restarting the server must not grow the descriptor table.
+TEST(TcpServerTest, RestartDoesNotLeakDescriptors) {
+    TcpServer server("127.0.0.1", pickUnusedPort(), 16);
+    ASSERT_EQ(server.start(), 0);
+    server.stop();
+    const size_t baseline = countOpenFileDescriptors();
+
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_EQ(server.start(), 0);
+        server.stop();
+    }
+    EXPECT_EQ(countOpenFileDescriptors(), baseline);
+}
+
+// One readiness event can cover several queued connections; all of them must be accepted, none left waiting.
+TEST(TcpServerTest, AcceptsEveryQueuedConnection) {
+    const uint16_t port = pickUnusedPort();
+    TcpServer server("127.0.0.1", port, 64);
+    std::atomic<int> accepted{0};
+    server.onConnect([&](int fd, const sockaddr_storage*) { ++accepted; ::close(fd); });
+    ASSERT_EQ(server.start(), 0);
+
+    std::vector<TcpClient> clients(20);
+    for (auto& client : clients) ASSERT_EQ(client.connect("127.0.0.1", port, 2s), 0);
+
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (accepted.load() < 20 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
+    EXPECT_EQ(accepted.load(), 20);
+
+    server.stop();
+}
+
+// Destroying a running server must stop its thread (a joinable std::thread in the destructor would terminate).
+TEST(TcpServerTest, DestructorStopsRunningServer) {
+    auto server = std::make_unique<TcpServer>("127.0.0.1", pickUnusedPort(), 16);
+    ASSERT_EQ(server->start(), 0);
+    server.reset();
+    SUCCEED();
+}

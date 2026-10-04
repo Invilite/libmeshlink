@@ -4,7 +4,6 @@
 #include "transport/TcpClient.h"
 
 #include <poll.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -23,7 +22,6 @@ namespace invilite::Mesh {
     namespace {
         constexpr int    POLL_TIMEOUT_MS          = 100;
         constexpr size_t MIN_SEND_QUEUE_LIMIT     = 64 * 1024;                     // Fits the largest 0xFF message (PEX batch of MAX_RECORDS_PER_BATCH records) with room to spare
-        constexpr size_t WAKEUP_DRAIN_BUFFER      = 64;
         constexpr int    OUTBOUND_CONNECT_TIMEOUT = 5;
         // Upper bound of one outbound attempt: TCP connect (5 s) + transport handshake (3 s) + identity verification
         // (2 × 3 s receive) + registration, with margin. Topology does not redial a peer within this window (R9).
@@ -136,20 +134,11 @@ void Network::start() {
                   << this->selfRecordSerialized.size() << "B" << std::endl;
     }
 
-    if (::pipe(this->wakeupPipe) == -1) {
+    try {
+        this->ioWakeup.open();
+    } catch (const std::exception&) {
         this->running.store(false);
-        throw std::runtime_error("Failed to create wakeup pipe");
-    }
-
-    for (const int fd : { this->wakeupPipe[0], this->wakeupPipe[1] }) {
-        const int flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags == -1 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
-            ::close(this->wakeupPipe[0]);
-            ::close(this->wakeupPipe[1]);
-            this->wakeupPipe[0] = this->wakeupPipe[1] = -1;
-            this->running.store(false);
-            throw std::runtime_error("Failed to set wakeup pipe non-blocking");
-        }
+        throw;
     }
 
     if (this->config.listenPort != 0) {
@@ -160,22 +149,20 @@ void Network::start() {
 
         if (this->tcpServer->start() != 0) {
             this->tcpServer.reset();
-            ::close(this->wakeupPipe[0]);
-            ::close(this->wakeupPipe[1]);
-            this->wakeupPipe[0] = this->wakeupPipe[1] = -1;
+            this->ioWakeup.close();
             this->running.store(false);
             throw std::runtime_error("Failed to start TcpServer");
         }
     }
 
     this->dispatchThread = std::thread(&Network::dispatchLoop, this);
-    pthread_setname_np(this->dispatchThread.native_handle(), "EventDispatcher");
+    Transport::Platform::setThreadName(this->dispatchThread, "EventDispatcher");
 
     this->managementThread = std::thread(&Network::managementLoop, this);
-    pthread_setname_np(this->managementThread.native_handle(), "PeerManager");
+    Transport::Platform::setThreadName(this->managementThread, "PeerManager");
 
     this->ioThread = std::thread(&Network::ioLoop, this);
-    pthread_setname_np(this->ioThread.native_handle(), "TransportLoop");
+    Transport::Platform::setThreadName(this->ioThread, "TransportLoop");
 }
 
 void Network::stop() {
@@ -222,9 +209,7 @@ void Network::stop() {
     this->finalCleanupAllPeers();
     this->tcpServer.reset();
 
-    if (this->wakeupPipe[0] != -1) ::close(this->wakeupPipe[0]);
-    if (this->wakeupPipe[1] != -1) ::close(this->wakeupPipe[1]);
-    this->wakeupPipe[0] = this->wakeupPipe[1] = -1;
+    this->ioWakeup.close();
 }
 
 // ============================================================
@@ -679,7 +664,7 @@ void Network::ioLoop() {
 
     while (this->running.load()) {
         fds.clear();
-        fds.push_back({ this->wakeupPipe[0], POLLIN, 0 });
+        fds.push_back({ this->ioWakeup.readHandle(), POLLIN, 0 });
 
         {
             std::shared_lock lock(this->peersMutex);
@@ -701,7 +686,7 @@ void Network::ioLoop() {
             }
         }
 
-        const int ready = ::poll(fds.data(), fds.size(), POLL_TIMEOUT_MS);
+        const int ready = Transport::Platform::waitForSockets(fds.data(), fds.size(), POLL_TIMEOUT_MS);
         if (ready < 0) {
             if (errno == EINTR) continue;
             std::cerr << "Network::ioLoop: poll() failed errno=" << errno << std::endl;
@@ -710,7 +695,7 @@ void Network::ioLoop() {
 
         if (ready > 0) {
             for (const auto& pfd : fds) {
-                if (pfd.fd == this->wakeupPipe[0]) {
+                if (pfd.fd == this->ioWakeup.readHandle()) {
                     if (pfd.revents & POLLIN) this->handleWakeup();
                 } else {
                     if (pfd.revents & POLLOUT) this->handleConnectionWritable(pfd.fd);
@@ -729,8 +714,7 @@ void Network::ioLoop() {
 }
 
 void Network::handleWakeup() {
-    char buf[WAKEUP_DRAIN_BUFFER];
-    while (::read(this->wakeupPipe[0], buf, sizeof(buf)) > 0) { }
+    this->ioWakeup.drain();
 
     Command cmd;
     while (this->commandQueue.tryPop(cmd)) {
@@ -1697,9 +1681,7 @@ ssize_t Network::sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vecto
 }
 
 void Network::wakeupIoThread() const {
-    if (this->wakeupPipe[1] == -1) return;
-    constexpr char byte = 'x';
-    [[maybe_unused]] auto _ = ::write(this->wakeupPipe[1], &byte, 1);
+    this->ioWakeup.notify();
 }
 
 void Network::markAllPeersForClose() {
