@@ -69,6 +69,10 @@ namespace invilite::Mesh {
         // Actual batch may be smaller if our verified pool is smaller.
         uint8_t                     initialPexBatchSize = 5;
 
+        // Address book bound (R2): identities are free to mint, so gossip must not grow the book without limit. When full,
+        // a new record replaces the least valuable entry or is dropped — see chooseEvictionVictim.
+        size_t                      maxKnownPeers       = 500;
+
         // Periodic anti-entropy PEX tick — slow systematic gossip to fill gaps left by flood + initial exchange.
         // At each tick, a random interval in [min, max] is picked; up to batchSize verified records with the
         // oldest lastAnnouncedAt are broadcast to all connected peers.

@@ -1,4 +1,5 @@
 #include "meshlink/network.h"
+#include "meshlink/known_peer_eviction.h"
 #include "meshlink/identity.h"
 #include "meshlink/thread_signals.h"
 #include "transport/TcpClient.h"
@@ -143,6 +144,9 @@ Network::Network(std::shared_ptr<LocalIdentity> selfIdentity,
     const ConnectionLimits& limits = this->config.connectionLimits;
     if (limits.inbound.soft == 0 || limits.inbound.effectiveHard() < limits.inbound.soft) {
         throw std::invalid_argument("connectionLimits.inbound: need 0 < soft <= hard");
+    }
+    if (this->config.maxKnownPeers == 0) {
+        throw std::invalid_argument("maxKnownPeers must be at least 1");
     }
     if (limits.inbound.perAddress == 0) {
         throw std::invalid_argument("connectionLimits.inbound.perAddress must be at least 1");
@@ -1451,6 +1455,20 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
     // Unknown and a probe may upgrade it later.
     const PeerId peerId          = record.peerId;                                   // capture before move
     bool         shouldBroadcast = false;
+
+    // Full address book (R2): a new record needs room — the least valuable entry goes, or the record is dropped.
+    // Only this thread adds entries, so the check and the insert below cannot be interleaved by another insert.
+    if (!this->peerDirectory->findPeer(peerId) && this->peerDirectory->size() >= this->config.maxKnownPeers) {
+        std::vector<PeerId> connected;
+        for (const auto& peer : this->activePeersSnapshot()) connected.push_back(peer->getPeerId());
+        const auto victim = chooseEvictionVictim(this->peerDirectory->listPeers(), connected, outboundMatch);
+        if (!victim) {
+            std::cerr << "Network: address book full, dropping record " << peerIdShort(peerId) << std::endl;
+            return false;
+        }
+        this->peerDirectory->removePeer(*victim);
+        std::cerr << "Network: address book full, evicted " << peerIdShort(*victim) << " for " << peerIdShort(peerId) << std::endl;
+    }
 
     this->peerDirectory->upsertPeer(peerId, [&](KnownPeer& entry, bool isNewEntry) {
         const AvailabilityState newAvailability = outboundMatch

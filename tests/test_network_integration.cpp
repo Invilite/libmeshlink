@@ -748,3 +748,46 @@ TEST(NetworkIntegrationTest, RestartAfterStopWorks) {
     node.network->stop();
     other.network->stop();
 }
+
+// R2: the address book is bounded and unverified gossip cannot push out what we know works. Bounded already holds
+// three entries that once worked (unreachable right now) and room for one more — taken by the gossiper's HELLO, proven
+// by our own dial. The gossiper then hands over 30 unverified records: with only proven or connected entries left,
+// every one of them must be dropped. A hostile peer can mint identities for free; they must not cost us real peers.
+TEST(NetworkIntegrationTest, AddressBookStaysWithinLimitUnderGossip) {
+    const auto secret = makeSecret();
+    TestNode bounded(secret, "bounded", [](NetworkConfig& config) { config.maxKnownPeers = 4; });
+    TestNode gossiper(secret, "gossiper", [](NetworkConfig& config) { config.initialPexBatchSize = 30; });
+
+    std::vector<PeerId> gossip;
+    for (int i = 0; i < 30; ++i) {
+        const auto someone = LocalIdentity::generate();
+        const auto record  = makeSignedRecord(someone, { ipv4("127.0.0.1", static_cast<uint16_t>(20000 + i)) }, std::chrono::system_clock::now());
+        gossiper.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; entry.hasEverConnected = true; });
+        gossip.push_back(record.peerId);
+    }
+    std::vector<PeerId> veterans;
+    for (int i = 0; i < 3; ++i) {
+        const auto veteran = LocalIdentity::generate();
+        const auto record  = makeSignedRecord(veteran, { ipv4("127.0.0.1", pickUnusedPort()) }, std::chrono::system_clock::now());
+        bounded.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) {
+            entry.record = record; entry.hasEverConnected = true; entry.availability = AvailabilityState::Unavailable;
+            entry.consecutiveProbeFailures = 4;
+            entry.nextProbeAllowedAt = std::chrono::steady_clock::now() + 1h;                 // keep the probe away
+        });
+        veterans.push_back(record.peerId);
+    }
+
+    bounded.network->start();
+    gossiper.network->start();
+    bounded.network->connectToPeer("127.0.0.1", gossiper.port);
+
+    ASSERT_TRUE(waitUntil([&] { return bounded.knownPeer(gossiper).has_value(); }, 5s));
+    std::this_thread::sleep_for(500ms);                                                       // the whole PEX batch is processed
+
+    EXPECT_EQ(bounded.directory->size(), 4u);
+    for (const auto& veteran : veterans) EXPECT_TRUE(bounded.directory->findPeer(veteran).has_value()) << "an entry that once worked was pushed out by unverified gossip";
+    for (const auto& record : gossip) EXPECT_FALSE(bounded.directory->findPeer(record).has_value());
+
+    bounded.network->stop();
+    gossiper.network->stop();
+}
