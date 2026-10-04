@@ -719,14 +719,16 @@ void Network::handleWakeup() {
                 }
 
                 std::shared_ptr<Peer> insertedPeer;                                 // set if peer was added → schedule HELLO + notify after unlock
+                std::shared_ptr<Peer> replacedPeer;                                 // set if tie-break swapped connections → close after unlock
                 {
                     std::unique_lock lock(this->peersMutex);
 
                     const auto existingIt = this->peersById.find(cmd.peer->getPeerId());
                     if (existingIt != this->peersById.end()) {
                         if (this->shouldReplaceExistingPeer(*existingIt->second, *cmd.peer)) {
-                            existingIt->second->markForClose();
-                            this->peersBySocket.erase(existingIt->second->getSocket());
+                            replacedPeer = existingIt->second;
+                            replacedPeer->markForClose();
+                            this->peersBySocket.erase(replacedPeer->getSocket());
                             existingIt->second = cmd.peer;
                             this->peersBySocket[fd] = cmd.peer;
                             cmd.peer->markActive();
@@ -748,12 +750,17 @@ void Network::handleWakeup() {
                     }
                 }
 
-                // Schedule HELLO send from Management thread — keeps actual send off the I/O path.
+                // The replaced peer is no longer in any map, so cleanClosedPeers will never see it — close it here.
+                if (replacedPeer) replacedPeer->closeConnection();
+
+                // Schedule HELLO send from Management thread — keeps actual send off the I/O path. Also on
+                // replacement: a HELLO queued for the old connection is skipped once that peer is Closing.
                 // Notify listeners after Network-internal state is fully consistent (peer in maps,
-                // HELLO scheduled). Listener callbacks run on this I/O thread.
+                // HELLO scheduled). Listener callbacks run on this I/O thread. A replacement is transparent
+                // to listeners — the peer stays connected, only the underlying connection changed.
                 if (insertedPeer) {
                     this->scheduleHelloSend(insertedPeer);
-                    this->notifyPeerConnected(insertedPeer->getIdentity());
+                    if (!replacedPeer) this->notifyPeerConnected(insertedPeer->getIdentity());
                 }
                 break;
             }

@@ -4,6 +4,8 @@
 #include "meshlink/network.h"
 #include "test_helpers.h"
 
+#include <atomic>
+#include <filesystem>
 #include <functional>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -60,6 +62,33 @@ struct TestNode {
         const auto entry = this->knownPeer(other);
         return entry && entry->availability == AvailabilityState::Available;
     }
+};
+
+size_t countOpenFileDescriptors() {
+    return static_cast<size_t>(std::distance(std::filesystem::directory_iterator("/proc/self/fd"), std::filesystem::directory_iterator{}));
+}
+
+// Tracks lifecycle events for one remote peer and checks they alternate: connected, disconnected, connected...
+// Both callbacks fire on the I/O thread, so plain sequencing is enough; atomics only for the reading test thread.
+struct PeerEventCounter : NetworkEventListener {
+    explicit PeerEventCounter(PeerId watched) : watched(watched) {}
+    void onPeerConnected(const PeerIdentity& identity) override {
+        if (identity.getPeerId() != this->watched) return;
+        if (this->isConnected) ++this->outOfOrder;                                          // connected twice without disconnect
+        this->isConnected = true;
+        ++this->connected;
+    }
+    void onPeerDisconnected(const PeerId& peerId) override {
+        if (peerId != this->watched) return;
+        if (!this->isConnected) ++this->outOfOrder;
+        this->isConnected = false;
+        ++this->disconnected;
+    }
+    PeerId            watched;
+    std::atomic<bool> isConnected{false};
+    std::atomic<int>  connected{0};
+    std::atomic<int>  disconnected{0};
+    std::atomic<int>  outOfOrder{0};
 };
 
 std::shared_ptr<std::array<uint8_t, 64>> makeSecret() {
@@ -165,4 +194,43 @@ TEST(NetworkIntegrationTest, NewerRecordWithSameAddressesKeepsReachabilityKnowle
 
     alpha.network->stop();
     beta.network->stop();
+}
+
+// B4: when both peers dial each other, the tie-break keeps exactly one connection. Replacing the existing
+// connection must close the old socket, and listener events must stay consistent. On the replacing side the swap is
+// invisible. The other side may see the old connection's EOF before its own handshake for the new one completes —
+// an inherent simultaneous-open race — and then reports disconnected → connected, which is still consistent.
+TEST(NetworkIntegrationTest, TieBreakReplacementClosesOldConnectionAndStaysTransparent) {
+    const auto secret = makeSecret();
+    TestNode first(secret, "first");
+    TestNode second(secret, "second");
+    // The node with the smaller PeerId wins with its outbound connection. Let the larger one dial first,
+    // so the smaller one's later dial replaces the existing connection on both sides.
+    TestNode& smaller = first.identity->getPeerId() < second.identity->getPeerId() ? first : second;
+    TestNode& larger  = (&smaller == &first) ? second : first;
+    const auto eventsAtSmaller = std::make_shared<PeerEventCounter>(larger.identity->getPeerId());
+    const auto eventsAtLarger  = std::make_shared<PeerEventCounter>(smaller.identity->getPeerId());
+    smaller.network->addListener(eventsAtSmaller);
+    larger.network->addListener(eventsAtLarger);
+    smaller.network->start();
+    larger.network->start();
+
+    larger.network->connectToPeer("127.0.0.1", smaller.port);
+    ASSERT_TRUE(waitUntil([&] { return eventsAtSmaller->connected == 1 && eventsAtLarger->connected == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);                                                       // let HELLO/PEX/probes settle
+    const size_t descriptorsBeforeReplacement = countOpenFileDescriptors();
+
+    smaller.network->connectToPeer("127.0.0.1", larger.port);
+    std::this_thread::sleep_for(1500ms);                                                      // handshake + replacement + cleanup
+
+    EXPECT_EQ(smaller.network->getConnectedPeerCount(), 1u);
+    EXPECT_EQ(larger.network->getConnectedPeerCount(), 1u);
+    EXPECT_EQ(countOpenFileDescriptors(), descriptorsBeforeReplacement) << "old connection sockets leaked";
+    for (const auto* events : { eventsAtSmaller.get(), eventsAtLarger.get() }) {
+        EXPECT_EQ(events->outOfOrder, 0) << "connected reported twice without a disconnect in between";
+        EXPECT_TRUE(events->isConnected);
+    }
+
+    larger.network->stop();
+    smaller.network->stop();
 }
