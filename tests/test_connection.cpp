@@ -8,6 +8,7 @@
 #include <cstring>
 #include <memory>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -630,4 +631,23 @@ TEST_F(EstablishedConnectionPair, HalfFrameInBufferNeedsSocketData) {
     for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(received, 100ms);
     ASSERT_GT(result, 0);
     EXPECT_EQ(received, payload);
+}
+
+// Small messages sent back to back must not wait for an ACK of the first one (Nagle + delayed ACK ≈ 40 ms on Linux).
+// The send queue already coalesces frames, so Nagle would only add latency.
+TEST_F(EstablishedConnectionPair, BackToBackSmallMessagesAreNotDelayed) {
+    int noDelay = 0;
+    socklen_t length = sizeof(noDelay);
+    ASSERT_EQ(::getsockopt(clientFd, IPPROTO_TCP, TCP_NODELAY, &noDelay, &length), 0);
+    EXPECT_NE(noDelay, 0);
+
+    const size_t frameSize = NONCE_SIZE + HEADER_SIZE + 20 + TAG_SIZE;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto payload = numberedPayload(i, 20);
+        ASSERT_GT(client->send(&payload), 0);
+    }
+    int available = 0;
+    while (static_cast<size_t>(available) < 3 * frameSize && std::chrono::steady_clock::now() - start < 1s) ::ioctl(serverFd, FIONREAD, &available);
+    EXPECT_LT(std::chrono::steady_clock::now() - start, 20ms) << "later frames were held back";
 }

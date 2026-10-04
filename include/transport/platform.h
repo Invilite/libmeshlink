@@ -16,6 +16,10 @@ namespace invilite::Transport::Platform {
     // Switches a socket (or pipe end) to non-blocking mode. False on failure.
     bool setNonBlocking(int handle);
 
+    // Sends small segments immediately instead of holding them for an ACK (Nagle). Frames are already coalesced by the
+    // send queue, so Nagle only adds latency (~40 ms with delayed ACK) to back-to-back small messages. False on failure.
+    bool disableNagle(int socket);
+
     // Waits for readiness on several sockets — poll() on POSIX (WSAPoll() on Windows). Same contract as poll().
     int waitForSockets(pollfd* sockets, size_t count, int timeoutMs);
 

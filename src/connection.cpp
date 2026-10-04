@@ -119,6 +119,9 @@ invilite::Mesh::Connection::Connection(const int clientSocket, const sockaddr_st
         throw std::runtime_error("Unable to switch socket to non-blocking mode");
     }
 
+    // Latency only, never correctness — a socket that refuses it still works
+    Transport::Platform::disableNagle(clientSocket);
+
 #if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
     const int noSigPipe = 1;
     setsockopt(clientSocket, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe));                        // See SEND_FLAGS

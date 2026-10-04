@@ -1,6 +1,9 @@
 #include "transport/platform.h"
 
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <stdexcept>
 #include <unistd.h>
@@ -8,6 +11,11 @@
 bool invilite::Transport::Platform::setNonBlocking(const int handle) {
     const int flags = ::fcntl(handle, F_GETFL, 0);
     return flags != -1 && ::fcntl(handle, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
+bool invilite::Transport::Platform::disableNagle(const int socket) {
+    const int enabled = 1;
+    return ::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
 }
 
 int invilite::Transport::Platform::waitForSockets(pollfd* sockets, const size_t count, const int timeoutMs) {
