@@ -2,6 +2,7 @@
 #define TCP_SERVER_H
 
 #include <atomic>
+#include <string>
 #include <thread>
 #include <utility>
 #include <string.h>
@@ -16,7 +17,9 @@ namespace invilite::Transport {
 
 class TcpServer {
 public:
-    TcpServer(const int port);
+    // listenAddress must be a numeric IPv4/IPv6 address (no DNS): "::" = every interface over IPv4 and IPv6 (dual stack),
+    // "0.0.0.0" = every IPv4 interface, any other address = only that interface (e.g. a VPN). backlog is passed to listen().
+    TcpServer(std::string listenAddress, int port, int backlog);
     virtual ~TcpServer();
 
     int start();
@@ -30,7 +33,9 @@ protected:
 private:
     void serverListener();
 
+    const std::string listenAddress;
     const int serverPort;
+    const int backlog;
     int serverSocket;
     std::atomic<bool> stopServer = false;
     std::thread serverThread;

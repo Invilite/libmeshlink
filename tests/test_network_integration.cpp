@@ -7,6 +7,7 @@
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
@@ -48,11 +49,12 @@ struct TestNode {
     uint16_t                       port      = pickUnusedPort();
     std::unique_ptr<Network>       network;
 
-    TestNode(const std::shared_ptr<std::array<uint8_t, 64>>& secret, const std::string& name) {
+    TestNode(const std::shared_ptr<std::array<uint8_t, 64>>& secret, const std::string& name, const std::function<void(NetworkConfig&)>& adjustConfig = {}) {
         NetworkConfig config;
         config.listenPort         = this->port;
         config.nodeName           = name;
         config.announcedAddresses = { ipv4("127.0.0.1", this->port) };
+        if (adjustConfig) adjustConfig(config);
         this->network = std::make_unique<Network>(this->identity, secret, this->directory, config);
     }
 
@@ -330,4 +332,59 @@ TEST(NetworkIntegrationTest, TopologyDoesNotRedialPeerWhileAttemptIsInProgress) 
     node.network->stop();
     ::close(filler);
     ::close(listener);
+}
+
+// Raw TCP connect, true when the connection was accepted by a listener at that address.
+static bool tcpConnects(int family, const std::string& address, uint16_t port) {
+    const int fd = ::socket(family, SOCK_STREAM, 0);
+    sockaddr_storage target{};
+    socklen_t length = 0;
+    if (family == AF_INET6) {
+        auto* v6 = reinterpret_cast<sockaddr_in6*>(&target);
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port   = htons(port);
+        ::inet_pton(AF_INET6, address.c_str(), &v6->sin6_addr);
+        length = sizeof(sockaddr_in6);
+    } else {
+        auto* v4 = reinterpret_cast<sockaddr_in*>(&target);
+        v4->sin_family = AF_INET;
+        v4->sin_port   = htons(port);
+        ::inet_pton(AF_INET, address.c_str(), &v4->sin_addr);
+        length = sizeof(sockaddr_in);
+    }
+    const bool connected = ::connect(fd, reinterpret_cast<sockaddr*>(&target), length) == 0;
+    ::close(fd);
+    return connected;
+}
+
+// R7: listenAddress restricts which interface accepts connections (e.g. only a VPN address). Bound to the IPv4
+// loopback, the node must accept there and refuse on the IPv6 loopback — with the old hard-coded "::" both worked.
+TEST(NetworkIntegrationTest, ListenAddressRestrictsAcceptingInterface) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "restricted", [](NetworkConfig& config) { config.listenAddress = "127.0.0.1"; });
+    node.network->start();
+
+    EXPECT_TRUE(tcpConnects(AF_INET, "127.0.0.1", node.port));
+    EXPECT_FALSE(tcpConnects(AF_INET6, "::1", node.port));
+
+    node.network->stop();
+}
+
+// R7: the default "::" listens on IPv4 and IPv6 (dual stack), whatever the OS default for IPV6_V6ONLY.
+TEST(NetworkIntegrationTest, DefaultListenAddressAcceptsIpv4AndIpv6) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "dualstack");
+    node.network->start();
+
+    EXPECT_TRUE(tcpConnects(AF_INET, "127.0.0.1", node.port));
+    EXPECT_TRUE(tcpConnects(AF_INET6, "::1", node.port));
+
+    node.network->stop();
+}
+
+// R7: a listen address that is not a numeric IP fails loudly at start instead of silently listening everywhere.
+TEST(NetworkIntegrationTest, NonNumericListenAddressFailsToStart) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "misconfigured", [](NetworkConfig& config) { config.listenAddress = "localhost"; });
+    EXPECT_THROW(node.network->start(), std::runtime_error);
 }

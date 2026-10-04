@@ -1,6 +1,7 @@
 #include "transport/TcpServer.h"
 
-invilite::Transport::TcpServer::TcpServer(const int port) : serverPort(port), serverSocket(-1) {}
+invilite::Transport::TcpServer::TcpServer(std::string listenAddress, const int port, const int backlog)
+    : listenAddress(std::move(listenAddress)), serverPort(port), backlog(backlog), serverSocket(-1) {}
 
 invilite::Transport::TcpServer::~TcpServer() {
     if (serverSocket != -1) {
@@ -12,8 +13,26 @@ int invilite::Transport::TcpServer::start() {
     // Stop server if running
     this->stop();
 
+    // Resolve the bind address first — the socket family follows from it
+    sockaddr_storage bindAddress{};
+    socklen_t        bindAddressLength = 0;
+    bool             bindsEveryIpv6Interface = false;
+    if (auto* v6 = reinterpret_cast<sockaddr_in6*>(&bindAddress); inet_pton(AF_INET6, this->listenAddress.c_str(), &v6->sin6_addr) == 1) {
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port   = htons(this->serverPort);
+        bindAddressLength = sizeof(sockaddr_in6);
+        bindsEveryIpv6Interface = IN6_IS_ADDR_UNSPECIFIED(&v6->sin6_addr);
+    } else if (auto* v4 = reinterpret_cast<sockaddr_in*>(&bindAddress); inet_pton(AF_INET, this->listenAddress.c_str(), &v4->sin_addr) == 1) {
+        v4->sin_family = AF_INET;
+        v4->sin_port   = htons(this->serverPort);
+        bindAddressLength = sizeof(sockaddr_in);
+    } else {
+        std::cerr << "Error: listen address is not a numeric IPv4/IPv6 address: " << this->listenAddress << std::endl;
+        return -8;
+    }
+
     // Create new server socket
-    this->serverSocket = socket(AF_INET6, SOCK_STREAM, 0);
+    this->serverSocket = socket(bindAddress.ss_family, SOCK_STREAM, 0);
     if (this->serverSocket == -1) {
         std::cerr << "Error: Cannot create socket" << std::endl;
         return -1;
@@ -45,30 +64,21 @@ int invilite::Transport::TcpServer::start() {
         return -4;
     }
 
-    // Enable dual-stack (IPv4 and IPv6)
-    opt = 0;
-    if (setsockopt(this->serverSocket, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        return -5;
+    // "::" also accepts IPv4 (dual stack) — the OS default for IPV6_V6ONLY differs between systems, so set it explicitly
+    if (bindsEveryIpv6Interface) {
+        opt = 0;
+        if (setsockopt(this->serverSocket, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
+            perror("setsockopt");
+            return -5;
+        }
     }
 
-    // sockaddr_in server_address;
-    // server_address.sin_family = AF_INET;
-    // server_address.sin_addr.s_addr = INADDR_ANY;
-    // server_address.sin_port = htons(this->serverPort);
-
-    sockaddr_in6 server_address;
-    memset(&server_address, 0, sizeof(server_address));
-    server_address.sin6_family = AF_INET6;
-    server_address.sin6_addr = in6addr_any; // Akceptuj połączenia IPv6
-    server_address.sin6_port = htons(this->serverPort);
-
-    if (bind(this->serverSocket, (struct sockaddr *)&server_address, sizeof(server_address)) < 0) {
-        std::cerr << "Error: Cannot bind socket" << std::endl;
+    if (bind(this->serverSocket, reinterpret_cast<sockaddr*>(&bindAddress), bindAddressLength) < 0) {
+        std::cerr << "Error: Cannot bind socket to " << this->listenAddress << ":" << this->serverPort << std::endl;
         return -6;
     }
 
-    if (listen(this->serverSocket, 5) < 0) {
+    if (listen(this->serverSocket, this->backlog) < 0) {
         std::cerr << "Error: Cannot listen on socket" << std::endl;
         return -7;
     }

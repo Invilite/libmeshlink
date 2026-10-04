@@ -153,7 +153,7 @@ void Network::start() {
     }
 
     if (this->config.listenPort != 0) {
-        this->tcpServer = std::make_unique<Transport::TcpServer>(this->config.listenPort);
+        this->tcpServer = std::make_unique<Transport::TcpServer>(this->config.listenAddress, this->config.listenPort, this->config.backlog);
         this->tcpServer->onConnect([this](int fd, const sockaddr_storage* addr) {
             this->onIncomingConnection(fd, addr);
         });
