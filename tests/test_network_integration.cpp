@@ -234,3 +234,65 @@ TEST(NetworkIntegrationTest, TieBreakReplacementClosesOldConnectionAndStaysTrans
     larger.network->stop();
     smaller.network->stop();
 }
+
+// B8: a peer that keeps refusing our dials must not stay Available forever (Topology would redial it without end).
+// After connectionFailuresBeforeUnavailable failed dials it is handed to the probe as Unavailable.
+// Topology is kept away (nextConnectionAttemptAt far ahead); connectToPeer dials regardless of backoff.
+TEST(NetworkIntegrationTest, RepeatedDialFailuresMakeAvailablePeerUnavailable) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "dialer");
+    const auto ghost     = LocalIdentity::generate();
+    const uint16_t port  = pickUnusedPort();
+    const auto record    = makeSignedRecord(ghost, { ipv4("127.0.0.1", port) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) {
+        entry.record                        = record;
+        entry.hasEverConnected              = true;
+        entry.availability                  = AvailabilityState::Available;
+        entry.consecutiveConnectionFailures = 1;
+        entry.nextConnectionAttemptAt       = std::chrono::steady_clock::now() + 1h;
+    });
+    node.network->start();
+
+    // Second failure: still below the threshold of 3 — one bad moment must not demote a working peer
+    node.network->connectToPeer("127.0.0.1", port);
+    ASSERT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveConnectionFailures == 2; }, 3s));
+    EXPECT_EQ(node.directory->findPeer(record.peerId)->availability, AvailabilityState::Available);
+
+    // Third failure reaches the threshold
+    node.network->connectToPeer("127.0.0.1", port);
+    ASSERT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveConnectionFailures == 3; }, 3s));
+    EXPECT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->availability == AvailabilityState::Unavailable; }, 3s));
+
+    // The probe now owns it: it is probed (and fails, nobody listens) with its own backoff channel
+    EXPECT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveProbeFailures >= 1; }, 3s));
+    EXPECT_TRUE(node.directory->findPeer(record.peerId)->hasEverConnected) << "demotion must not erase PEX evidence";
+
+    node.network->stop();
+}
+
+// B8: once demoted, the peer comes back through the probe — when it is reachable again it becomes Available.
+TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "dialer");
+    TestNode target(secret, "target");
+    const auto record = makeSignedRecord(*target.identity, { ipv4("127.0.0.1", target.port) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) {
+        entry.record                        = record;
+        entry.hasEverConnected              = true;
+        entry.availability                  = AvailabilityState::Available;
+        entry.consecutiveConnectionFailures = 2;
+        entry.nextConnectionAttemptAt       = std::chrono::steady_clock::now() + 1h;     // keep Topology from dialing
+        entry.nextProbeAllowedAt            = std::chrono::steady_clock::now() + 1500ms; // first probe only after the target is up
+    });
+    node.network->start();
+
+    node.network->connectToPeer("127.0.0.1", target.port);                                 // target not started yet → refused
+    ASSERT_TRUE(waitUntil([&] { const auto e = node.directory->findPeer(record.peerId); return e->availability != AvailabilityState::Available; }, 3s));
+
+    target.network->start();
+    EXPECT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->availability == AvailabilityState::Available; }, 5s));
+    EXPECT_EQ(node.directory->findPeer(record.peerId)->consecutiveConnectionFailures, 3) << "probe success must not reset the dial channel";
+
+    target.network->stop();
+    node.network->stop();
+}

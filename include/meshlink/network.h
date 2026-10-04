@@ -62,6 +62,10 @@ namespace invilite::Mesh {
         // A peer whose queued frames made no progress for this long has stopped reading — its connection is closed.
         std::chrono::seconds        sendStallTimeout        = std::chrono::seconds(15);
 
+        // After this many consecutive failed dials an Available peer becomes Unavailable and is handed to the probe,
+        // which keeps checking it with its own backoff. Topology stops wasting dials on a peer that is gone.
+        uint8_t                     connectionFailuresBeforeUnavailable = 3;
+
         // Probe backoff and connection attempt backoff are tracked per-peer in KnownPeer
         // (consecutiveProbeFailures + nextProbeAllowedAt, consecutiveConnectionFailures + nextConnectionAttemptAt).
         // The schedule is shared between both — see computeBackoffInterval() in network.cpp.
@@ -72,6 +76,9 @@ namespace invilite::Mesh {
         std::shared_ptr<Peer>   peer;
         uint16_t                subtype = 0;
         std::vector<uint8_t>    payload;
+        // Fact supplied by the connection layer: the remote IP we dialed when this connection is outbound, empty when
+        // the peer dialed us. Discovery uses it as reachability evidence without reaching into Peer/Connection (A1 M2).
+        std::string             dialedAddress;
     };
 
 // Reason codes sent in a GOODBYE frame before closing a connection.
@@ -255,6 +262,10 @@ namespace invilite::Mesh {
         // Called by runOutgoingHandshake when establishOutboundConnection fails.
         // No-op if peer is not in peerDirectory (e.g. connectToPeer to a bootstrap address before HELLO).
         void recordConnectionAttemptFailure(const std::string& address, uint16_t port);
+
+        // Discovery's reaction to repeated failed dials reported by the connection layer: availability belongs to
+        // discovery, so the connection layer only reports the count. Demotes Available → Unavailable at the threshold.
+        void demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t consecutiveFailures);
 
         // ===== Configuration (immutable after construction) =====
         std::shared_ptr<LocalIdentity>                  selfIdentity;

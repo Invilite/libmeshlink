@@ -77,6 +77,12 @@ std::vector<uint8_t> buildFrame(uint8_t group, uint16_t subtype, const std::vect
 bool hasSameAddressSet(const std::vector<PeerAddress>& a, const std::vector<PeerAddress>& b) {
     return a.size() == b.size() && std::is_permutation(a.begin(), a.end(), b.begin());
 }
+
+// Reachability evidence: we dialed this peer and reached it at an IP its own record announces.
+bool recordAnnouncesDialedAddress(const SignedPeerRecord& record, const std::string& dialedAddress) {
+    if (dialedAddress.empty()) return false;                                        // inbound connection — no evidence about its addresses
+    return std::any_of(record.addresses.begin(), record.addresses.end(), [&](const PeerAddress& a) { return a.address == dialedAddress; });
+}
 }
 
 // ============================================================
@@ -589,6 +595,28 @@ void Network::recordConnectionAttemptFailure(const std::string& address, uint16_
     std::cerr << "Network: connection failure recorded for " << peerIdShort(matchedId)
               << " (failures=" << static_cast<int>(newFailureCount)
               << ", next attempt in " << waitDuration.count() << "s)" << std::endl;
+
+    this->demoteAfterRepeatedDialFailures(matchedId, newFailureCount);
+}
+
+void Network::demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t consecutiveFailures) {
+    if (consecutiveFailures < this->config.connectionFailuresBeforeUnavailable) return;
+
+    // Only Available is demoted: Unknown/Unavailable already belong to the probe, and a Probing peer gets its state from
+    // the probe result. The probe backoff is left as is — the probe channel stays independent of the dial channel, and a
+    // later probe success does not reset dial backoff either (a peer that accepts probes but rejects connections must not
+    // cycle Available ↔ Unavailable every few seconds).
+    bool demoted = false;
+    this->peerDirectory->mutatePeer(peerId, [&](KnownPeer& entry) {
+        if (entry.availability != AvailabilityState::Available) return;
+        entry.availability = AvailabilityState::Unavailable;
+        demoted = true;
+    });
+
+    if (demoted) {
+        std::cerr << "Network: " << peerIdShort(peerId) << " unreachable after " << static_cast<int>(consecutiveFailures)
+                  << " failed dials, handing it to the probe" << std::endl;
+    }
 }
 
 void Network::joinFinishedHandshakeWorkers() {
@@ -880,6 +908,7 @@ void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vect
         pm.peer    = peer;
         pm.subtype = subtype;
         pm.payload = std::move(payload);
+        if (peer->isOutbound()) pm.dialedAddress = peer->getConnection()->getRemoteClientAddress();
         this->messageProtocolQueue.push(std::move(pm));
     } else {
         NetworkMessage nm;
@@ -1084,13 +1113,7 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
     }
 
     // Reachability check — same logic as before, delegated to the shared upsert helper.
-    bool outboundMatch = false;
-    if (msg.peer->isOutbound() && msg.peer->getConnection()) {
-        const std::string connectedIp = msg.peer->getConnection()->getRemoteClientAddress();
-        for (const auto& addr : record.addresses) {
-            if (addr.address == connectedIp) { outboundMatch = true; break; }
-        }
-    }
+    const bool outboundMatch = recordAnnouncesDialedAddress(record, msg.dialedAddress);
 
     const PeerId peerId          = record.peerId;                                   // save before move
     const bool   shouldBroadcast = this->upsertKnownPeer(std::move(record), outboundMatch);
@@ -1309,13 +1332,7 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
         // outbound match on the actual connection IP is valid evidence of reachability.
         // For records about other peers, we have no direct evidence — outboundMatch stays false
         // until a probe verifies reachability.
-        bool outboundMatch = false;
-        if (record.peerId == senderId && msg.peer->isOutbound() && msg.peer->getConnection()) {
-            const std::string connectedIp = msg.peer->getConnection()->getRemoteClientAddress();
-            for (const auto& addr : record.addresses) {
-                if (addr.address == connectedIp) { outboundMatch = true; break; }
-            }
-        }
+        const bool outboundMatch = record.peerId == senderId && recordAnnouncesDialedAddress(record, msg.dialedAddress);
 
         const PeerId peerId          = record.peerId;                               // save before move
         const bool   shouldBroadcast = this->upsertKnownPeer(std::move(record), outboundMatch);
