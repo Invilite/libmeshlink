@@ -104,7 +104,8 @@ struct RouterMesh {
     std::vector<std::shared_ptr<DeliveryRecorder>>  recorders;
     bool                                            ready = false;
 
-    RouterMesh(size_t count, const std::vector<Edge>& edges, const std::function<void(size_t, RouterConfig&)>& adjustRouter = {}) {
+    RouterMesh(size_t count, const std::vector<Edge>& edges, const std::function<void(size_t, RouterConfig&)>& adjustRouter = {},
+               const std::function<void(NetworkConfig&)>& adjustNetwork = {}) {
         std::vector<uint16_t> outDegree(count, 0);
         std::vector<size_t>   degree(count, 0);
         for (const auto& [dialer, listener] : edges) { ++outDegree[dialer]; ++degree[dialer]; ++degree[listener]; }
@@ -114,6 +115,7 @@ struct RouterMesh {
                 c.connectionLimits.outbound = { .min = 0, .soft = outDegree[i], .hard = outDegree[i] };
                 c.periodicPexMinInterval = 600s;
                 c.periodicPexMaxInterval = 600s;
+                if (adjustNetwork) adjustNetwork(c);
             }));
             this->nodes.back()->network->start();
         }
@@ -1390,9 +1392,9 @@ TEST(RouterTest, PresenceIsLimitedAndCaughtUp) {
 // A node that joins later learns the way to nodes that get no new neighbor (and so send no PRESENCE): every Router answers
 // a PRESENCE with a PRESENCE_REPLY to its sender — at most once per presenceMinInterval to the same node
 TEST(RouterTest, LateJoinerLearnsTheWayToEveryone) {
-    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& config) { config.announcePresence = true; });
+    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 0ms; });
     ASSERT_TRUE(mesh.ready);
-    ASSERT_TRUE(waitUntil([&] { return mesh.routers[2]->getRouteCandidates(mesh.id(0)).size() == 1; }, 5s));
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().presenceRepliesSent == 2; }, 5s));   // to nodes 1 and 2
     const uint64_t repliesBefore = mesh.routers[0]->getStatistics().presenceRepliesSent;
 
     TestNode gamma(mesh.secret, "gamma");
@@ -1406,4 +1408,38 @@ TEST(RouterTest, LateJoinerLearnsTheWayToEveryone) {
     for (size_t i = 0; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->total(), 0u) << "node " << i;
     gammaRouter.stop();
     gamma.network->stop();
+}
+
+// Review PRESENCE I1: the answers to a joiner's PRESENCE come from nodes whose records it mostly lacks, so they wait for
+// those records — in a bounded queue per neighbor. Answers spread over time get through that queue; a burst would be
+// dropped, and each replier would not answer again for a whole interval
+TEST(RouterTest, LateJoinerLearnsEveryoneThroughASmallVerificationQueue) {
+    RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 1500ms; },
+                    [](NetworkConfig& config) { config.initialPexBatchSize = 0; });  // no gossip: the joiner knows only its neighbor's record
+    ASSERT_TRUE(mesh.ready);
+
+    TestNode gamma(mesh.secret, "gamma");
+    gamma.network->start();
+    gamma.network->connectToPeer("127.0.0.1", mesh.nodes[4]->port);
+    RouterConfig joinerConfig;
+    joinerConfig.pendingVerificationPerNeighbor = 1;
+    Router gammaRouter(*gamma.network, gamma.directory, gamma.identity, joinerConfig);
+    gammaRouter.start();
+    EXPECT_TRUE(waitUntil([&] {
+        for (size_t i = 0; i < 5; ++i) if (gammaRouter.getRouteCandidates(mesh.id(i)).empty()) return false;
+        return true;
+    }, 8s));
+    gammaRouter.stop();
+    gamma.network->stop();
+}
+
+// Review PRESENCE I2: one node's answers together are budgeted — the rest wait for the next second, none is lost
+TEST(RouterTest, PresenceRepliesAreBudgetedPerSecond) {
+    RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) {
+        config.announcePresence = true; config.presenceReplySpread = 0ms; config.presenceRepliesPerSecond = 1;
+    });
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getRouteCandidates(mesh.id(4)).size() == 1; }, 5s));   // the PRESENCEs have arrived
+    EXPECT_LE(mesh.routers[0]->getStatistics().presenceRepliesSent, 2u);
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().presenceRepliesSent == 4; }, 8s));     // one per other node, in time
 }

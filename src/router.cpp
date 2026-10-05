@@ -28,6 +28,12 @@ namespace {
         return id;
     }
 
+    // Uniform in [0, max] — spreads answers in time; not security-relevant
+    std::chrono::milliseconds randomDelayUpTo(std::chrono::milliseconds max) {
+        if (max.count() <= 0) return std::chrono::milliseconds(0);
+        return std::chrono::milliseconds(randomMessageId() % (static_cast<uint64_t>(max.count()) + 1));
+    }
+
     // The sender's first hop does not decrement; clamped because ttlInitial 255 with ttlRemaining 0 would wrap to 0
     uint8_t hopsTraveled(const RoutedMessage& message) {
         return static_cast<uint8_t>(std::min(message.ttlInitial - message.ttlRemaining + 1, 255));
@@ -134,6 +140,7 @@ void Router::start() {
         this->presencePending = !this->neighbors.empty() && this->config.announcePresence && this->config.broadcastTtl > 0;
         this->lastPresenceAt.reset();
         this->presenceRepliedAt.clear();
+        this->scheduledPresenceReplies.clear();
     }
 
     this->routerThread = std::thread(&Router::routerLoop, this);
@@ -277,6 +284,7 @@ void Router::routerLoop() {
             this->nextPendingRetryAt = std::chrono::steady_clock::now() + PENDING_RETRY_INTERVAL;
         }
         this->announcePresenceWhenDue(std::chrono::steady_clock::now());
+        this->sendDuePresenceReplies(std::chrono::steady_clock::now());
     }
 }
 
@@ -285,25 +293,55 @@ void Router::routerLoop() {
 // broadcast. At most once per presenceMinInterval; a neighbor arriving inside the interval is caught up when it ends, so
 // a later part of the network learns of us too.
 // A PRESENCE teaches us the way to its sender; our answer teaches the sender the way back to us — a node joining later
-// learns of nodes that get no new neighbor (and so send no PRESENCE). Over the route just learned, never by flooding; at
-// most once per presenceMinInterval to the same node.
+// learns of nodes that get no new neighbor (and so send no PRESENCE). At most once per presenceMinInterval to the same
+// node. Every node answers the same PRESENCE, so the answer waits a random part of presenceReplySpread: a joiner, which
+// lacks most answerers' records, verifies them through a small queue per neighbor — a burst would overflow it, and the
+// lost answers would not come again for a whole interval (review PRESENCE I1).
 void Router::answerPresence(const PeerId& sender) {
     const auto now = std::chrono::steady_clock::now();
-    if (this->presenceRepliedAt.size() >= 1024) {                                    // bounded: verified records are, but keep this map small
-        std::erase_if(this->presenceRepliedAt, [&](const auto& entry) { return now - entry.second >= this->config.presenceMinInterval; });
-        if (this->presenceRepliedAt.size() >= 1024) return;
-    }
     const auto replied = this->presenceRepliedAt.find(sender);
     if (replied != this->presenceRepliedAt.end() && now - replied->second < this->config.presenceMinInterval) return;
-    if (!this->knowsWayTo(sender)) return;                                          // the route was just learned — unless its neighbor left meanwhile
+    if (this->scheduledPresenceReplies.size() >= MAX_SCHEDULED_PRESENCE_REPLIES) return;
+    for (const auto& scheduled : this->scheduledPresenceReplies) if (scheduled.second == sender) return;
+    this->scheduledPresenceReplies.emplace_back(now + randomDelayUpTo(this->config.presenceReplySpread), sender);
+}
+
+// Due answers go out within presenceRepliesPerSecond for the whole node (one PRESENCE makes every node answer — review
+// PRESENCE I2); the rest wait for the next second. Over a known way only, never by flooding.
+void Router::sendDuePresenceReplies(std::chrono::steady_clock::time_point now) {
+    if (this->scheduledPresenceReplies.empty()) return;
+    if (now - this->presenceReplyWindowStart >= std::chrono::seconds(1)) {
+        this->presenceReplyWindowStart = now;
+        this->presenceRepliesInWindow  = 0;
+    }
+    for (auto it = this->scheduledPresenceReplies.begin(); it != this->scheduledPresenceReplies.end();) {
+        if (it->first > now) { ++it; continue; }
+        if (this->presenceRepliesInWindow >= this->config.presenceRepliesPerSecond) return;   // the rest next second
+        const PeerId sender = it->second;
+        it = this->scheduledPresenceReplies.erase(it);
+        if (!this->knowsWayTo(sender)) continue;                                    // its route ended meanwhile
+        ++this->presenceRepliesInWindow;
+        this->rememberPresenceReply(sender, now);
+        ++this->presenceRepliesSent;
+        this->sendOwnRouterMessage(this->buildRouterMessage(sender, RouterWire::SUBTYPE_PRESENCE_REPLY, {}));
+    }
+}
+
+// Bounded: when full, expired entries go, then the oldest — a flood of senders must not lock honest joiners out (review PRESENCE M3)
+void Router::rememberPresenceReply(const PeerId& sender, std::chrono::steady_clock::time_point now) {
+    if (this->presenceRepliedAt.size() >= MAX_PRESENCE_REPLY_MEMORY && !this->presenceRepliedAt.contains(sender)) {
+        std::erase_if(this->presenceRepliedAt, [&](const auto& entry) { return now - entry.second >= this->config.presenceMinInterval; });
+        if (this->presenceRepliedAt.size() >= MAX_PRESENCE_REPLY_MEMORY) {
+            this->presenceRepliedAt.erase(std::min_element(this->presenceRepliedAt.begin(), this->presenceRepliedAt.end(), [](const auto& a, const auto& b) { return a.second < b.second; }));
+        }
+    }
     this->presenceRepliedAt[sender] = now;
-    ++this->presenceRepliesSent;
-    this->sendOwnRouterMessage(this->buildRouterMessage(sender, RouterWire::SUBTYPE_PRESENCE_REPLY, {}));
 }
 
 void Router::announcePresenceWhenDue(std::chrono::steady_clock::time_point now) {
     if (!this->presencePending || (this->lastPresenceAt && now - *this->lastPresenceAt < this->config.presenceMinInterval)) return;
     this->presencePending = false;
+    if (this->neighborsSnapshot().empty()) return;                                  // the neighbor left again: nobody to tell, the interval stays unused (M1)
     this->lastPresenceAt  = now;
 
     RoutedMessage presence;
@@ -324,10 +362,10 @@ void Router::processEvent(Event& event) {
     std::visit([this](auto& content) {
         using T = std::decay_t<decltype(content)>;
         if constexpr (std::is_same_v<T, Event::NeighborConnected>) {
-            this->presencePending = this->config.announcePresence && this->config.broadcastTtl > 0;
             this->plumtree.addLink(content.peerId);
             std::lock_guard lock(this->neighborsMutex);
-            this->neighbors.insert(content.peerId);
+            // Only a neighbor new to us: the start() seed and a queued event may name the same one (M2)
+            if (this->neighbors.insert(content.peerId).second && this->config.announcePresence && this->config.broadcastTtl > 0) this->presencePending = true;
         } else if constexpr (std::is_same_v<T, Event::NeighborDisconnected>) {
             this->unknownModeReportedAt.erase(content.peerId);
             this->unicastAcksByNeighbor.erase(content.peerId);

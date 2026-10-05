@@ -53,6 +53,8 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   routeErrorInterval      = std::chrono::seconds(1);    // at most one ROUTE_ERROR per neighbor whose messages got stuck here
         bool                        announcePresence        = true;                 // PRESENCE on new neighbors; off only for tests that count traffic
         std::chrono::milliseconds   presenceMinInterval     = std::chrono::seconds(60);   // at most one PRESENCE per interval; a later new neighbor is caught up
+        std::chrono::milliseconds   presenceReplySpread     = std::chrono::seconds(5);    // PRESENCE_REPLY after a random delay up to this: a joiner gets answers spread out
+        size_t                      presenceRepliesPerSecond = 20;                  // all PRESENCE_REPLYs of this node together; more wait for the next second
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -187,6 +189,8 @@ namespace invilite::Mesh {
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
         void announcePresenceWhenDue(std::chrono::steady_clock::time_point now);
         void answerPresence(const PeerId& sender);
+        void sendDuePresenceReplies(std::chrono::steady_clock::time_point now);
+        void rememberPresenceReply(const PeerId& sender, std::chrono::steady_clock::time_point now);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
         void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
@@ -215,7 +219,12 @@ namespace invilite::Mesh {
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
         bool                                        presencePending = false;        // a neighbor appeared since our last PRESENCE
         std::optional<std::chrono::steady_clock::time_point> lastPresenceAt;
+        static constexpr size_t MAX_PRESENCE_REPLY_MEMORY      = 1024;
+        static constexpr size_t MAX_SCHEDULED_PRESENCE_REPLIES = 1024;
         std::unordered_map<PeerId, std::chrono::steady_clock::time_point, PeerIDHash> presenceRepliedAt;   // last PRESENCE_REPLY per node
+        std::vector<std::pair<std::chrono::steady_clock::time_point, PeerId>> scheduledPresenceReplies;   // (due, sender)
+        std::chrono::steady_clock::time_point       presenceReplyWindowStart{};
+        size_t                                      presenceRepliesInWindow = 0;
         // Our messages waiting for answers (ACK_REQUESTED, route probes): by msgId, and in send order for expiry
         struct AwaitedReply {
             std::chrono::steady_clock::time_point   sentAt;
