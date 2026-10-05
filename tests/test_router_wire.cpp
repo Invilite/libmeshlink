@@ -557,3 +557,17 @@ TEST(RouterWireTest, ControlDecodersRequireExactLength) {
     reportPayload.push_back(0);
     EXPECT_FALSE(RouterWire::decodeUnknownDeliveryMode(reportPayload, report));
 }
+
+TEST(RouterWireTest, EncodedSizeMatchesEncode) {
+    const auto sender = LocalIdentity::generate();
+    for (const RoutingMode mode : ALL_MODES) {
+        for (const Content content : ALL_CONTENTS) {
+            if (RouterWire::reachesEveryNode(mode) && content != Content::Data) continue;
+            for (const bool withExtensions : { false, true }) {
+                RoutedMessage m = makeMessage(sender, mode, content);
+                if (withExtensions) m.extensions = { { 0x05, { 1, 2, 3 } }, { RouterWire::EXTENSION_SENT_TO, {} } };
+                EXPECT_EQ(RouterWire::encodedSize(m), RouterWire::encode(m).size()) << "mode " << int(mode) << " content " << int(content);
+            }
+        }
+    }
+}

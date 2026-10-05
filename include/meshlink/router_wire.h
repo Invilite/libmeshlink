@@ -159,6 +159,9 @@ namespace invilite::Mesh {
         // Group / Subtype without a routing header, unknown mode, Router message in FLOOD / BROADCAST, source-route index past the route).
         std::vector<uint8_t> encode(const RoutedMessage& message);
 
+        // Size of encode(message) without building it (for memory accounting); meaningful for encodable messages only
+        size_t encodedSize(const RoutedMessage& message);
+
         // Decode and validate a received message. Network has already split off Group and Subtype, so they come
         // separately and `body` starts at the routing header. sentAt must lie within now ± maxClockSkew.
         // On failure `out` is unspecified — do not use it — except UnknownMode, where the fixed header is filled in.

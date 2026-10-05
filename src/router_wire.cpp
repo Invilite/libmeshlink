@@ -193,6 +193,14 @@ bool requiresSignature(uint8_t group, RoutingMode mode) {
     return reachesEveryNode(mode) || group == ROUTER_PROTOCOL_GROUP;
 }
 
+size_t encodedSize(const RoutedMessage& message) {
+    size_t size = 3 + FIXED_HEADER_SIZE + message.signature.size() + message.payload.size();
+    if (message.destination) size += PEER_ID_SIZE;
+    if (message.sourceRoute) size += 2 + message.sourceRoute->hops.size() * PEER_ID_SIZE;
+    if (!message.extensions.empty()) size += 2 + extensionsBlockLength(message);
+    return size;
+}
+
 std::vector<uint8_t> encode(const RoutedMessage& message) {
     if (!isEncodable(message)) return {};
 
