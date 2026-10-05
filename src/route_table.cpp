@@ -37,7 +37,9 @@ void RouteTable::learn(const PeerId& destination, const PeerId& via, uint8_t hop
     auto& candidates = found->second.candidates;
     const auto existing = std::find_if(candidates.begin(), candidates.end(), [&](const RouteCandidate& c) { return c.via == via; });
     if (existing != candidates.end()) {
-        existing->hops            = hops;                                           // newer data replaces
+        // Newer data replaces — except that a broadcast's hop count (unsigned, a relay can lower it) never rewrites an
+        // ACK-confirmed candidate (review R-5 M1)
+        if (evidence == RouteEvidence::Ack || existing->evidence != RouteEvidence::Ack) existing->hops = hops;
         existing->lastConfirmedAt = now;
         if (evidence == RouteEvidence::Ack) existing->evidence = RouteEvidence::Ack;
         if (rtt) existing->rtt = existing->rtt ? smoothed(*existing->rtt, *rtt) : *rtt;

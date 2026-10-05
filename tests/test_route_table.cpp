@@ -34,7 +34,7 @@ TEST(RouteTableTest, AckConfirmedRouteComesFirstAndStaysConfirmed) {
     const auto candidates = table.candidates(DEST);
     EXPECT_EQ(candidates.front().via, B);
     EXPECT_EQ(candidates.front().evidence, RouteEvidence::Ack);
-    EXPECT_EQ(candidates.front().hops, 4);                                                    // replaced
+    EXPECT_EQ(candidates.front().hops, 5);                                                    // the broadcast's unsigned hop count does not rewrite a confirmed one (M1)
     EXPECT_EQ(candidates.front().lastConfirmedAt, T0 + 1s);
 }
 
@@ -89,4 +89,18 @@ TEST(RouteTableTest, FullTableDropsTheLeastRecentlyHeardDestination) {
     EXPECT_TRUE(table.nextHops(peerId(2)).empty());
     EXPECT_FALSE(table.nextHops(peerId(1)).empty());
     EXPECT_FALSE(table.nextHops(peerId(3)).empty());
+}
+
+// Review R-5 M1: the hop count of a broadcast is unsigned (a relay can lower it); it must not rewrite what an ACK confirmed
+TEST(RouteTableTest, BroadcastDoesNotRewriteHopsOfAckConfirmedRoute) {
+    RouteTable table;
+    table.learn(DEST, A, 3, RouteEvidence::Ack, T0, 40ms);
+    table.learn(DEST, A, 1, RouteEvidence::Broadcast, T0 + 1s);
+    const auto candidates = table.candidates(DEST);
+    ASSERT_EQ(candidates.size(), 1u);
+    EXPECT_EQ(candidates[0].hops, 3);
+    EXPECT_EQ(candidates[0].evidence, RouteEvidence::Ack);
+
+    table.learn(DEST, A, 2, RouteEvidence::Ack, T0 + 2s, 40ms);                                // a newer ACK does update it
+    EXPECT_EQ(table.candidates(DEST)[0].hops, 2);
 }
