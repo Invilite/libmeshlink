@@ -612,7 +612,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
 
     const Transport::ConnectError connectResult = client.connect(address, port, std::chrono::seconds(OUTBOUND_CONNECT_TIMEOUT));
     if (connectResult != Transport::ConnectError::None) {
-        this->log.format(LogLevel::Warning, "outgoing connect to {}:{} failed: {}", address, port, Transport::connectErrorName(connectResult));
+        result.failure = std::format("connect failed: {}", Transport::connectErrorName(connectResult));
         return result;                                                              // verification defaults to ConnectionError
     }
 
@@ -633,14 +633,14 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     }
 
     if (connection->initHandshake() != 0) {
-        this->log.format(LogLevel::Warning, "outgoing transport handshake to {}:{} could not start", address, port);
+        result.failure = "transport handshake could not start";
         connection->close();
         return result;
     }
 
     const int handshakeResult = connection->waitForHandshake();
     if (handshakeResult < 0) {
-        this->log.format(LogLevel::Warning, "outgoing transport handshake with {}:{} failed, code={}", address, port, handshakeResult);
+        result.failure = std::format("transport handshake failed, code={}", handshakeResult);
         connection->close();
         return result;
     }
@@ -654,7 +654,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     );
 
     if (verification.result != VerificationResult::Success) {
-        this->log.format(LogLevel::Warning, "outgoing identity verification with {}:{} failed: {} at {}", address, port, verificationResultName(verification.result), verificationStepName(verification.failedAt));
+        result.failure = std::format("identity verification failed: {} at {}", verificationResultName(verification.result), verificationStepName(verification.failedAt));
         connection->close();
         result.verification = verification.result;
         return result;
@@ -676,6 +676,7 @@ void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, Connectio
     for (const PeerAddress& address : addresses) {
         result = this->establishOutboundConnection(address.address, address.port, IdentityFlags{});
         if (result.verification == VerificationResult::Success) break;
+        if (!result.failure.empty()) this->log.format(LogLevel::Warning, "outgoing connect to {}:{} failed: {}", address.address, address.port, result.failure);
     }
 
     if (result.verification != VerificationResult::Success) {
@@ -1549,11 +1550,12 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
         for (const auto& peer : this->activePeersSnapshot()) connected.push_back(peer->getPeerId());
         const auto victim = chooseEvictionVictim(this->peerDirectory->listPeers(), connected, outboundMatch);
         if (!victim) {
-            this->log.format(LogLevel::Warning, "address book full, dropping record {}", peerIdShort(peerId));
+            // Node-wide condition a neighbor can trigger with freshly minted identities: one line per window, not one per record
+            this->log.formatRateLimited(this->managementThreadLogLimiter, "address book full", LogLevel::Warning, "address book full, dropping record {}", peerIdShort(peerId));
             return false;
         }
         this->peerDirectory->removePeer(*victim);
-        this->log.format(LogLevel::Warning, "address book full, evicted {} for {}", peerIdShort(*victim), peerIdShort(peerId));
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "address book full", LogLevel::Warning, "address book full, evicted {} for {}", peerIdShort(*victim), peerIdShort(peerId));
     }
 
     this->peerDirectory->upsertPeer(peerId, [&](KnownPeer& entry, bool isNewEntry) {
@@ -1946,7 +1948,7 @@ void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses
         OutboundConnectionResult result = this->establishOutboundConnection(address, port, flags);
 
         if (result.verification != VerificationResult::Success) {
-            this->log.format(LogLevel::Info, "probe to {} at {}:{} failed during handshake: {}", peerIdShort(expected), address, port, verificationResultName(result.verification));
+            this->log.format(LogLevel::Info, "probe to {} at {}:{} failed: {}", peerIdShort(expected), address, port, result.failure.empty() ? verificationResultName(result.verification) : result.failure);
         } else if (result.remoteIdentity.getPeerId() != expected) {
             // Someone else on that address — don't trust the address for the expected peer.
             // We don't record anything for the actual remote: our probe flag caused it to close without

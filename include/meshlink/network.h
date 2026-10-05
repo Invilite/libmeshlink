@@ -218,6 +218,7 @@ namespace invilite::Mesh {
             std::shared_ptr<Connection>  connection;
             PeerIdentity                 remoteIdentity;
             IdentityFlags                remoteFlags;
+            std::string                  failure;                                       // why the attempt failed; logged by the caller at its own level (dial: Warning, probe: Info)
         };
 
         // Perform TCP connect + transport handshake + identity verification as initiator.

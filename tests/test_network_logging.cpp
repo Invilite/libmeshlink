@@ -53,3 +53,40 @@ TEST(NetworkLoggingTest, ListenFailureNamesTheCause) {
     EXPECT_EQ(sink->countContaining(LogLevel::Critical, "bind"), 1u);
     first.network->stop();
 }
+
+// Probes target peers of unknown or lost reachability, so failing is their normal outcome: Info, never a Warning stream
+TEST(NetworkLoggingTest, ProbeFailureIsNotAWarning) {
+    auto sink   = std::make_shared<CollectingLogSink>();
+    auto secret = makeSecret();
+    TestNode node(secret, "prober", {}, std::make_shared<Logger>(sink, LogLevel::Info));
+    const auto ghost  = LocalIdentity::generate();
+    const auto record = makeSignedRecord(ghost, { ipv4("127.0.0.1", pickUnusedPort()) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; });
+    node.network->start();
+
+    EXPECT_TRUE(waitUntil([&] { return sink->countContaining(LogLevel::Info, "probe to") > 0; }, 3s));
+    node.network->stop();
+    EXPECT_EQ(sink->countAtLevel(LogLevel::Warning), 0u);
+}
+
+// A neighbor can mint identities for free: a full address book dropping 30 gossiped records logs once, not 30 times
+TEST(NetworkLoggingTest, FullAddressBookLogsOncePerWindow) {
+    auto sink   = std::make_shared<CollectingLogSink>();
+    auto secret = makeSecret();
+    TestNode bounded(secret, "bounded", [](NetworkConfig& config) { config.maxKnownPeers = 1; }, std::make_shared<Logger>(sink, LogLevel::Info));
+    TestNode gossiper(secret, "gossiper", [](NetworkConfig& config) { config.initialPexBatchSize = 30; });
+    for (int i = 0; i < 30; ++i) {
+        const auto someone = LocalIdentity::generate();
+        const auto record  = makeSignedRecord(someone, { ipv4("127.0.0.1", static_cast<uint16_t>(20000 + i)) }, std::chrono::system_clock::now());
+        gossiper.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; entry.hasEverConnected = true; });
+    }
+    bounded.network->start();
+    gossiper.network->start();
+    bounded.network->connectToPeer("127.0.0.1", gossiper.port);
+
+    ASSERT_TRUE(waitUntil([&] { return sink->countContaining(LogLevel::Warning, "address book full") > 0; }, 5s));
+    std::this_thread::sleep_for(500ms);                                              // the whole PEX batch is processed
+    EXPECT_EQ(sink->countContaining(LogLevel::Warning, "address book full"), 1u);
+    bounded.network->stop();
+    gossiper.network->stop();
+}
