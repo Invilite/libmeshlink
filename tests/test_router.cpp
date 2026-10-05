@@ -1085,3 +1085,38 @@ TEST(RouterTest, RecordRouteRefusesOwnNode) {
     ASSERT_TRUE(mesh.ready);
     EXPECT_FALSE(mesh.routers[0]->recordRoute(mesh.id(0)).has_value());
 }
+
+// Holds every message on Network's Dispatch thread for a while: the disconnect event (sent from the I/O thread) overtakes it
+struct DelayingListener : NetworkEventListener {
+    void onMessageReceived(const NetworkMessage&) override { std::this_thread::sleep_for(500ms); }
+};
+
+// Review R-5 I1: routes end with their neighbor and never expire, so a message processed after its neighbor left must not
+// bring a route through that neighbor back
+TEST(RouterTest, MessageArrivingAfterDisconnectTeachesNoRoute) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+    alpha.network->start();
+    beta.network->start();
+    beta.network->connectToPeer("127.0.0.1", alpha.port);
+    ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
+
+    alpha.network->addListener(std::make_shared<DelayingListener>());              // registered before the Router: runs first
+    Router alphaRouter(*alpha.network, alpha.directory, alpha.identity);
+    Router betaRouter(*beta.network, beta.directory, beta.identity);
+    alphaRouter.start();
+    betaRouter.start();
+    ASSERT_TRUE(waitUntil([&] { return alphaRouter.getNeighbors().size() == 1 && betaRouter.getNeighbors().size() == 1; }, 5s));
+
+    ASSERT_TRUE(betaRouter.broadcast(0x10, 0, { 'g' }).has_value());
+    std::this_thread::sleep_for(50ms);                                             // the frame leaves before GOODBYE
+    betaRouter.stop();
+    beta.network->stop();
+
+    ASSERT_TRUE(waitUntil([&] { return alphaRouter.getNeighbors().empty(); }, 5s));
+    std::this_thread::sleep_for(1s);                                               // the delayed broadcast reaches the Router
+    EXPECT_TRUE(alphaRouter.getRouteCandidates(beta.identity->getPeerId()).empty());
+    alphaRouter.stop();
+    alpha.network->stop();
+}

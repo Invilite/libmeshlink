@@ -146,6 +146,7 @@ namespace invilite::Mesh {
         void sendRouteReport(const RoutedMessage& probe);
         [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const;
         void sendOwnRouterMessage(const RoutedMessage& message);
+        void learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt = std::nullopt);
         void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee);   // nullopt: every node answers (broadcast)
         [[nodiscard]] std::optional<std::chrono::milliseconds> acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer);
         void dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now);

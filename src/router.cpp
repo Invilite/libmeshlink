@@ -246,7 +246,7 @@ void Router::processEvent(Event& event) {
         } else if constexpr (std::is_same_v<T, Event::FrameReceived>) {
             // Until the Dispatch thread goes (C6), messages travel a different thread than disconnects: a message from a
             // neighbor may arrive after its disconnect event. It was still received from a verified neighbor, so it is
-            // processed normally — only replies to that neighbor will fail.
+            // processed normally — only replies to that neighbor will fail, and it teaches no route (learnRoute).
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
         } else if (RouterWire::reachesEveryNode(content.message.mode)) {
@@ -449,11 +449,8 @@ void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, st
 }
 
 void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom) {
-    {
-        // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
-        std::lock_guard lock(this->routesMutex);
-        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
-    }
+    // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
+    this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
     this->deliverLocally(message, true);                                            // signature checked
     if (message.ackRequested) this->sendAck(message);                               // every node is an addressee
     this->spreadNewMessage(message, receivedFrom);
@@ -470,12 +467,9 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
         if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) this->sendRouteReport(message);
         return;                                                                     // ROUTE_ERROR (R-6), unknown: nothing yet
     }
-    if (isAnswer) {
-        // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee
-        // over us — broadcast-grade evidence, or a relay replaying ACKs would look confirmed (review R-5 I2, D5)
-        std::lock_guard lock(this->routesMutex);
-        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
-    }
+    // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee
+    // over us — broadcast-grade evidence, or a relay replaying ACKs would look confirmed (review R-5 I2, D5)
+    if (isAnswer) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
     if (message.ttlRemaining <= 1) return;
     message.ttlRemaining -= 1;
     if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) {
@@ -492,13 +486,9 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
 void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom) {
     AckPayload payload;
     RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
-    const auto now = std::chrono::steady_clock::now();
     const auto rtt = this->acceptAnswer(payload.acknowledgedMsgId, ack.sender);
-    {
-        // A round trip we asked for confirms the route; an unsolicited ACK teaches it like a broadcast
-        std::lock_guard lock(this->routesMutex);
-        this->routes.learn(ack.sender, receivedFrom, hopsTraveled(ack), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, now, rtt);
-    }
+    // A round trip we asked for confirms the route; an unsolicited ACK teaches it like a broadcast
+    this->learnRoute(ack.sender, receivedFrom, hopsTraveled(ack), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, rtt);
     if (!rtt) return;                                                               // not asked for, not from the addressee, a repeat or too late
 
     const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
@@ -509,10 +499,7 @@ void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& 
     RouteReportPayload payload;
     RouterWire::decodeRouteReportPayload(report.payload, payload);                 // shape checked by decode
     const auto rtt = this->acceptAnswer(payload.probeMsgId, report.sender);
-    {
-        std::lock_guard lock(this->routesMutex);                                    // a round trip that worked, like an ACK
-        this->routes.learn(report.sender, receivedFrom, hopsTraveled(report), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, std::chrono::steady_clock::now(), rtt);
-    }
+    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, rtt);   // a round trip that worked, like an ACK
     if (!rtt) return;                                                               // not our probe, not from the probed node, a repeat or too late
     const RouteReport event{ report.sender, payload.probeMsgId, std::move(payload.hops), payload.receivedOffsetMs, *rtt };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteReported(event); }, "onRouteReported");
@@ -552,6 +539,18 @@ RoutedMessage Router::buildRouterMessage(const PeerId& destination, uint16_t sub
 void Router::sendOwnRouterMessage(const RoutedMessage& message) {
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
     this->forwardUnicast(message, std::nullopt);
+}
+
+// Routes end only with their neighbor (no expiry). Until the Dispatch thread goes (C6) a message may be processed after
+// its neighbor's disconnect — it must not bring a route through that neighbor back (review R-5 I1). The Router thread is
+// the only writer of both sets, so the check cannot go stale before the insert.
+void Router::learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt) {
+    {
+        std::lock_guard lock(this->neighborsMutex);
+        if (!this->neighbors.contains(via)) return;
+    }
+    std::lock_guard lock(this->routesMutex);
+    this->routes.learn(destination, via, hops, evidence, std::chrono::steady_clock::now(), rtt);
 }
 
 void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee) {
