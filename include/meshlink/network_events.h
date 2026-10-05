@@ -22,14 +22,14 @@ namespace invilite::Mesh {
 // Observer interface for Network lifecycle and message events.
 //
 // Threading contract:
-//   - onPeerConnected / onPeerDisconnected fire on Network's I/O thread.
-//   - onMessageReceived fires on Network's Dispatch thread.
-//   - Listeners MUST be fast and non-blocking. The expected pattern is to enqueue the
-//     event into the listener's own thread-safe queue and return immediately. Long-running
-//     work (signature verification, decryption, business logic) belongs in the listener's
+//   - All three events fire on Network's I/O thread, so a listener sees each peer's events in the order they happened:
+//     connected, its messages, disconnected — never a message after the disconnect.
+//   - Listeners MUST be fast and non-blocking: the I/O thread serves every peer, so a slow listener stalls the whole
+//     node. The expected pattern is to enqueue the event into the listener's own thread-safe queue and return
+//     immediately. Long-running work (signature verification, decryption, business logic) belongs in the listener's
 //     own thread.
-//   - Listeners MUST NOT call back into Network methods that would acquire the same locks
-//     transitively (no defined cases today, but keep work minimal).
+//   - Listeners may call sendToPeer, getters and addListener / removeListener, but never Network::stop(): it joins the
+//     I/O thread the listener runs on.
 //
 // All methods have empty default implementations — listeners override only the events
 // they care about.

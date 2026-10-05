@@ -1105,14 +1105,10 @@ TEST(RouterTest, RecordRouteRefusesOwnNode) {
     EXPECT_FALSE(mesh.routers[0]->recordRoute(mesh.id(0)).has_value());
 }
 
-// Holds every message on Network's Dispatch thread for a while: the disconnect event (sent from the I/O thread) overtakes it
-struct DelayingListener : NetworkEventListener {
-    void onMessageReceived(const NetworkMessage&) override { std::this_thread::sleep_for(500ms); }
-};
-
-// Review R-5 I1: routes end with their neighbor and never expire, so a message processed after its neighbor left must not
-// bring a route through that neighbor back
-TEST(RouterTest, MessageArrivingAfterDisconnectTeachesNoRoute) {
+// Routes end only with their neighbor and never expire. A broadcast parked for its sender's record can be accepted after
+// the neighbor that handed it over has left (here: alpha forgets beta's record and gets it back only after beta is
+// gone) — it must not bring a route through that neighbor back
+TEST(RouterTest, MessageAcceptedAfterItsNeighborLeftTeachesNoRoute) {
     const auto secret = makeSecret();
     TestNode alpha(secret, "alpha");
     TestNode beta(secret, "beta");
@@ -1121,20 +1117,29 @@ TEST(RouterTest, MessageArrivingAfterDisconnectTeachesNoRoute) {
     beta.network->connectToPeer("127.0.0.1", alpha.port);
     ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
 
-    alpha.network->addListener(std::make_shared<DelayingListener>());              // registered before the Router: runs first
-    Router alphaRouter(*alpha.network, alpha.directory, alpha.identity);
-    Router betaRouter(*beta.network, beta.directory, beta.identity);
+    RouterConfig quiet;
+    quiet.announcePresence = false;
+    quiet.unknownSenderWait = 30s;                                                   // the parked broadcast outlives beta's shutdown, however slow
+    Router alphaRouter(*alpha.network, alpha.directory, alpha.identity, quiet);
+    Router betaRouter(*beta.network, beta.directory, beta.identity, quiet);
+    const auto deliveries = std::make_shared<DeliveryRecorder>();
+    alphaRouter.addListener(deliveries);
     alphaRouter.start();
     betaRouter.start();
     ASSERT_TRUE(waitUntil([&] { return alphaRouter.getNeighbors().size() == 1 && betaRouter.getNeighbors().size() == 1; }, 5s));
 
-    ASSERT_TRUE(betaRouter.broadcast(0x10, 0, { 'g' }).has_value());
-    std::this_thread::sleep_for(50ms);                                             // the frame leaves before GOODBYE
+    ASSERT_TRUE(waitUntil([&] { return alpha.directory->findPeer(beta.identity->getPeerId()).has_value(); }, 5s));
+    const auto betaRecord = alpha.directory->findPeer(beta.identity->getPeerId());
+    alpha.directory->removePeer(beta.identity->getPeerId());                         // beta's broadcast now waits for its record
+    const auto broadcastId = betaRouter.broadcast(0x10, 0, { 'g' });
+    ASSERT_TRUE(broadcastId.has_value());
+    ASSERT_TRUE(waitUntil([&] { return betaRouter.getStatistics().fullMessagesSent >= 1; }, 3s));   // on its way before beta leaves
     betaRouter.stop();
     beta.network->stop();
 
     ASSERT_TRUE(waitUntil([&] { return alphaRouter.getNeighbors().empty(); }, 5s));
-    std::this_thread::sleep_for(1s);                                               // the delayed broadcast reaches the Router
+    alpha.directory->upsertPeer(beta.identity->getPeerId(), [&](KnownPeer& entry, bool) { entry = *betaRecord; });
+    ASSERT_TRUE(waitUntil([&] { return deliveries->countOf(beta.identity->getPeerId(), *broadcastId) == 1; }, 3s)) << "the parked broadcast was never accepted";
     EXPECT_TRUE(alphaRouter.getRouteCandidates(beta.identity->getPeerId()).empty());
     alphaRouter.stop();
     alpha.network->stop();

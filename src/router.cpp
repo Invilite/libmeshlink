@@ -382,9 +382,6 @@ void Router::processEvent(Event& event) {
             // Fast repair (docs/router.md 4.3): an eager link is gone, ask every lazy one for full copies again
             for (const PeerId& lazyLink : this->plumtree.removeLink(content.peerId)) this->sendGraft(lazyLink, {});
         } else if constexpr (std::is_same_v<T, Event::FrameReceived>) {
-            // Until the Dispatch thread goes (C6), messages travel a different thread than disconnects: a message from a
-            // neighbor may arrive after its disconnect event. It was still received from a verified neighbor, so it is
-            // processed normally — only replies to that neighbor will fail, and it teaches no route (learnRoute).
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
         } else if (RouterWire::reachesEveryNode(content.message.mode)) {
@@ -775,8 +772,8 @@ void Router::sendOwnRouterMessage(const RoutedMessage& message) {
     else                                     this->forwardUnicast(message, std::nullopt);
 }
 
-// Routes end only with their neighbor (no expiry). Until the Dispatch thread goes (C6) a message may be processed after
-// its neighbor's disconnect — it must not bring a route through that neighbor back (review R-5 I1). The Router thread is
+// Routes end only with their neighbor (no expiry). A message parked for its sender's record may be accepted after the
+// neighbor that handed it over has left — it must not bring a route through that neighbor back. The Router thread is
 // the only writer of both sets, so the check cannot go stale before the insert.
 void Router::learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt) {
     {

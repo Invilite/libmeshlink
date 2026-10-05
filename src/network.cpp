@@ -181,7 +181,6 @@ void Network::start() {
 
     // Queues and the worker list are closed by stop(); open them again so a restarted Network does not spin on them
     this->messageProtocolQueue.reopen();
-    this->routerMessageQueue.reopen();
     this->peerLifecycleEvents.reopen();
     {
         std::lock_guard lock(this->handshakeWorkersMutex);
@@ -232,9 +231,6 @@ void Network::start() {
         this->log.format(LogLevel::Notice, "listening on {}:{}", this->config.listenAddress, this->config.listenPort);
     }
 
-    this->dispatchThread = std::thread(&Network::dispatchLoop, this);
-    Transport::Platform::setThreadName(this->dispatchThread, "EventDispatcher");
-
     this->managementThread = std::thread(&Network::managementLoop, this);
     Transport::Platform::setThreadName(this->managementThread, "PeerManager");
 
@@ -273,13 +269,11 @@ void Network::stop() {
 
     if (this->ioThread.joinable()) this->ioThread.join();
 
-    // Now wake Management and Dispatch — I/O no longer produces messages
+    // Now wake Management — I/O no longer produces messages
     this->messageProtocolQueue.shutdown();
-    this->routerMessageQueue.shutdown();
     this->peerLifecycleEvents.shutdown();
 
     if (this->managementThread.joinable()) this->managementThread.join();
-    if (this->dispatchThread.joinable())   this->dispatchThread.join();
 
     for (auto& worker : this->probeWorkers) {                                       // management thread has exited — safe to touch
         if (worker->thread.joinable()) worker->thread.join();
@@ -1025,6 +1019,10 @@ bool Network::handleConnectionReadable(int fd, short revents) {
     size_t bytesThisRound  = 0;
 
     while (true) {
+        // A peer marked for close (a bad frame, or the management thread closing it) is not read further: nothing it
+        // still has buffered reaches listeners
+        if (!peer->isActive() && !peer->isDeparting()) return false;
+
         // Budget spent: yield to the other peers. Data still in the socket makes poll() report us again; frames already
         // in the Connection buffer are invisible to poll(), so tell the loop to come back. A terminal event is handled
         // once the buffer is drained — poll() keeps reporting it until then.
@@ -1121,7 +1119,9 @@ void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vect
         nm.group   = group;
         nm.subtype = subtype;
         nm.payload = std::move(payload);
-        this->routerMessageQueue.push(std::move(nm));
+        // Delivered on this I/O thread, like connect and disconnect: a listener sees one peer's events in the order they
+        // happened, so no message from a peer can reach it after that peer's disconnect
+        this->notifyMessageReceived(nm);
     }
 }
 
@@ -1514,20 +1514,6 @@ void Network::markRecordsAnnounced(const std::vector<PeerId>& recordIds) {
             kp.lastAnnouncedAt = now;
             ++kp.announceCount;
         });
-    }
-}
-
-// ============================================================
-// Dispatch thread — drains routerMessageQueue and notifies listeners
-// ============================================================
-
-void Network::dispatchLoop() {
-    blockSigpipeInCurrentThread();
-
-    while (this->running.load()) {
-        auto msg = this->routerMessageQueue.waitPop(std::chrono::milliseconds(100));
-        if (!msg) continue;
-        this->notifyMessageReceived(*msg);
     }
 }
 

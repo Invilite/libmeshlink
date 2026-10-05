@@ -229,7 +229,6 @@ namespace invilite::Mesh {
         // ===== Thread loops =====
         void ioLoop();
         void managementLoop();
-        void dispatchLoop();
 
         // ===== I/O thread internals =====
         void handleWakeup();
@@ -382,7 +381,6 @@ namespace invilite::Mesh {
         // ===== Threads =====
         std::thread                                      ioThread;
         std::thread                                      managementThread;
-        std::thread                                      dispatchThread;
 
         // ===== Handshake workers =====
         std::mutex                                       handshakeWorkersMutex;
@@ -399,7 +397,6 @@ namespace invilite::Mesh {
         // ===== Inter-thread queues =====
         ThreadSafeQueue<Command>                         commandQueue;                  // workers → I/O
         ThreadSafeQueue<ProtocolMessage>                 messageProtocolQueue;          // I/O → Management (0xFF protocol)
-        ThreadSafeQueue<NetworkMessage>                  routerMessageQueue;            // I/O → Dispatch (router/application layer)
         ThreadSafeQueue<PeerLifecycleEvent>              peerLifecycleEvents;           // I/O → Management (peer activated / dismissed)
 
         // ===== Event listeners =====

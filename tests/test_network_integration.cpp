@@ -425,7 +425,7 @@ struct ReceiveFairnessObserver : NetworkEventListener {
         this->stalling = true;
         std::this_thread::sleep_for(500ms);
     }
-    void onMessageReceived(const NetworkMessage& message) override {                         // dispatch thread, in I/O processing order
+    void onMessageReceived(const NetworkMessage& message) override {                         // I/O thread, in processing order
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         if (message.source == this->flooder) {
             ++this->flooderMessages;
@@ -758,7 +758,7 @@ TEST(NetworkIntegrationTest, RestartAfterStopWorks) {
     EXPECT_TRUE(waitUntil([&] { return node.network->getConnectedPeerCount() == 1 && other.knownPeer(node).has_value(); }, 5s)) << "HELLO not processed after restart";
 
     // Queues left closed still hand out items, so everything above works — but every waitPop returns at once and the
-    // management and dispatch threads spin. An idle process must stay well below one core.
+    // management thread spins. An idle process must stay well below one core.
     const auto cpuTime = [] { timespec t{}; ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t); return std::chrono::seconds(t.tv_sec) + std::chrono::nanoseconds(t.tv_nsec); };
     const auto cpuBefore = cpuTime();
     std::this_thread::sleep_for(1s);
@@ -920,5 +920,53 @@ TEST(NetworkIntegrationTest, PexRequestFetchesRecordTheNeighborHolds) {
     EXPECT_EQ(alpha.network->getConnectedPeerCount(), 1u);                                    // a request for unknown ids is no violation
 
     beta.network->stop();
+    alpha.network->stop();
+}
+
+namespace {
+
+// Records one peer's events in the order a listener sees them. The first message is held for a while: if messages
+// travelled another thread than disconnects, the disconnect would overtake the messages still behind it.
+struct PeerEventOrderRecorder : NetworkEventListener {
+    explicit PeerEventOrderRecorder(PeerId watched) : watched(watched) {}
+    void onMessageReceived(const NetworkMessage& message) override {
+        if (message.source != this->watched) return;
+        if (!this->heldFirst.exchange(true)) std::this_thread::sleep_for(300ms);
+        this->record('m');
+    }
+    void onPeerConnected(const PeerIdentity& identity) override { if (identity.getPeerId() == this->watched) this->record('c'); }
+    void onPeerDisconnected(const PeerId& peerId) override { if (peerId == this->watched) this->record('d'); }
+    std::string events() const { std::lock_guard lock(this->mutex); return this->sequence; }
+
+    PeerId              watched;
+    std::atomic<bool>   heldFirst{false};
+    mutable std::mutex  mutex;
+    std::string         sequence;
+
+private:
+    void record(char event) { std::lock_guard lock(this->mutex); this->sequence += event; }
+};
+
+} // namespace
+
+// Connects, messages and disconnects reach listeners on one thread in the order they happened: no message before the
+// peer's connect, every message it sent before leaving before its disconnect, and none after it
+TEST(NetworkIntegrationTest, PeerMessagesReachListenersBeforeItsDisconnect) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+    const auto recorder = std::make_shared<PeerEventOrderRecorder>(beta.identity->getPeerId());
+    alpha.network->addListener(recorder);
+    alpha.network->start();
+    beta.network->start();
+    beta.network->connectToPeer("127.0.0.1", alpha.port);
+    ASSERT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
+
+    for (int i = 0; i < 5; ++i) ASSERT_GT(beta.network->sendToPeer(alpha.identity->getPeerId(), applicationMessage(0x10, 16)), 0);
+    beta.network->stop();
+
+    ASSERT_TRUE(waitUntil([&] { return recorder->events().find('d') != std::string::npos; }, 5s));
+    std::this_thread::sleep_for(100ms);                                                       // anything late would show up now
+    EXPECT_EQ(recorder->events(), "cmmmmmd");
     alpha.network->stop();
 }

@@ -14,7 +14,7 @@ namespace invilite::Mesh {
     // within libmeshlink's threads, the host application's signal handling is unaffected.
     //
     // Intended to be called as the first statement of every thread body we launch
-    // (ioLoop, managementLoop, dispatchLoop, handshake workers, probe workers).
+    // (ioLoop, managementLoop, handshake workers, probe workers).
     //
     // TODO: consider centralising this via a small "start a Network thread" helper
     // once the probe worker lands — by then we'll have 5+ thread-entry points.
