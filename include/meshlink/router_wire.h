@@ -97,6 +97,34 @@ namespace invilite::Mesh {
         bool operator==(const RouteErrorPayload&) const = default;
     };
 
+    // One relay a route probe crossed: who, and when (ms after the probe was sent — clocks are synchronized, so per-hop
+    // delays are as good as the sync; the sender's round trip is exact)
+    struct RouteHop {
+        PeerId                  node{};
+        uint32_t                offsetMs = 0;
+
+        bool operator==(const RouteHop&) const = default;
+    };
+
+    // RECORD_ROUTE payload (Group 0xFE / 0x0102): sentAtMs is signed by the probe's sender; the hops are appended by
+    // relays and are not — claims of intermediaries (D5)
+    struct RecordRoutePayload {
+        uint64_t                sentAtUnixMs = 0;
+        std::vector<RouteHop>   hops;                                               // relays in order, at most 255
+
+        bool operator==(const RecordRoutePayload&) const = default;
+    };
+
+    // ROUTE_REPORT payload (Group 0xFE / 0x0103): the destination's signed account of the probe that reached it
+    struct RouteReportPayload {
+        uint64_t                probeMsgId = 0;
+        uint64_t                probeSentAtUnixMs = 0;
+        uint32_t                receivedOffsetMs = 0;                               // at the destination
+        std::vector<RouteHop>   hops;
+
+        bool operator==(const RouteReportPayload&) const = default;
+    };
+
     // UNKNOWN_DELIVERY_MODE payload: "I do not know the mode of this message and did not forward it" (neighbor-only)
     struct UnknownDeliveryModeReport {
         uint8_t                 mode = 0;                                           // the raw mode nibble we could not handle
@@ -171,6 +199,7 @@ namespace invilite::Mesh {
         // Bytes covered by the sender's Ed25519 signature:
         //   "MeshLink-Router-V1" | Group | Subtype | version+mode | flags without HAS_EXTENSIONS | ttlInitial | msgId | sentAt
         //   | sender | [destination] | [count + source-route hops] | signedExtensionsLength(2) | signed TLVs | payload
+        // — of a RECORD_ROUTE probe only the first RECORD_ROUTE_SIGNED_PREFIX bytes of the payload (relays append hops)
         // The signed-extensions length keeps the TLV / payload boundary inside the signature: without it a relay could drop
         // a signed extension and prepend its bytes to the payload without breaking the signature.
         std::vector<uint8_t> bytesToSign(const RoutedMessage& message);
@@ -178,7 +207,13 @@ namespace invilite::Mesh {
         // Ed25519 check against the sender's public key (from its SignedPeerRecord). False when the signature is absent.
         bool verifySignature(const RoutedMessage& message, std::span<const uint8_t> senderEd25519Pub);
 
-        // Payloads of the routed Router messages. Decoders require the exact length (no trailing bytes).
+        // Payloads of the routed Router messages. Decoders require the exact length (no trailing bytes); encoders return an
+        // empty vector when more than 255 hops are given.
+        constexpr size_t     RECORD_ROUTE_SIGNED_PREFIX = 8;                       // sentAtMs; the hop list after it is per-hop
+        std::vector<uint8_t> encodeRecordRoutePayload(const RecordRoutePayload& probe);
+        bool                 decodeRecordRoutePayload(std::span<const uint8_t> payload, RecordRoutePayload& out);
+        std::vector<uint8_t> encodeRouteReportPayload(const RouteReportPayload& report);
+        bool                 decodeRouteReportPayload(std::span<const uint8_t> payload, RouteReportPayload& out);
         std::vector<uint8_t> encodeAckPayload(const AckPayload& ack);
         bool                 decodeAckPayload(std::span<const uint8_t> payload, AckPayload& out);
         std::vector<uint8_t> encodeRouteErrorPayload(const RouteErrorPayload& error);

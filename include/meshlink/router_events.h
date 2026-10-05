@@ -36,6 +36,15 @@ namespace invilite::Mesh {
         uint8_t                     hopsTraveled = 0;                               // of the ACK on its way back
     };
 
+    // Answer to Router::recordRoute (diagnostics): the path the probe took and when each relay saw it
+    struct RouteReport {
+        PeerId                      destination{};
+        uint64_t                    probeMsgId = 0;
+        std::vector<RouteHop>       hops;                                           // relays in order; offsets in ms after sending (synchronized clocks)
+        uint32_t                    receivedOffsetMs = 0;                           // at the destination
+        std::chrono::milliseconds   rtt{0};                                         // probe out + report back, our clock only
+    };
+
     // Observer for Router deliveries. Callbacks fire on the Router thread, which serves every peer: listeners MUST be
     // fast and non-blocking (enqueue and return), and MUST NOT call Router::stop() (it joins the very thread running the
     // callback). Exceptions are caught per listener. Default implementations are empty.
@@ -45,6 +54,7 @@ namespace invilite::Mesh {
 
         virtual void onMessageDelivered(const RoutedDelivery& delivery) { (void)delivery; }
         virtual void onAckReceived(const AckReceipt& receipt) { (void)receipt; }
+        virtual void onRouteReported(const RouteReport& report) { (void)report; }
     };
 
 } // namespace invilite::Mesh

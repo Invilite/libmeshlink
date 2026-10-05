@@ -171,11 +171,13 @@ namespace {
     }
 
     // The payload shape of a routed Router message is part of the receive validation (3.6): a malformed ACK / ROUTE_ERROR
-    // is rejected before anyone acts on it. RECORD_ROUTE / ROUTE_REPORT get their codecs in R-5; unknown subtypes pass.
+    // is rejected before anyone acts on it. Unknown subtypes pass (a relay forwards what it does not understand).
     bool hasValidRouterMessagePayload(const RoutedMessage& message) {
         if (message.group != ROUTER_PROTOCOL_GROUP) return true;
         if (message.subtype == SUBTYPE_ACK)         { AckPayload ack;          return decodeAckPayload(message.payload, ack); }
         if (message.subtype == SUBTYPE_ROUTE_ERROR) { RouteErrorPayload error; return decodeRouteErrorPayload(message.payload, error); }
+        if (message.subtype == SUBTYPE_RECORD_ROUTE)  { RecordRoutePayload probe; return decodeRecordRoutePayload(message.payload, probe); }
+        if (message.subtype == SUBTYPE_ROUTE_REPORT)  { RouteReportPayload report; return decodeRouteReportPayload(message.payload, report); }
         return true;
     }
 }
@@ -340,7 +342,9 @@ std::vector<uint8_t> bytesToSign(const RoutedMessage& message) {
     writeBE16(out, static_cast<uint16_t>(signedExtensions.size()));
     out.insert(out.end(), signedExtensions.begin(), signedExtensions.end());
 
-    out.insert(out.end(), message.payload.begin(), message.payload.end());
+    const bool isProbe = message.group == ROUTER_PROTOCOL_GROUP && message.subtype == SUBTYPE_RECORD_ROUTE;
+    const size_t signedPayload = isProbe ? std::min(message.payload.size(), RECORD_ROUTE_SIGNED_PREFIX) : message.payload.size();
+    out.insert(out.end(), message.payload.begin(), message.payload.begin() + static_cast<std::ptrdiff_t>(signedPayload));
     return out;
 }
 
@@ -385,6 +389,63 @@ bool decodeRouteErrorPayload(std::span<const uint8_t> payload, RouteErrorPayload
     if (!reader.readUnsignedBE(8, out.stuckMsgId) || !reader.readPeerId(out.unreachableDestination) || !reader.readU8(reason)) return false;
     out.reason = static_cast<RouteErrorReason>(reason);
     return reader.remaining() == 0;
+}
+
+namespace {
+    constexpr size_t ROUTE_HOP_SIZE = PEER_ID_SIZE + 4;
+
+    void writeRouteHops(std::vector<uint8_t>& out, const std::vector<RouteHop>& hops) {
+        out.push_back(static_cast<uint8_t>(hops.size()));
+        for (const RouteHop& hop : hops) {
+            out.insert(out.end(), hop.node.begin(), hop.node.end());
+            writeBE32(out, hop.offsetMs);
+        }
+    }
+
+    // count(1) + count × hop, up to the end of the payload
+    bool readRouteHops(WireReader& reader, std::vector<RouteHop>& out) {
+        uint8_t count = 0;
+        if (!reader.readU8(count) || reader.remaining() != count * ROUTE_HOP_SIZE) return false;
+        out.resize(count);
+        for (RouteHop& hop : out) {
+            uint64_t offset = 0;
+            reader.readPeerId(hop.node);
+            reader.readUnsignedBE(4, offset);
+            hop.offsetMs = static_cast<uint32_t>(offset);
+        }
+        return true;
+    }
+}
+
+std::vector<uint8_t> encodeRecordRoutePayload(const RecordRoutePayload& probe) {
+    if (probe.hops.size() > MAX_LIST_ENTRIES) return {};
+    std::vector<uint8_t> out;
+    writeBE64(out, probe.sentAtUnixMs);
+    writeRouteHops(out, probe.hops);
+    return out;
+}
+
+bool decodeRecordRoutePayload(std::span<const uint8_t> payload, RecordRoutePayload& out) {
+    WireReader reader(payload);
+    return reader.readUnsignedBE(8, out.sentAtUnixMs) && readRouteHops(reader, out.hops);
+}
+
+std::vector<uint8_t> encodeRouteReportPayload(const RouteReportPayload& report) {
+    if (report.hops.size() > MAX_LIST_ENTRIES) return {};
+    std::vector<uint8_t> out;
+    writeBE64(out, report.probeMsgId);
+    writeBE64(out, report.probeSentAtUnixMs);
+    writeBE32(out, report.receivedOffsetMs);
+    writeRouteHops(out, report.hops);
+    return out;
+}
+
+bool decodeRouteReportPayload(std::span<const uint8_t> payload, RouteReportPayload& out) {
+    WireReader reader(payload);
+    uint64_t receivedOffset = 0;
+    if (!reader.readUnsignedBE(8, out.probeMsgId) || !reader.readUnsignedBE(8, out.probeSentAtUnixMs) || !reader.readUnsignedBE(4, receivedOffset)) return false;
+    out.receivedOffsetMs = static_cast<uint32_t>(receivedOffset);
+    return readRouteHops(reader, out.hops);
 }
 
 std::vector<uint8_t> encodeIhave(std::span<const RoutedMessageKey> keys) {

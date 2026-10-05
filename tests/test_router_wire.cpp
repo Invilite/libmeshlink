@@ -571,3 +571,62 @@ TEST(RouterWireTest, EncodedSizeMatchesEncode) {
         }
     }
 }
+
+// ── Route probe (R-5 d) ─────────────────────────────────────────────────────
+
+TEST(RouterWireTest, RouteProbeAndReportPayloadsRoundTrip) {
+    const RecordRoutePayload probe{ 1'800'000'000'123ULL, { { peerId(1), 3 }, { peerId(2), 9 } } };
+    RecordRoutePayload decodedProbe;
+    ASSERT_TRUE(RouterWire::decodeRecordRoutePayload(RouterWire::encodeRecordRoutePayload(probe), decodedProbe));
+    EXPECT_EQ(decodedProbe, probe);
+    EXPECT_EQ(RouterWire::encodeRecordRoutePayload(probe).size(), 8u + 1u + 2u * 36u);
+
+    const RouteReportPayload report{ 0xABCD, probe.sentAtUnixMs, 15, probe.hops };
+    RouteReportPayload decodedReport;
+    ASSERT_TRUE(RouterWire::decodeRouteReportPayload(RouterWire::encodeRouteReportPayload(report), decodedReport));
+    EXPECT_EQ(decodedReport, report);
+
+    auto cut = RouterWire::encodeRecordRoutePayload(probe);
+    cut.pop_back();
+    EXPECT_FALSE(RouterWire::decodeRecordRoutePayload(cut, decodedProbe));
+    auto longer = RouterWire::encodeRouteReportPayload(report);
+    longer.push_back(0);
+    EXPECT_FALSE(RouterWire::decodeRouteReportPayload(longer, decodedReport));
+    EXPECT_TRUE(RouterWire::encodeRecordRoutePayload({ 0, std::vector<RouteHop>(256) }).empty());
+}
+
+// Relays append hops to a signed probe: the sender's signature covers only the send time
+TEST(RouterWireTest, RelaysAppendingHopsKeepProbeSignature) {
+    const auto sender = LocalIdentity::generate();
+    RoutedMessage probe = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
+    probe.subtype = RouterWire::SUBTYPE_RECORD_ROUTE;
+    probe.payload = RouterWire::encodeRecordRoutePayload({ 1'800'000'000'000ULL, {} });
+    signWith(probe, sender);
+
+    RoutedMessage relayed = roundTrip(probe);
+    RecordRoutePayload hops;
+    ASSERT_TRUE(RouterWire::decodeRecordRoutePayload(relayed.payload, hops));
+    hops.hops.push_back({ peerId(0x11), 4 });
+    relayed.payload = RouterWire::encodeRecordRoutePayload(hops);
+    EXPECT_TRUE(RouterWire::verifySignature(roundTrip(relayed), sender.getEd25519Pub()));
+
+    RecordRoutePayload backdated = hops;
+    backdated.sentAtUnixMs -= 1;                                                             // the signed part
+    relayed.payload = RouterWire::encodeRecordRoutePayload(backdated);
+    EXPECT_FALSE(RouterWire::verifySignature(relayed, sender.getEd25519Pub()));
+
+    // Any other Router message is signed whole
+    RoutedMessage ack = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
+    ack.payload.push_back(0);
+    EXPECT_FALSE(RouterWire::verifySignature(ack, sender.getEd25519Pub()));
+}
+
+TEST(RouterWireTest, MalformedProbeIsRejectedOnReceive) {
+    const auto sender = LocalIdentity::generate();
+    RoutedMessage probe = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
+    probe.subtype = RouterWire::SUBTYPE_RECORD_ROUTE;
+    probe.payload = { 1, 2, 3 };                                                             // shorter than the send time
+    signWith(probe, sender);
+    RoutedMessage out;
+    EXPECT_EQ(decodeFrame(RouterWire::encode(probe), out), RoutedMessageStatus::MalformedEncoding);
+}

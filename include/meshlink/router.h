@@ -46,8 +46,8 @@ namespace invilite::Mesh {
         std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
         size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
         RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
-        std::chrono::seconds        ackWaitWindow           = std::chrono::seconds(60);   // how long our ACK_REQUESTED messages wait for ACKs
-        size_t                      maxAwaitedAcks          = 4096;                 // messages waiting at once; the oldest is given up first
+        std::chrono::seconds        replyWaitWindow         = std::chrono::seconds(60);   // how long our messages wait for ACKs / route reports
+        size_t                      maxAwaitedReplies       = 4096;                 // messages waiting at once; the oldest is given up first
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -100,6 +100,10 @@ namespace invilite::Mesh {
         // `group` is not a user group or `destination` is this node.
         std::optional<uint64_t> send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options = {});
 
+        // Diagnostics: a probe to `destination` that records every relay and its time; the answer arrives as
+        // onRouteReported. Travels as UNICAST, so it shows the path messages to that node take now.
+        std::optional<uint64_t> recordRoute(const PeerId& destination);
+
         void addListener(std::shared_ptr<RouterEventListener> listener);
         void removeListener(const std::shared_ptr<RouterEventListener>& listener);
 
@@ -135,9 +139,14 @@ namespace invilite::Mesh {
         void acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom);
         void acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom);
         void receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom);
+        void receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom);
         void sendAck(const RoutedMessage& acknowledged);
-        void awaitAcks(const RoutedMessage& message);
-        void dropExpiredAwaitedAcks(std::chrono::steady_clock::time_point now);
+        void sendRouteReport(const RoutedMessage& probe);
+        [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const;
+        void sendOwnRouterMessage(const RoutedMessage& message);
+        void awaitReply(uint64_t msgId);
+        [[nodiscard]] std::optional<std::chrono::milliseconds> roundTripOf(uint64_t awaitedMsgId) const;
+        void dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now);
         void notifyListeners(const std::function<void(RouterEventListener&)>& call, const char* event);
         void reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom);
         void sendOwnBroadcast(const RoutedMessage& message);
@@ -169,9 +178,9 @@ namespace invilite::Mesh {
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
-        // Our ACK_REQUESTED messages: send time by msgId, and the same in send order for expiry
-        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> awaitedAckSentAt;
-        std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedAckOrder;
+        // Our messages waiting for answers (ACK_REQUESTED, route probes): send time by msgId, and in send order for expiry
+        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> awaitedReplySentAt;
+        std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedReplyOrder;
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
 

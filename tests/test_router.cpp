@@ -62,9 +62,22 @@ struct DeliveryRecorder : RouterEventListener {
         return matching;
     }
 
+    void onRouteReported(const RouteReport& report) override {
+        std::lock_guard lock(this->mutex);
+        this->routeReports.push_back(report);
+    }
+
+    std::vector<RouteReport> reportsFor(uint64_t probeMsgId) const {
+        std::lock_guard lock(this->mutex);
+        std::vector<RouteReport> matching;
+        for (const auto& report : this->routeReports) if (report.probeMsgId == probeMsgId) matching.push_back(report);
+        return matching;
+    }
+
     mutable std::mutex           mutex;
     std::vector<RoutedDelivery>  deliveries;
     std::vector<AckReceipt>      acks;
+    std::vector<RouteReport>     routeReports;
 };
 
 using Edge = std::pair<size_t, size_t>;                                                       // (dialer, listener)
@@ -1000,4 +1013,57 @@ TEST(RouterTest, ForgedAckIsDropped) {
     ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), unsolicited), 0);
     std::this_thread::sleep_for(300ms);
     EXPECT_TRUE(mesh.recorders[0]->acksFor(neverSent).empty());
+}
+
+
+// ── Route probe (R-5 d) ─────────────────────────────────────────────────────
+
+TEST(RouterTest, RouteProbeRecordsEveryRelayInOrderWithTimes) {
+    RouterMesh mesh(5, lineEdges(5));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t probe = mesh.routers[0]->recordRoute(mesh.id(4)).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probe).size() == 1; }, 5s));
+    const RouteReport report = mesh.recorders[0]->reportsFor(probe).front();
+    EXPECT_EQ(report.destination, mesh.id(4));
+    ASSERT_EQ(report.hops.size(), 3u);
+    for (size_t i = 0; i < 3; ++i) EXPECT_EQ(report.hops[i].node, mesh.id(i + 1)) << "hop " << i;
+    EXPECT_LE(report.hops[0].offsetMs, report.hops[1].offsetMs);                              // one clock on this host: monotonic
+    EXPECT_LE(report.hops[2].offsetMs, report.receivedOffsetMs);
+    EXPECT_LT(report.rtt, 2s);
+
+    // Neither a delivery to applications nor an ACK
+    for (size_t i = 1; i < 5; ++i) EXPECT_EQ(mesh.recorders[i]->total(), 0u);
+    // The signed report confirmed the way to node 4, as an ACK would
+    const auto route = mesh.routers[0]->getRouteCandidates(mesh.id(4));
+    ASSERT_FALSE(route.empty());
+    EXPECT_EQ(route.front().evidence, RouteEvidence::Ack);
+}
+
+// Nobody knows node 6 yet: the probe floods locally, the first copy wins, the report shows a real path to it
+TEST(RouterTest, RouteProbeWithoutRouteFindsAPath) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t probe = mesh.routers[0]->recordRoute(mesh.id(6)).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probe).size() == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    ASSERT_EQ(mesh.recorders[0]->reportsFor(probe).size(), 1u);                               // later copies are duplicates
+
+    // Every step of node 0 → hops… → node 6 is an edge of the topology
+    const auto edges = ringWithChords();
+    auto adjacent = [&](const PeerId& a, const PeerId& b) {
+        for (const auto& [x, y] : edges) if ((mesh.id(x) == a && mesh.id(y) == b) || (mesh.id(x) == b && mesh.id(y) == a)) return true;
+        return false;
+    };
+    const RouteReport report = mesh.recorders[0]->reportsFor(probe).front();                // a copy: iterating a temporary's member would dangle
+    std::vector<PeerId> path{ mesh.id(0) };
+    for (const auto& hop : report.hops) path.push_back(hop.node);
+    path.push_back(mesh.id(6));
+    for (size_t i = 0; i + 1 < path.size(); ++i) EXPECT_TRUE(adjacent(path[i], path[i + 1])) << "step " << i;
+}
+
+TEST(RouterTest, RecordRouteRefusesOwnNode) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    EXPECT_FALSE(mesh.routers[0]->recordRoute(mesh.id(0)).has_value());
 }

@@ -34,6 +34,16 @@ namespace {
         return static_cast<uint8_t>(std::min(message.ttlInitial - message.ttlRemaining + 1, 255));
     }
 
+    uint64_t currentUnixMs() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    // ms since `sentAtUnixMs` on our clock; clock skew could make it negative — then 0
+    uint32_t offsetSince(uint64_t sentAtUnixMs) {
+        const uint64_t now = currentUnixMs();
+        return now <= sentAtUnixMs ? 0 : static_cast<uint32_t>(std::min<uint64_t>(now - sentAtUnixMs, UINT32_MAX));
+    }
+
     uint32_t currentUnixSeconds() {
         return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     }
@@ -75,8 +85,8 @@ void Router::start() {
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
     this->unknownModeReportedAt.clear();
-    this->awaitedAckSentAt.clear();
-    this->awaitedAckOrder.clear();
+    this->awaitedReplySentAt.clear();
+    this->awaitedReplyOrder.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
     this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
     {
@@ -129,6 +139,14 @@ std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::
 
     const uint64_t msgId = message.msgId;
     this->inbox->events.push({ Event::SendRequested{ std::move(message) } });
+    return msgId;
+}
+
+std::optional<uint64_t> Router::recordRoute(const PeerId& destination) {
+    if (!this->running.load() || this->config.unicastTtl == 0 || destination == this->selfIdentity->getPeerId()) return std::nullopt;
+    RoutedMessage probe = this->buildRouterMessage(destination, RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ currentUnixMs(), {} }));
+    const uint64_t msgId = probe.msgId;
+    this->inbox->events.push({ Event::SendRequested{ std::move(probe) } });       // signed here, off the Router thread
     return msgId;
 }
 
@@ -231,10 +249,11 @@ void Router::processEvent(Event& event) {
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
         } else if (RouterWire::reachesEveryNode(content.message.mode)) {
-            this->awaitAcks(content.message);
+            if (content.message.ackRequested) this->awaitReply(content.message.msgId);
             this->sendOwnBroadcast(content.message);
         } else {
-            this->awaitAcks(content.message);
+            const bool isProbe = content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP && content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE;
+            if (content.message.ackRequested || isProbe) this->awaitReply(content.message.msgId);
             this->seenMessages.remember({ content.message.sender, content.message.msgId }, content.message.sentAtUnixSeconds, std::chrono::steady_clock::now());
             this->forwardUnicast(content.message, std::nullopt);
         }
@@ -317,7 +336,7 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now))         this->sendGraft(neighbor, keys);
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
-    this->dropExpiredAwaitedAcks(now);
+    this->dropExpiredAwaitedReplies(now);
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -442,20 +461,31 @@ void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId&
     this->spreadNewMessage(message, receivedFrom);
 }
 
-// A verified routed Router message (Group 0xFE, UNICAST). An ACK teaches the way to its signer on every hop (D6, signed
-// by the node it leads to — D5); the destination acts on it, relays forward it like any UNICAST.
+// A verified routed Router message (Group 0xFE, UNICAST). An answer (ACK, ROUTE_REPORT) teaches the way to its signer on
+// every hop (D6, signed by the node it leads to — D5); the destination acts on it, relays forward it like any UNICAST —
+// a route probe with this relay added.
 void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom) {
-    const bool isAck = message.subtype == RouterWire::SUBTYPE_ACK;
+    const bool isAnswer = message.subtype == RouterWire::SUBTYPE_ACK || message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT;
     if (message.destination == this->selfIdentity->getPeerId()) {
-        if (isAck) this->receiveAckForUs(message, receivedFrom);
-        return;                                                                     // ROUTE_ERROR (R-6), RECORD_ROUTE (R-5 d), unknown: nothing yet
+        if (message.subtype == RouterWire::SUBTYPE_ACK)          this->receiveAckForUs(message, receivedFrom);
+        if (message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT) this->receiveRouteReportForUs(message, receivedFrom);
+        if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) this->sendRouteReport(message);
+        return;                                                                     // ROUTE_ERROR (R-6), unknown: nothing yet
     }
-    if (isAck) {
+    if (isAnswer) {
         std::lock_guard lock(this->routesMutex);
         this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Ack, std::chrono::steady_clock::now());
     }
     if (message.ttlRemaining <= 1) return;
     message.ttlRemaining -= 1;
+    if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) {
+        RecordRoutePayload probe;
+        RouterWire::decodeRecordRoutePayload(message.payload, probe);              // shape checked by decode
+        if (probe.hops.size() < 255) {                                              // full: forwarded without us
+            probe.hops.push_back({ this->selfIdentity->getPeerId(), offsetSince(probe.sentAtUnixMs) });
+            message.payload = RouterWire::encodeRecordRoutePayload(probe);          // per-hop part, outside the signature
+        }
+    }
     this->forwardUnicast(message, receivedFrom);
 }
 
@@ -463,55 +493,89 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
     AckPayload payload;
     RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
     const auto now = std::chrono::steady_clock::now();
-    const auto awaited = this->awaitedAckSentAt.find(payload.acknowledgedMsgId);
-    const std::optional<std::chrono::milliseconds> rtt = awaited == this->awaitedAckSentAt.end() ? std::nullopt
-        : std::optional(std::chrono::duration_cast<std::chrono::milliseconds>(now - awaited->second));
+    const auto rtt = this->roundTripOf(payload.acknowledgedMsgId);
     {
         std::lock_guard lock(this->routesMutex);
         this->routes.learn(ack.sender, receivedFrom, hopsTraveled(ack), RouteEvidence::Ack, now, rtt);
     }
     if (!rtt) return;                                                               // not asked for (or too late): teaches the route, nothing to report
 
-    // Kept until the window ends: a broadcast collects one ACK from every node
     const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
 }
 
+void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom) {
+    RouteReportPayload payload;
+    RouterWire::decodeRouteReportPayload(report.payload, payload);                 // shape checked by decode
+    const auto rtt = this->roundTripOf(payload.probeMsgId);
+    {
+        std::lock_guard lock(this->routesMutex);                                    // a round trip that worked, like an ACK
+        this->routes.learn(report.sender, receivedFrom, hopsTraveled(report), RouteEvidence::Ack, std::chrono::steady_clock::now(), rtt);
+    }
+    if (!rtt) return;                                                               // not our probe (or too late)
+    const RouteReport event{ report.sender, payload.probeMsgId, std::move(payload.hops), payload.receivedOffsetMs, *rtt };
+    this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteReported(event); }, "onRouteReported");
+}
+
 // An addressee answers ACK_REQUESTED: a signed UNICAST back to the sender (docs/router.md 3.3)
 void Router::sendAck(const RoutedMessage& acknowledged) {
-    RoutedMessage ack;
-    ack.group             = RouterWire::ROUTER_PROTOCOL_GROUP;
-    ack.subtype           = RouterWire::SUBTYPE_ACK;
-    ack.mode              = RoutingMode::Unicast;
-    ack.ttlInitial        = this->config.unicastTtl;
-    ack.ttlRemaining      = this->config.unicastTtl;
-    ack.msgId             = randomMessageId();
-    ack.sentAtUnixSeconds = currentUnixSeconds();
-    ack.sender            = this->selfIdentity->getPeerId();
-    ack.destination       = acknowledged.sender;
-    ack.payload           = RouterWire::encodeAckPayload({ acknowledged.msgId });
-    ack.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(ack));
-    this->seenMessages.remember({ ack.sender, ack.msgId }, ack.sentAtUnixSeconds, std::chrono::steady_clock::now());
     ++this->acksSent;
-    this->forwardUnicast(ack, std::nullopt);
+    this->sendOwnRouterMessage(this->buildRouterMessage(acknowledged.sender, RouterWire::SUBTYPE_ACK, RouterWire::encodeAckPayload({ acknowledged.msgId })));
 }
 
-void Router::awaitAcks(const RoutedMessage& message) {
-    if (!message.ackRequested) return;
+// The probe's destination signs what reached it; back as UNICAST in R-5, along the reversed route from R-6
+void Router::sendRouteReport(const RoutedMessage& probe) {
+    RecordRoutePayload recorded;
+    RouterWire::decodeRecordRoutePayload(probe.payload, recorded);
+    const RouteReportPayload report{ probe.msgId, recorded.sentAtUnixMs, offsetSince(recorded.sentAtUnixMs), std::move(recorded.hops) };
+    this->sendOwnRouterMessage(this->buildRouterMessage(probe.sender, RouterWire::SUBTYPE_ROUTE_REPORT, RouterWire::encodeRouteReportPayload(report)));
+}
+
+// Signed UNICAST of the Router's own (Group 0xFE); safe on any thread — signing needs only the identity
+RoutedMessage Router::buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const {
+    RoutedMessage message;
+    message.group             = RouterWire::ROUTER_PROTOCOL_GROUP;
+    message.subtype           = subtype;
+    message.mode              = RoutingMode::Unicast;
+    message.ttlInitial        = this->config.unicastTtl;
+    message.ttlRemaining      = this->config.unicastTtl;
+    message.msgId             = randomMessageId();
+    message.sentAtUnixSeconds = currentUnixSeconds();
+    message.sender            = this->selfIdentity->getPeerId();
+    message.destination       = destination;
+    message.payload           = std::move(payload);
+    message.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(message));
+    return message;
+}
+
+void Router::sendOwnRouterMessage(const RoutedMessage& message) {
+    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    this->forwardUnicast(message, std::nullopt);
+}
+
+void Router::awaitReply(uint64_t msgId) {
     const auto now = std::chrono::steady_clock::now();
-    this->dropExpiredAwaitedAcks(now);
-    if (this->awaitedAckOrder.size() >= this->config.maxAwaitedAcks && !this->awaitedAckOrder.empty()) {
-        this->awaitedAckSentAt.erase(this->awaitedAckOrder.front().second);
-        this->awaitedAckOrder.pop_front();
+    this->dropExpiredAwaitedReplies(now);
+    if (this->awaitedReplyOrder.size() >= this->config.maxAwaitedReplies && !this->awaitedReplyOrder.empty()) {
+        this->awaitedReplySentAt.erase(this->awaitedReplyOrder.front().second);
+        this->awaitedReplyOrder.pop_front();
     }
-    this->awaitedAckSentAt[message.msgId] = now;
-    this->awaitedAckOrder.emplace_back(now, message.msgId);
+    this->awaitedReplySentAt[msgId] = now;
+    this->awaitedReplyOrder.emplace_back(now, msgId);
 }
 
-void Router::dropExpiredAwaitedAcks(std::chrono::steady_clock::time_point now) {
-    while (!this->awaitedAckOrder.empty() && now - this->awaitedAckOrder.front().first >= this->config.ackWaitWindow) {
-        this->awaitedAckSentAt.erase(this->awaitedAckOrder.front().second);
-        this->awaitedAckOrder.pop_front();
+// Time since we sent `awaitedMsgId`; nothing when we did not ask (or the wait window is over). Kept until the window
+// ends: a broadcast collects one ACK from every node.
+std::optional<std::chrono::milliseconds> Router::roundTripOf(uint64_t awaitedMsgId) const {
+    const auto awaited = this->awaitedReplySentAt.find(awaitedMsgId);
+    if (awaited == this->awaitedReplySentAt.end()) return std::nullopt;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - awaited->second);
+}
+
+void Router::dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now) {
+    while (!this->awaitedReplyOrder.empty() && now - this->awaitedReplyOrder.front().first >= this->config.replyWaitWindow) {
+        this->awaitedReplySentAt.erase(this->awaitedReplyOrder.front().second);
+        this->awaitedReplyOrder.pop_front();
     }
 }
 
