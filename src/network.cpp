@@ -46,6 +46,8 @@ namespace invilite::Mesh {
 
         // Management protocol subtypes
         constexpr uint16_t SUBTYPE_HELLO          = 0x0001;
+        constexpr uint16_t SUBTYPE_OBSERVED_ADDRESS = 0x0002;                       // "I see you connecting from this IP"
+        constexpr size_t   MAX_OBSERVED_SELF_ADDRESSES = 8;
         constexpr uint16_t SUBTYPE_PEX_ANNOUNCE   = 0x0020;
         constexpr uint16_t SUBTYPE_PEX_REQUEST    = 0x0021;
         constexpr uint16_t SUBTYPE_GOODBYE        = 0x0040;
@@ -979,7 +981,8 @@ void Network::handleWakeup() {
                     this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Dismissed, dismissedPeer, GoodbyeReason::NoSlots });
                 }
                 if (activatedPeer) {
-                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Activated, activatedPeer, GoodbyeReason::Shutdown });
+                    const std::string connectedFrom = activatedPeer->isOutbound() ? std::string() : activatedPeer->getConnection()->getRemoteClientAddress();
+                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Activated, activatedPeer, GoodbyeReason::Shutdown, connectedFrom });
                     // Listener event after Network-internal state is consistent. A replacement is transparent to listeners —
                     // the peer stays connected, only the underlying connection changed.
                     if (!replacedPeer) this->notifyPeerConnected(activatedPeer->getIdentity());
@@ -1178,7 +1181,7 @@ void Network::managementLoop() {
         while (this->peerLifecycleEvents.tryPop(event)) {
             if (!event.peer) continue;
             if (event.type == PeerLifecycleEvent::Type::Activated) {
-                if (event.peer->isActive()) this->greetActivatedPeer(event.peer);   // skip if it closed or is already leaving
+                if (event.peer->isActive()) this->greetActivatedPeer(event.peer, event.connectedFromAddress);   // skip if it closed or is already leaving
             } else {
                 this->sendFarewellAndDepart(event.peer, event.reason);
             }
@@ -1233,6 +1236,10 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
 
         case SUBTYPE_GOODBYE:
             this->processGoodbyeMessage(msg);
+            break;
+
+        case SUBTYPE_OBSERVED_ADDRESS:
+            this->processObservedAddressMessage(msg);
             break;
 
         default:
@@ -1311,11 +1318,16 @@ std::vector<uint8_t> Network::buildHelloFrame() const {
     return buildFrame(GROUP_INTERNAL, SUBTYPE_HELLO, this->selfRecordSerialized);
 }
 
-void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer) {
+void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::string& connectedFromAddress) {
     const auto hello = this->buildHelloFrame();
     if (!hello.empty()) {
         const ssize_t sent = this->sendFrameTo(peer, hello);
         std::cerr << "Network: HELLO to " << peerIdShort(peer->getPeerId()) << (sent > 0 ? " sent" : " failed, code=") << (sent > 0 ? "" : std::to_string(sent)) << std::endl;
+    }
+
+    // It dialed us: tell it where it comes from — behind NAT it cannot know (F7, first step)
+    if (const auto observed = ObservedAddressCodec::encode(connectedFromAddress); !observed.empty()) {
+        this->sendFrameTo(peer, buildFrame(GROUP_INTERNAL, SUBTYPE_OBSERVED_ADDRESS, observed));
     }
 
     if (auto pex = this->buildInitialPexFor(peer->getPeerId())) {
@@ -1380,6 +1392,38 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
               << (outboundMatch ? ", verified" : ", unverified")
               << (shouldBroadcast ? ", broadcasting" : "")
               << ", knownPeers=" << this->peerDirectory->size() << std::endl;
+}
+
+// Only a peer we dialed sees our source address; one that dialed us would be telling us about its own connection
+void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
+    if (msg.dialedAddress.empty()) return;
+    const auto address = ObservedAddressCodec::decode(msg.payload);
+    if (!address) {
+        std::cerr << "Network: malformed OBSERVED_ADDRESS from " << peerIdShort(msg.peer->getPeerId()) << std::endl;
+        return;
+    }
+
+    bool firstTime = false;
+    {
+        std::lock_guard lock(this->observedSelfMutex);
+        auto& observed = this->observedSelfAddresses;
+        const auto known = std::find_if(observed.begin(), observed.end(), [&](const ObservedSelfAddress& o) { return o.address == *address; });
+        firstTime = known == observed.end();
+        if (!firstTime) observed.erase(known);
+        else if (observed.size() >= MAX_OBSERVED_SELF_ADDRESSES) observed.erase(observed.begin());
+        observed.push_back({ *address, msg.peer->getPeerId(), std::chrono::system_clock::now() });
+    }
+
+    const bool announced = std::any_of(this->config.announcedAddresses.begin(), this->config.announcedAddresses.end(), [&](const PeerAddress& a) { return a.address == *address; });
+    if (firstTime && !announced && !isPrivateAddress(*address)) {
+        std::cerr << "Network: peers see this node as " << *address << ", which it does not announce — it is behind NAT and cannot be dialed "
+                  << "from outside; with port forwarding, announce " << *address << " (reported by " << peerIdShort(msg.peer->getPeerId()) << ")" << std::endl;
+    }
+}
+
+std::vector<ObservedSelfAddress> Network::getObservedSelfAddresses() const {
+    std::lock_guard lock(this->observedSelfMutex);
+    return this->observedSelfAddresses;
 }
 
 void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason) {

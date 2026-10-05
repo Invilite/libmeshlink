@@ -960,9 +960,11 @@ std::string invilite::Mesh::Connection::getRemoteClientAddress() const {
         const auto& addr4 = reinterpret_cast<const sockaddr_in&>(this->clientAddress);
         inet_ntop(AF_INET, &addr4.sin_addr, remoteClientAddress, sizeof(remoteClientAddress));
     } else if (this->clientAddress.ss_family == AF_INET6) {
-        // Incoming IPv6 connection
+        // Incoming IPv6 connection. An IPv4 client on a dual-stack listener ("::") arrives as ::ffff:a.b.c.d — report the
+        // IPv4 address it really is, or it never matches announced addresses and is shown to peers in a form they do not use.
         const auto& addr6 = reinterpret_cast<const sockaddr_in6&>(this->clientAddress);
-        inet_ntop(AF_INET6, &addr6.sin6_addr, remoteClientAddress, sizeof(remoteClientAddress));
+        if (IN6_IS_ADDR_V4MAPPED(&addr6.sin6_addr)) inet_ntop(AF_INET, &addr6.sin6_addr.s6_addr[12], remoteClientAddress, sizeof(remoteClientAddress));
+        else                                        inet_ntop(AF_INET6, &addr6.sin6_addr, remoteClientAddress, sizeof(remoteClientAddress));
     } else {
         throw std::runtime_error("Unsupported socket type, only tcp IPv4/IPv6 socket is supported.");
     }

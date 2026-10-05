@@ -5,6 +5,7 @@
 
 #include "meshlink/peer.h"
 #include "meshlink/identity.h"
+#include "meshlink/observed_address.h"
 #include "meshlink/peer_directory.h"
 #include "meshlink/network_events.h"
 #include "meshlink/pex_announce.h"
@@ -165,6 +166,10 @@ namespace invilite::Mesh {
         bool    requestPeerRecords(const PeerId& neighbor, const std::vector<PeerId>& wanted);
 
         std::vector<PeerId>             getConnectedPeers() const;
+
+        // How peers we dialed see us (OBSERVED_ADDRESS), newest last, at most 8 distinct addresses. A public one we do
+        // not announce means this node is behind NAT — reachable from outside only with port forwarding.
+        std::vector<ObservedSelfAddress> getObservedSelfAddresses() const;
         size_t                          getConnectedPeerCount() const;
 
         // Returns snapshot of known peers (learned via HELLO or PEX_ANNOUNCE).
@@ -186,6 +191,7 @@ namespace invilite::Mesh {
             Type                    type = Type::Activated;
             std::shared_ptr<Peer>   peer;
             GoodbyeReason           reason = GoodbyeReason::Shutdown;                   // Dismissed only
+            std::string             connectedFromAddress;                               // Activated, inbound only: the IP it dialed us from (a fact from I/O)
         };
 
         // Initial PEX for one peer, built by discovery; the caller sends it and then marks the records as announced.
@@ -235,6 +241,7 @@ namespace invilite::Mesh {
         // ===== 0xFF protocol handlers =====
         void processHelloMessage(const ProtocolMessage& msg);                           // subtype 0x0001
         void processGoodbyeMessage(const ProtocolMessage& msg);                         // subtype 0x0040
+        void processObservedAddressMessage(const ProtocolMessage& msg);                 // subtype 0x0002
 
         // ===== Discovery content (who we are, whom we know) — sent by whoever owns the moment =====
         [[nodiscard]] std::vector<uint8_t> buildHelloFrame() const;                    // empty if selfRecord is missing
@@ -242,7 +249,7 @@ namespace invilite::Mesh {
         void markRecordsAnnounced(const std::vector<PeerId>& recordIds);
 
         // Discovery's greeting for a peer that became Active: HELLO + initial PEX.
-        void greetActivatedPeer(const std::shared_ptr<Peer>& peer);
+        void greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::string& connectedFromAddress);
 
         // Departure window (B3), connection-layer side: the peer is already Departing. Sends the farewell (HELLO + PEX
         // when dismissing with NoSlots, so the dismissed peer still learns where else to go), then GOODBYE, then
@@ -391,6 +398,10 @@ namespace invilite::Mesh {
 
         // ===== Connected peers — I/O thread is the ONLY writer =====
         mutable std::shared_mutex                                       peersMutex;
+
+        // Discovery: how peers we dialed see us (management thread writes, getObservedSelfAddresses reads)
+        mutable std::mutex                                              observedSelfMutex;
+        std::vector<ObservedSelfAddress>                                observedSelfAddresses;
         std::unordered_map<PeerId, std::shared_ptr<Peer>, PeerIDHash>   peersById;
         std::unordered_map<int,    std::shared_ptr<Peer>>               peersBySocket;
 

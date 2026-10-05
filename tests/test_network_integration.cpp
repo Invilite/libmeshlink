@@ -298,6 +298,26 @@ TEST(NetworkIntegrationTest, HelloOverPrivateAddressClearsBehindNatEvidence) {
     beta.network->stop();
 }
 
+// The side that accepted the connection tells the dialer where it sees it coming from; the dialer remembers it
+TEST(NetworkIntegrationTest, DialerLearnsTheAddressItIsSeenFrom) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+    alpha.network->start();
+    beta.network->start();
+
+    alpha.network->connectToPeer("127.0.0.1", beta.port);
+    ASSERT_TRUE(waitUntil([&] { return !alpha.network->getObservedSelfAddresses().empty(); }, 5s));
+    const auto observed = alpha.network->getObservedSelfAddresses();
+    ASSERT_EQ(observed.size(), 1u);
+    EXPECT_EQ(observed.front().address, "127.0.0.1");
+    EXPECT_EQ(observed.front().reportedBy, beta.identity->getPeerId());
+    EXPECT_TRUE(beta.network->getObservedSelfAddresses().empty());                           // it was dialed: nothing to learn
+
+    alpha.network->stop();
+    beta.network->stop();
+}
+
 // R9: while a dial is still in progress, Topology (ticking every 3 s) must not pick the same peer again.
 // The target listens with a full accept queue, so the kernel drops our SYNs and connect() hangs for the whole
 // 5 s connect timeout — longer than one Topology tick. One dial → one failure; a redial would add a second.
