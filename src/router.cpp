@@ -8,7 +8,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <iostream>
 #include <variant>
 
 namespace invilite::Mesh {
@@ -69,8 +68,10 @@ public:
     ThreadSafeQueue<Event> events;
 };
 
-Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config)
+Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config,
+               std::shared_ptr<Logger> logger)
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
+      log(logger ? std::move(logger) : network.getLogger(), "Router"),
       inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
       plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
 
@@ -266,22 +267,21 @@ void Router::handleRouterControl(const NetworkMessage& message) {
         case RouterWire::SUBTYPE_GRAFT: this->handleGraft(message.source, message.payload); return;
         case RouterWire::SUBTYPE_PRUNE:
             if (RouterWire::decodePrune(message.payload)) this->plumtree.onPrune(message.source);
-            else std::cerr << "Router: malformed PRUNE from " << shortPeerId(message.source) << std::endl;
+            else this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed PRUNE:" + shortPeerId(message.source), LogLevel::Warning, "malformed PRUNE from {}", shortPeerId(message.source));
             return;
         case RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE: {
             UnknownDeliveryModeReport report;
             if (!RouterWire::decodeUnknownDeliveryMode(message.payload, report)) {
-                std::cerr << "Router: malformed UNKNOWN_DELIVERY_MODE from " << shortPeerId(message.source) << std::endl;
+                this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed UNKNOWN_DELIVERY_MODE:" + shortPeerId(message.source), LogLevel::Warning, "malformed UNKNOWN_DELIVERY_MODE from {}", shortPeerId(message.source));
                 return;
             }
             // Informational: the mode is signed, so the message cannot be resent in another one (docs/router.md 3.4)
-            std::cerr << "Router: " << shortPeerId(message.source) << " does not know mode 0x" << std::hex << static_cast<int>(report.mode)
-                      << " of message " << report.message.msgId << std::dec << " from " << shortPeerId(report.message.sender) << std::endl;
+            this->log.formatRateLimited(this->routerThreadLogLimiter, "unknown mode report:" + shortPeerId(message.source), LogLevel::Notice, "{} does not know mode 0x{:x} of message {:x} from {}", shortPeerId(message.source), static_cast<int>(report.mode), report.message.msgId, shortPeerId(report.message.sender));
             return;
         }
         default:
             // NEIGHBORS arrives with the eager-set optimization (R-7)
-            std::cerr << "Router: control subtype 0x" << std::hex << message.subtype << std::dec << " from " << shortPeerId(message.source) << " not handled" << std::endl;
+            this->log.formatRateLimited(this->routerThreadLogLimiter, "unhandled control subtype:" + shortPeerId(message.source), LogLevel::Warning, "control subtype 0x{:04x} from {} not handled", message.subtype, shortPeerId(message.source));
     }
 }
 
@@ -290,7 +290,7 @@ void Router::handleRouterControl(const NetworkMessage& message) {
 void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> payload) {
     std::vector<RoutedMessageKey> keys;
     if (!RouterWire::decodeIhave(payload, keys)) {
-        std::cerr << "Router: malformed IHAVE from " << shortPeerId(from) << std::endl;
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed IHAVE:" + shortPeerId(from), LogLevel::Warning, "malformed IHAVE from {}", shortPeerId(from));
         return;
     }
     std::erase_if(keys, [this](const RoutedMessageKey& key) {
@@ -303,7 +303,7 @@ void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> pay
 void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
     std::vector<RoutedMessageKey> keys;
     if (!RouterWire::decodeGraft(payload, keys)) {
-        std::cerr << "Router: malformed GRAFT from " << shortPeerId(from) << std::endl;
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed GRAFT:" + shortPeerId(from), LogLevel::Warning, "malformed GRAFT from {}", shortPeerId(from));
         return;
     }
     this->plumtree.onGraft(from);
@@ -362,7 +362,7 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
         return;
     }
     if (status != RoutedMessageStatus::Success) {
-        std::cerr << "Router: routed message from " << shortPeerId(message.source) << " rejected (status " << static_cast<int>(status) << ")" << std::endl;
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "routed message rejected:" + shortPeerId(message.source), LogLevel::Warning, "routed message from {} rejected (status {})", shortPeerId(message.source), static_cast<int>(status));
         return;
     }
 
@@ -376,7 +376,7 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
         return;
     }
     // ROUTED arrives in R-6
-    std::cerr << "Router: routed message mode " << static_cast<int>(routed.mode) << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
+    this->log.formatRateLimited(this->routerThreadLogLimiter, "mode not handled:" + shortPeerId(message.source), LogLevel::Info, "routed message mode {} from {} not handled yet", static_cast<int>(routed.mode), shortPeerId(message.source));
 }
 
 // docs/router.md 4.1 for signed messages: duplicate → sender's key → signature → seen → deliver / forward
@@ -408,8 +408,7 @@ void Router::awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom
         if (pending.receivedFrom == receivedFrom) ++fromThisNeighbor;
     }
     if (this->pendingVerifications.size() >= this->config.pendingVerificationLimit || fromThisNeighbor >= this->config.pendingVerificationPerNeighbor) {
-        std::cerr << "Router: message from unknown " << shortPeerId(message.sender) << " dropped, verification queue full (from "
-                  << shortPeerId(receivedFrom) << ")" << std::endl;
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "verification queue full:" + shortPeerId(receivedFrom), LogLevel::Warning, "message from unknown {} dropped, verification queue full (from {})", shortPeerId(message.sender), shortPeerId(receivedFrom));
         return;
     }
 
@@ -431,7 +430,7 @@ void Router::retryPendingVerifications() {
         if (const auto senderEntry = this->peerDirectory->findPeer(pending.message.sender)) {
             this->acceptWithKey(std::move(pending.message), pending.receivedFrom, senderEntry->record.ed25519Pub);
         } else if (now >= pending.deadline) {
-            std::cerr << "Router: message from unknown " << shortPeerId(pending.message.sender) << " dropped, record did not arrive" << std::endl;
+            this->log.format(LogLevel::Info, "message from unknown {} dropped, record did not arrive", shortPeerId(pending.message.sender));
         } else {
             this->pendingVerifications.push_back(std::move(pending));
         }
@@ -441,8 +440,7 @@ void Router::retryPendingVerifications() {
 // Signature first, and only then "seen": a forgery must not occupy the msgId of the genuine message
 void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub) {
     if (!RouterWire::verifySignature(message, senderEd25519Pub)) {
-        std::cerr << "Router: message " << std::hex << message.msgId << std::dec << " claiming sender " << shortPeerId(message.sender)
-                  << " has an invalid signature, dropped (from " << shortPeerId(receivedFrom) << ")" << std::endl;
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "invalid signature:" + shortPeerId(receivedFrom), LogLevel::Warning, "message {:x} claiming sender {} has an invalid signature, dropped (from {})", message.msgId, shortPeerId(message.sender), shortPeerId(receivedFrom));
         return;
     }
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
@@ -724,9 +722,9 @@ void Router::notifyListeners(const std::function<void(RouterEventListener&)>& ca
         try {
             call(*listener);
         } catch (const std::exception& e) {
-            std::cerr << "Router: listener->" << event << " threw: " << e.what() << std::endl;
+            this->log.format(LogLevel::Error, "listener->{} threw: {}", event, e.what());
         } catch (...) {
-            std::cerr << "Router: listener->" << event << " threw unknown exception" << std::endl;
+            this->log.format(LogLevel::Error, "listener->{} threw unknown exception", event);
         }
     }
 }

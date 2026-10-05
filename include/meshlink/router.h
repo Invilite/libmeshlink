@@ -5,6 +5,7 @@
 
 #include "meshlink/broadcast_cache.h"
 #include "meshlink/identity.h"
+#include "meshlink/log.h"
 #include "meshlink/peer_directory.h"
 #include "meshlink/plumtree_state.h"
 #include "meshlink/route_table.h"
@@ -78,7 +79,8 @@ namespace invilite::Mesh {
     class Router {
     public:
         // PeerDirectory supplies the senders' public keys; LocalIdentity signs this node's messages.
-        Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config = {});
+        Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config = {},
+               std::shared_ptr<Logger> logger = {});                                    // null → the Network's Logger
         ~Router();
 
         Router(const Router&)            = delete;
@@ -167,6 +169,8 @@ namespace invilite::Mesh {
         std::shared_ptr<PeerDirectory>              peerDirectory;
         std::shared_ptr<LocalIdentity>              selfIdentity;
         const RouterConfig                          config;
+        ComponentLog                                log;
+        LogRateLimiter                              routerThreadLogLimiter;          // logs a neighbor can trigger; Router thread only
 
         std::shared_ptr<EventInbox>                 inbox;
         std::thread                                 routerThread;
