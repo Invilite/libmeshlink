@@ -3,7 +3,7 @@
 #ifndef MESH_SEEN_MESSAGE_CACHE_H
 #define MESH_SEEN_MESSAGE_CACHE_H
 
-#include "meshlink/peer_identity.h"
+#include "meshlink/routed_message_key.h"
 
 #include <chrono>
 #include <cstdint>
@@ -12,18 +12,6 @@
 #include <unordered_set>
 
 namespace invilite::Mesh {
-
-    // Identity of a routed message: msgId is random per sender, so the pair is unique network-wide
-    struct RoutedMessageKey {
-        PeerId      sender{};
-        uint64_t    msgId = 0;
-
-        bool operator==(const RoutedMessageKey&) const = default;
-    };
-
-    struct RoutedMessageKeyHash {
-        size_t operator()(const RoutedMessageKey& key) const noexcept;
-    };
 
     // Router's duplicate and replay memory (docs/router.md 4.5). A key is remembered for `window` — longer than the
     // accepted timestamp skew in both directions, so a replay is either remembered or rejected by its timestamp.

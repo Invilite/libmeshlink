@@ -68,6 +68,7 @@ void Router::start() {
     // Drop anything a previous run left behind, then register — events from now on are kept
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
+    this->unknownModeReportedAt.clear();
     this->network.addListener(this->inbox);
 
     // Seed after registering, before the loop drains anything. A peer that connects or leaves around this point shows up
@@ -158,6 +159,7 @@ void Router::processEvent(Event& event) {
             std::lock_guard lock(this->neighborsMutex);
             this->neighbors.insert(content.peerId);
         } else if constexpr (std::is_same_v<T, Event::NeighborDisconnected>) {
+            this->unknownModeReportedAt.erase(content.peerId);
             std::lock_guard lock(this->neighborsMutex);
             this->neighbors.erase(content.peerId);
         } else if constexpr (std::is_same_v<T, Event::FrameReceived>) {
@@ -173,16 +175,41 @@ void Router::processEvent(Event& event) {
 }
 
 void Router::handleRouterControl(const NetworkMessage& message) {
-    // IHAVE / GRAFT / PRUNE / UNKNOWN_DELIVERY_MODE arrive with Plumtree (R-4b), NEIGHBORS with the eager-set optimization (R-7)
+    if (message.subtype == RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE) {
+        UnknownDeliveryModeReport report;
+        if (!RouterWire::decodeUnknownDeliveryMode(message.payload, report)) {
+            std::cerr << "Router: malformed UNKNOWN_DELIVERY_MODE from " << shortPeerId(message.source) << std::endl;
+            return;
+        }
+        // Informational: the mode is signed, so the message cannot be resent in another one (docs/router.md 3.4)
+        std::cerr << "Router: " << shortPeerId(message.source) << " does not know mode 0x" << std::hex << static_cast<int>(report.mode)
+                  << " of message " << report.message.msgId << std::dec << " from " << shortPeerId(report.message.sender) << std::endl;
+        return;
+    }
+    // IHAVE / GRAFT / PRUNE arrive with Plumtree (R-4b), NEIGHBORS with the eager-set optimization (R-7)
     std::cerr << "Router: control subtype 0x" << std::hex << message.subtype << std::dec << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
+}
+
+// Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
+// must not turn into a flood of replies.
+void Router::reportUnknownMode(const RoutedMessage& message, const PeerId& receivedFrom) {
+    {
+        // A message may arrive after its neighbor's disconnect (until C6): no reply, and no entry that nobody would erase
+        std::lock_guard lock(this->neighborsMutex);
+        if (!this->neighbors.contains(receivedFrom)) return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    auto& lastReport = this->unknownModeReportedAt[receivedFrom][static_cast<uint8_t>(message.mode) & 0x0F];
+    if (lastReport && now - *lastReport < this->config.unknownModeReportInterval) return;
+    lastReport = now;
+    this->network.sendToPeer(receivedFrom, RouterWire::encodeUnknownDeliveryMode({ static_cast<uint8_t>(message.mode), { message.sender, message.msgId } }));
 }
 
 void Router::handleRoutedMessage(const NetworkMessage& message) {
     RoutedMessage routed;
     const RoutedMessageStatus status = RouterWire::decode(message.group, message.subtype, message.payload, std::chrono::system_clock::now(), routed, this->config.maxClockSkew);
-    if (status == RoutedMessageStatus::UnknownMode) {                              // UNKNOWN_DELIVERY_MODE reply arrives with the control codec (R-4b)
-        std::cerr << "Router: message " << std::hex << routed.msgId << " from " << shortPeerId(message.source) << " uses unknown mode 0x"
-                  << static_cast<int>(routed.mode) << std::dec << ", ignored" << std::endl;
+    if (status == RoutedMessageStatus::UnknownMode) {                              // neither delivered nor forwarded
+        this->reportUnknownMode(routed, message.source);
         return;
     }
     if (status != RoutedMessageStatus::Success) {

@@ -15,7 +15,9 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <array>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -33,6 +35,7 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   unknownSenderWait       = std::chrono::seconds(2);    // how long a message waits for its sender's record
         size_t                      pendingVerificationLimit = 256;                 // messages waiting for a sender's record, all senders together
         size_t                      pendingVerificationPerNeighbor = 32;            // share of one neighbor — it cannot starve the others
+        std::chrono::seconds        unknownModeReportInterval = std::chrono::seconds(60);   // at most one UNKNOWN_DELIVERY_MODE per neighbor and mode
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -93,6 +96,7 @@ namespace invilite::Mesh {
         void processEvent(Event& event);
         void handleRouterControl(const NetworkMessage& message);                   // Group 0xFE neighbor-only subtypes
         void handleRoutedMessage(const NetworkMessage& message);                   // routing header: Group 0x00..0xFD, routed Group 0xFE subtypes
+        void reportUnknownMode(const RoutedMessage& message, const PeerId& receivedFrom);
         void handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom);
         void awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom);
         void retryPendingVerifications();
@@ -118,6 +122,8 @@ namespace invilite::Mesh {
         SeenMessageCache                            seenMessages;
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
+        // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
+        std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
 
         // Written by the Router thread (and by start() before the thread runs); read by getNeighbors()
         mutable std::mutex                          neighborsMutex;

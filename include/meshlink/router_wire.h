@@ -4,6 +4,7 @@
 #define MESH_ROUTER_WIRE_H
 
 #include "meshlink/peer_identity.h"
+#include "meshlink/routed_message_key.h"
 
 #include <chrono>
 #include <cstdint>
@@ -96,6 +97,14 @@ namespace invilite::Mesh {
         bool operator==(const RouteErrorPayload&) const = default;
     };
 
+    // UNKNOWN_DELIVERY_MODE payload: "I do not know the mode of this message and did not forward it" (neighbor-only)
+    struct UnknownDeliveryModeReport {
+        uint8_t                 mode = 0;                                           // the raw mode nibble we could not handle
+        RoutedMessageKey        message;
+
+        bool operator==(const UnknownDeliveryModeReport&) const = default;
+    };
+
     // Receive-side validation outcome (docs/router.md 3.6). Signature is checked separately (verifySignature) because
     // the sender's key comes from PeerDirectory, which the codec does not know.
     enum class RoutedMessageStatus : int {
@@ -171,6 +180,22 @@ namespace invilite::Mesh {
         bool                 decodeAckPayload(std::span<const uint8_t> payload, AckPayload& out);
         std::vector<uint8_t> encodeRouteErrorPayload(const RouteErrorPayload& error);
         bool                 decodeRouteErrorPayload(std::span<const uint8_t> payload, RouteErrorPayload& out);
+
+        // Neighbor-only control (Group 0xFE, subtypes 0x0001..0x00FF, section 3.3). Encoders return the whole Network frame
+        // (Group | Subtype | payload) ready for Network::sendToPeer, or an empty vector when the content does not fit;
+        // decoders take the payload Network split off and require the exact length.
+        constexpr size_t MAX_KEYS_PER_CONTROL_MESSAGE = 255;                        // 1-byte count
+
+        // IHAVE announces 1..255 messages; an empty IHAVE means nothing and is refused both ways
+        std::vector<uint8_t> encodeIhave(std::span<const RoutedMessageKey> keys);
+        bool                 decodeIhave(std::span<const uint8_t> payload, std::vector<RoutedMessageKey>& out);
+        // GRAFT asks for 0..255 messages and makes the sender of the GRAFT eager; 0 = only "send me full copies from now on"
+        std::vector<uint8_t> encodeGraft(std::span<const RoutedMessageKey> keys);
+        bool                 decodeGraft(std::span<const uint8_t> payload, std::vector<RoutedMessageKey>& out);
+        std::vector<uint8_t> encodePrune();
+        bool                 decodePrune(std::span<const uint8_t> payload);
+        std::vector<uint8_t> encodeUnknownDeliveryMode(const UnknownDeliveryModeReport& report);
+        bool                 decodeUnknownDeliveryMode(std::span<const uint8_t> payload, UnknownDeliveryModeReport& out);
 
     } // namespace RouterWire
 

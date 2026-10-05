@@ -468,3 +468,92 @@ TEST(RouterWireTest, SignatureRequiredForEveryNodeModesAndRouterMessages) {
     EXPECT_FALSE(RouterWire::reachesEveryNode(RoutingMode::Routed));
     EXPECT_FALSE(RouterWire::reachesEveryNode(RoutingMode::Unicast));
 }
+
+// ── Neighbor-only control messages (docs/router.md 3.3) ────────────────────
+
+namespace {
+std::vector<RoutedMessageKey> someKeys(size_t count) {
+    std::vector<RoutedMessageKey> keys;
+    for (size_t i = 0; i < count; ++i) keys.push_back({ peerId(static_cast<uint8_t>(i)), 0x1000 + i });
+    return keys;
+}
+
+std::span<const uint8_t> payloadOf(const std::vector<uint8_t>& frame) { return std::span<const uint8_t>(frame).subspan(3); }
+}
+
+TEST(RouterWireTest, ControlMessagesRoundTrip) {
+    for (const size_t count : { size_t(1), size_t(10), size_t(255) }) {
+        const auto keys = someKeys(count);
+        const auto frame = RouterWire::encodeIhave(keys);
+        ASSERT_EQ(frame.size(), 3 + 1 + count * 40);                                         // 40 B per announcement
+        EXPECT_EQ(frame[0], RouterWire::ROUTER_PROTOCOL_GROUP);
+        EXPECT_EQ((frame[1] << 8) | frame[2], RouterWire::SUBTYPE_IHAVE);
+        std::vector<RoutedMessageKey> decoded;
+        ASSERT_TRUE(RouterWire::decodeIhave(payloadOf(frame), decoded));
+        EXPECT_EQ(decoded, keys);
+    }
+    EXPECT_EQ(RouterWire::encodeIhave(someKeys(10)).size(), 404u);                          // docs/router.md 3.5
+
+    for (const size_t count : { size_t(0), size_t(3), size_t(255) }) {
+        const auto keys = someKeys(count);
+        const auto frame = RouterWire::encodeGraft(keys);
+        EXPECT_EQ((frame[1] << 8) | frame[2], RouterWire::SUBTYPE_GRAFT);
+        std::vector<RoutedMessageKey> decoded = someKeys(2);                                 // overwritten, not appended
+        ASSERT_TRUE(RouterWire::decodeGraft(payloadOf(frame), decoded));
+        EXPECT_EQ(decoded, keys);
+    }
+
+    const auto prune = RouterWire::encodePrune();
+    EXPECT_EQ(prune, (std::vector<uint8_t>{ 0xFE, 0x00, 0x04 }));
+    EXPECT_TRUE(RouterWire::decodePrune(payloadOf(prune)));
+
+    const UnknownDeliveryModeReport report{ 0x0A, { peerId(0x77), 0xABCDEF0123456789ULL } };
+    const auto reportFrame = RouterWire::encodeUnknownDeliveryMode(report);
+    EXPECT_EQ(reportFrame.size(), 3u + 41u);
+    EXPECT_EQ((reportFrame[1] << 8) | reportFrame[2], RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE);
+    UnknownDeliveryModeReport decodedReport;
+    ASSERT_TRUE(RouterWire::decodeUnknownDeliveryMode(payloadOf(reportFrame), decodedReport));
+    EXPECT_EQ(decodedReport, report);
+
+    // None of them carries a routing header
+    for (const uint16_t subtype : { RouterWire::SUBTYPE_NEIGHBORS, RouterWire::SUBTYPE_IHAVE, RouterWire::SUBTYPE_GRAFT, RouterWire::SUBTYPE_PRUNE, RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE }) {
+        EXPECT_FALSE(RouterWire::carriesRoutingHeader(RouterWire::ROUTER_PROTOCOL_GROUP, subtype));
+    }
+}
+
+TEST(RouterWireTest, ControlEncodersRefuseWhatDoesNotFit) {
+    EXPECT_TRUE(RouterWire::encodeIhave({}).empty());                                       // announces nothing
+    EXPECT_TRUE(RouterWire::encodeIhave(someKeys(256)).empty());
+    EXPECT_TRUE(RouterWire::encodeGraft(someKeys(256)).empty());
+}
+
+TEST(RouterWireTest, ControlDecodersRequireExactLength) {
+    std::vector<RoutedMessageKey> keys;
+    for (const bool graft : { false, true }) {
+        SCOPED_TRACE(graft ? "GRAFT" : "IHAVE");
+        auto decode = [graft](std::span<const uint8_t> p, std::vector<RoutedMessageKey>& out) { return graft ? RouterWire::decodeGraft(p, out) : RouterWire::decodeIhave(p, out); };
+        const auto frame = graft ? RouterWire::encodeGraft(someKeys(2)) : RouterWire::encodeIhave(someKeys(2));
+        const std::vector<uint8_t> payload(frame.begin() + 3, frame.end());
+        for (size_t length = 0; length < payload.size(); ++length) {
+            EXPECT_FALSE(decode(std::span<const uint8_t>(payload).first(length), keys)) << "length " << length;
+        }
+        std::vector<uint8_t> longer = payload;
+        longer.push_back(0);
+        EXPECT_FALSE(decode(longer, keys));
+        std::vector<uint8_t> miscounted = payload;
+        miscounted[0] = 1;                                                                   // count says 1, two keys follow
+        EXPECT_FALSE(decode(miscounted, keys));
+    }
+    const std::vector<uint8_t> zeroCount{ 0x00 };
+    EXPECT_FALSE(RouterWire::decodeIhave(zeroCount, keys));
+    EXPECT_TRUE(RouterWire::decodeGraft(zeroCount, keys));
+
+    EXPECT_FALSE(RouterWire::decodePrune(std::vector<uint8_t>{ 0x00 }));
+
+    UnknownDeliveryModeReport report;
+    const auto reportFrame = RouterWire::encodeUnknownDeliveryMode({ 4, { peerId(1), 2 } });
+    std::vector<uint8_t> reportPayload(reportFrame.begin() + 3, reportFrame.end());
+    EXPECT_FALSE(RouterWire::decodeUnknownDeliveryMode(std::span<const uint8_t>(reportPayload).first(40), report));
+    reportPayload.push_back(0);
+    EXPECT_FALSE(RouterWire::decodeUnknownDeliveryMode(reportPayload, report));
+}

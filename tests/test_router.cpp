@@ -122,6 +122,28 @@ std::vector<Edge> lineEdges(size_t count) {
     return edges;
 }
 
+// Router control frames (Group 0xFE neighbor-only subtypes) seen by one node's Network
+struct ControlFrameRecorder : NetworkEventListener {
+    void onMessageReceived(const NetworkMessage& message) override {
+        if (message.group != RouterWire::ROUTER_PROTOCOL_GROUP || RouterWire::carriesRoutingHeader(message.group, message.subtype)) return;
+        std::lock_guard lock(this->mutex);
+        this->frames.push_back(message);
+    }
+
+    std::vector<UnknownDeliveryModeReport> unknownModeReports() const {
+        std::lock_guard lock(this->mutex);
+        std::vector<UnknownDeliveryModeReport> reports;
+        for (const auto& frame : this->frames) {
+            UnknownDeliveryModeReport report;
+            if (frame.subtype == RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE && RouterWire::decodeUnknownDeliveryMode(frame.payload, report)) reports.push_back(report);
+        }
+        return reports;
+    }
+
+    mutable std::mutex           mutex;
+    std::vector<NetworkMessage>  frames;
+};
+
 // A broadcast built by hand — for frames a well-behaved Router would never send (forgeries, replays)
 RoutedMessage craftBroadcast(const PeerId& claimedSender, const LocalIdentity& signer, std::vector<uint8_t> payload) {
     RoutedMessage m;
@@ -136,6 +158,17 @@ RoutedMessage craftBroadcast(const PeerId& claimedSender, const LocalIdentity& s
     m.payload           = std::move(payload);
     m.signature         = signer.sign(RouterWire::bytesToSign(m));
     return m;
+}
+
+RoutedMessage craftBroadcastFrom(const LocalIdentity& sender, std::vector<uint8_t> payload) {
+    return craftBroadcast(sender.getPeerId(), sender, std::move(payload));
+}
+
+// A valid frame of `sender`'s broadcast with the mode nibble replaced by one nobody knows; `distinct` changes the msgId
+std::vector<uint8_t> frameWithUnknownMode(const LocalIdentity& sender, uint8_t mode, uint8_t distinct) {
+    std::vector<uint8_t> frame = RouterWire::encode(craftBroadcastFrom(sender, std::vector<uint8_t>(distinct, distinct)));
+    frame[3] = static_cast<uint8_t>(RouterWire::WIRE_VERSION << 4) | mode;
+    return frame;
 }
 
 } // namespace
@@ -494,4 +527,44 @@ TEST(RouterTest, UnknownModeIsIgnored) {
     ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, control); }, 5s));
     for (size_t i = 1; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), future.msgId), 0u) << "node " << i;
     EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 1u);                         // only the control message
+}
+
+// ── Unknown mode is reported to the neighbor (R-4b a) ───────────────────────
+
+TEST(RouterTest, UnknownModeIsReportedOncePerNeighborAndModeWithinInterval) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    auto recorder = std::make_shared<ControlFrameRecorder>();
+    mesh.nodes[0]->network->addListener(recorder);
+    const LocalIdentity& sender = *mesh.nodes[0]->identity;
+
+    const auto first = frameWithUnknownMode(sender, 0x4, 1);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), first), 0);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frameWithUnknownMode(sender, 0x4, 2)), 0);   // same mode: no second reply
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frameWithUnknownMode(sender, 0xF, 3)), 0);   // another mode: its own reply
+    ASSERT_TRUE(waitUntil([&] { return recorder->unknownModeReports().size() >= 2; }, 5s));
+    std::this_thread::sleep_for(300ms);
+
+    const auto reports = recorder->unknownModeReports();
+    ASSERT_EQ(reports.size(), 2u);
+    RoutedMessage firstDecoded;
+    ASSERT_EQ(RouterWire::decode(first[0], static_cast<uint16_t>(first[1] << 8 | first[2]), std::span<const uint8_t>(first).subspan(3), std::chrono::system_clock::now(), firstDecoded), RoutedMessageStatus::UnknownMode);
+    EXPECT_EQ(reports[0], (UnknownDeliveryModeReport{ 0x4, { sender.getPeerId(), firstDecoded.msgId } }));
+    EXPECT_EQ(reports[1].mode, 0xF);
+    mesh.nodes[0]->network->removeListener(recorder);
+}
+
+TEST(RouterTest, UnknownModeIsReportedAgainAfterInterval) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& c) { c.unknownModeReportInterval = 1s; });
+    ASSERT_TRUE(mesh.ready);
+    auto recorder = std::make_shared<ControlFrameRecorder>();
+    mesh.nodes[0]->network->addListener(recorder);
+    const LocalIdentity& sender = *mesh.nodes[0]->identity;
+
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frameWithUnknownMode(sender, 0x4, 1)), 0);
+    ASSERT_TRUE(waitUntil([&] { return recorder->unknownModeReports().size() == 1; }, 5s));
+    std::this_thread::sleep_for(1100ms);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frameWithUnknownMode(sender, 0x4, 2)), 0);
+    EXPECT_TRUE(waitUntil([&] { return recorder->unknownModeReports().size() == 2; }, 5s));
+    mesh.nodes[0]->network->removeListener(recorder);
 }

@@ -137,6 +137,39 @@ namespace {
         return message.signature.size() == expectedSignatureSize;
     }
 
+    constexpr size_t  MESSAGE_KEY_SIZE      = PEER_ID_SIZE + 8;                     // sender + msgId
+
+    std::vector<uint8_t> controlFrameHeader(uint16_t subtype, size_t payloadSize) {
+        std::vector<uint8_t> out;
+        out.reserve(3 + payloadSize);
+        out.push_back(ROUTER_PROTOCOL_GROUP);
+        writeBE16(out, subtype);
+        return out;
+    }
+
+    // IHAVE / GRAFT: count(1) + count × (sender(32) + msgId(8))
+    std::vector<uint8_t> encodeKeyList(uint16_t subtype, std::span<const RoutedMessageKey> keys) {
+        std::vector<uint8_t> out = controlFrameHeader(subtype, 1 + keys.size() * MESSAGE_KEY_SIZE);
+        out.push_back(static_cast<uint8_t>(keys.size()));
+        for (const RoutedMessageKey& key : keys) {
+            out.insert(out.end(), key.sender.begin(), key.sender.end());
+            writeBE64(out, key.msgId);
+        }
+        return out;
+    }
+
+    bool decodeKeyList(std::span<const uint8_t> payload, std::vector<RoutedMessageKey>& out) {
+        WireReader reader(payload);
+        uint8_t count = 0;
+        if (!reader.readU8(count) || reader.remaining() != count * MESSAGE_KEY_SIZE) return false;
+        out.resize(count);
+        for (RoutedMessageKey& key : out) {
+            reader.readPeerId(key.sender);
+            reader.readUnsignedBE(8, key.msgId);
+        }
+        return true;
+    }
+
     // The payload shape of a routed Router message is part of the receive validation (3.6): a malformed ACK / ROUTE_ERROR
     // is rejected before anyone acts on it. RECORD_ROUTE / ROUTE_REPORT get their codecs in R-5; unknown subtypes pass.
     bool hasValidRouterMessagePayload(const RoutedMessage& message) {
@@ -343,6 +376,46 @@ bool decodeRouteErrorPayload(std::span<const uint8_t> payload, RouteErrorPayload
     uint8_t reason = 0;
     if (!reader.readUnsignedBE(8, out.stuckMsgId) || !reader.readPeerId(out.unreachableDestination) || !reader.readU8(reason)) return false;
     out.reason = static_cast<RouteErrorReason>(reason);
+    return reader.remaining() == 0;
+}
+
+std::vector<uint8_t> encodeIhave(std::span<const RoutedMessageKey> keys) {
+    if (keys.empty() || keys.size() > MAX_KEYS_PER_CONTROL_MESSAGE) return {};
+    return encodeKeyList(SUBTYPE_IHAVE, keys);
+}
+
+bool decodeIhave(std::span<const uint8_t> payload, std::vector<RoutedMessageKey>& out) {
+    return decodeKeyList(payload, out) && !out.empty();
+}
+
+std::vector<uint8_t> encodeGraft(std::span<const RoutedMessageKey> keys) {
+    if (keys.size() > MAX_KEYS_PER_CONTROL_MESSAGE) return {};
+    return encodeKeyList(SUBTYPE_GRAFT, keys);
+}
+
+bool decodeGraft(std::span<const uint8_t> payload, std::vector<RoutedMessageKey>& out) {
+    return decodeKeyList(payload, out);
+}
+
+std::vector<uint8_t> encodePrune() {
+    return controlFrameHeader(SUBTYPE_PRUNE, 0);
+}
+
+bool decodePrune(std::span<const uint8_t> payload) {
+    return payload.empty();
+}
+
+std::vector<uint8_t> encodeUnknownDeliveryMode(const UnknownDeliveryModeReport& report) {
+    std::vector<uint8_t> out = controlFrameHeader(SUBTYPE_UNKNOWN_DELIVERY_MODE, 1 + MESSAGE_KEY_SIZE);
+    out.push_back(report.mode);
+    out.insert(out.end(), report.message.sender.begin(), report.message.sender.end());
+    writeBE64(out, report.message.msgId);
+    return out;
+}
+
+bool decodeUnknownDeliveryMode(std::span<const uint8_t> payload, UnknownDeliveryModeReport& out) {
+    WireReader reader(payload);
+    if (!reader.readU8(out.mode) || !reader.readPeerId(out.message.sender) || !reader.readUnsignedBE(8, out.message.msgId)) return false;
     return reader.remaining() == 0;
 }
 
