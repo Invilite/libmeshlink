@@ -32,6 +32,7 @@ namespace invilite::Mesh {
     // Router parameters (docs/router.md 5, initial values)
     struct RouterConfig {
         uint8_t                     broadcastTtl            = 16;                   // hops a broadcast may travel; 1 = direct neighbors only
+        uint8_t                     unicastTtl              = 16;                   // hops a message to one node may travel (local flooding included)
         std::chrono::seconds        maxClockSkew            = std::chrono::minutes(5);    // accepted sentAt distance from local time
         std::chrono::seconds        duplicateWindow         = std::chrono::minutes(10);   // > 2 × maxClockSkew: a replay is remembered or too old
         size_t                      duplicateCacheCapacity  = 65536;
@@ -52,6 +53,11 @@ namespace invilite::Mesh {
         uint64_t    announcementsSent  = 0;                                         // message keys announced in IHAVE
         uint64_t    graftsSent         = 0;                                         // GRAFT frames, fast-repair ones included
         uint64_t    prunesSent         = 0;
+        uint64_t    localFloods        = 0;                                         // UNICASTs sent to every neighbor for lack of a route
+    };
+
+    struct SendOptions {
+        bool    ackRequested = false;                                               // the destination answers with an ACK (R-5 c)
     };
 
     // Router (docs/router.md): delivers messages beyond direct neighbors — broadcast to every node, or to one node by
@@ -82,6 +88,11 @@ namespace invilite::Mesh {
         // node. Not delivered locally. The mode is signed and applies on every hop: Flood trades traffic for no tree-repair
         // delay (docs/router.md 4.3).
         std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode = RoutingMode::Broadcast);
+
+        // Send to one node (UNICAST): each hop picks the next one — a direct neighbor, a learned route, or local flooding
+        // when nothing is known. Not signed (D12). Returns the message id, or nothing when the Router is not running,
+        // `group` is not a user group or `destination` is this node.
+        std::optional<uint64_t> send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options = {});
 
         void addListener(std::shared_ptr<RouterEventListener> listener);
         void removeListener(const std::shared_ptr<RouterEventListener>& listener);
@@ -125,7 +136,9 @@ namespace invilite::Mesh {
         void sendGraft(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
-        void deliverLocally(const RoutedMessage& message);
+        void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
+        void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
+        void deliverLocally(const RoutedMessage& message, bool senderAuthenticated);
         [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 
         Network&                                    network;
@@ -159,6 +172,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       announcementsSent{0};
         std::atomic<uint64_t>                       graftsSent{0};
         std::atomic<uint64_t>                       prunesSent{0};
+        std::atomic<uint64_t>                       localFloods{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

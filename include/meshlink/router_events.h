@@ -13,12 +13,15 @@ namespace invilite::Mesh {
     // A routed message delivered to this node's applications. The Router delivers every broadcast; filtering by
     // group / subtype is the application's job (nodes forward services they do not implement — docs/router.md 1).
     struct RoutedDelivery {
-        PeerId                  sender{};                                           // verified originator (signature checked for broadcasts)
+        PeerId                  sender{};                                           // originator as the header says — see senderAuthenticated
         uint64_t                msgId   = 0;                                        // sender's message id; (sender, msgId) is unique
         uint8_t                 group   = 0;
         uint16_t                subtype = 0;
         RoutingMode             mode    = RoutingMode::Broadcast;
         uint8_t                 hopsTraveled = 0;                                   // 1 = from a direct neighbor
+        // The sender is proven: by its signature (FLOOD / BROADCAST), or by the link when a UNICAST came straight from that
+        // neighbor. A UNICAST relayed by others names its sender unverified until E2E (C2).
+        bool                    senderAuthenticated = false;
         std::vector<uint8_t>    payload;
     };
 

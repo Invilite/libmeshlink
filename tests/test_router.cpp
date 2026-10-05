@@ -790,3 +790,95 @@ TEST(RouterTest, BroadcastTeachesRouteToItsSenderAndDisconnectEndsIt) {
     EXPECT_TRUE(waitUntil([&] { return mesh.routers[3]->getRouteCandidates(mesh.id(0)).empty(); }, 5s));   // its only neighbor left
     EXPECT_EQ(mesh.routers[1]->getRouteCandidates(mesh.id(0)).size(), 1u);                    // not through node 2: unaffected
 }
+
+// ── UNICAST (R-5 b) ─────────────────────────────────────────────────────────
+
+namespace {
+RoutedMessage craftUnicast(const PeerId& claimedSender, const PeerId& destination, std::vector<uint8_t> payload) {
+    RoutedMessage m;
+    m.group             = 0x10;
+    m.subtype           = 0x0002;
+    m.mode              = RoutingMode::Unicast;
+    m.ttlInitial        = 16;
+    m.ttlRemaining      = 16;
+    m.msgId             = 0xC0DE0000ULL + payload.size();
+    m.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    m.sender            = claimedSender;
+    m.destination       = destination;
+    m.payload           = std::move(payload);
+    return m;
+}
+}
+
+// The destination's broadcast taught every node the way back: the message follows it, no flooding
+TEST(RouterTest, UnicastFollowsLearnedRouteToEndOfLine) {
+    RouterMesh mesh(5, lineEdges(5));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[4]->broadcast(0x10, 0, { 'h' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(4, hello); }, 5s));
+    std::this_thread::sleep_for(200ms);
+    const uint64_t before = totalFullMessagesSent(mesh);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(4), 0x10, 7, { 'u', 'n', 'i' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[4]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    std::this_thread::sleep_for(200ms);
+
+    const auto delivery = mesh.recorders[4]->find(mesh.id(0), msgId);
+    EXPECT_EQ(delivery->mode, RoutingMode::Unicast);
+    EXPECT_EQ(delivery->hopsTraveled, 4);
+    EXPECT_EQ(delivery->subtype, 7);
+    EXPECT_FALSE(delivery->senderAuthenticated);                                              // relayed: the sender is only claimed
+    EXPECT_EQ(totalFullMessagesSent(mesh) - before, 4u);                                      // one copy per hop
+    for (size_t i = 0; i < 5; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().localFloods, 0u) << "node " << i;
+    for (size_t i = 1; i < 4; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), msgId), 0u);   // relays do not deliver
+}
+
+// Nobody knows the destination: local flooding finds it, and it is delivered exactly once
+TEST(RouterTest, UnicastWithoutRouteFloodsLocallyAndArrivesOnce) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(6), 0x10, 0, { 'f' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[6]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.recorders[6]->countOf(mesh.id(0), msgId), 1u);
+    EXPECT_GT(mesh.routers[0]->getStatistics().localFloods, 0u);
+    for (size_t i = 0; i < 8; ++i) if (i != 6) { EXPECT_EQ(mesh.recorders[i]->total(), 0u) << "node " << i; }
+}
+
+TEST(RouterTest, UnicastFromNeighborHasAuthenticatedSenderOthersDoNot) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t direct = mesh.routers[0]->send(mesh.id(1), 0x10, 0, { 'd' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(mesh.id(0), direct) == 1; }, 5s));
+    const auto delivery = mesh.recorders[1]->find(mesh.id(0), direct);
+    EXPECT_TRUE(delivery->senderAuthenticated);
+    EXPECT_EQ(delivery->hopsTraveled, 1);
+
+    // Node 0 claims someone else sent it: delivered, but not as authenticated
+    const auto stranger = LocalIdentity::generate();
+    const RoutedMessage claimed = craftUnicast(stranger.getPeerId(), mesh.id(1), { 'c', 'l' });
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(claimed)), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(stranger.getPeerId(), claimed.msgId) == 1; }, 5s));
+    EXPECT_FALSE(mesh.recorders[1]->find(stranger.getPeerId(), claimed.msgId)->senderAuthenticated);
+}
+
+TEST(RouterTest, UnicastTtlLimitsHowFarItTravels) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t i, RouterConfig& c) { if (i == 0) c.unicastTtl = 2; });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t far  = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'x' }).value();
+    const uint64_t near = mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'y' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), near) == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.recorders[3]->countOf(mesh.id(0), far), 0u);
+}
+
+TEST(RouterTest, SendRefusesOwnNodeAndNonUserGroups) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    EXPECT_FALSE(mesh.routers[0]->send(mesh.id(0), 0x10, 0, { 1 }).has_value());
+    EXPECT_FALSE(mesh.routers[0]->send(mesh.id(1), RouterWire::ROUTER_PROTOCOL_GROUP, 0, { 1 }).has_value());
+    mesh.routers[0]->stop();
+    EXPECT_FALSE(mesh.routers[0]->send(mesh.id(1), 0x10, 0, { 1 }).has_value());
+}

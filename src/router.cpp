@@ -43,9 +43,9 @@ struct Router::Event {
     struct NeighborConnected    { PeerId peerId; };
     struct NeighborDisconnected { PeerId peerId; };
     struct FrameReceived        { NetworkMessage message; };
-    struct BroadcastRequested   { RoutedMessage message; };                         // built and signed by Router::broadcast
+    struct SendRequested        { RoutedMessage message; };                         // built (and signed when required) by broadcast() / send()
 
-    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, BroadcastRequested> content;
+    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, SendRequested> content;
 };
 
 // The only object Network holds: it owns the queue, so Network may outlive the Router without dangling.
@@ -125,7 +125,28 @@ std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::
     message.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(message));    // Ed25519 off the Router thread
 
     const uint64_t msgId = message.msgId;
-    this->inbox->events.push({ Event::BroadcastRequested{ std::move(message) } });
+    this->inbox->events.push({ Event::SendRequested{ std::move(message) } });
+    return msgId;
+}
+
+std::optional<uint64_t> Router::send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options) {
+    if (!this->running.load() || group > RouterWire::MAX_ROUTED_GROUP || this->config.unicastTtl == 0 || destination == this->selfIdentity->getPeerId()) return std::nullopt;
+
+    RoutedMessage message;
+    message.group             = group;
+    message.subtype           = subtype;
+    message.mode              = RoutingMode::Unicast;
+    message.ackRequested      = options.ackRequested;
+    message.ttlInitial        = this->config.unicastTtl;
+    message.ttlRemaining      = this->config.unicastTtl;
+    message.msgId             = randomMessageId();
+    message.sentAtUnixSeconds = currentUnixSeconds();
+    message.sender            = this->selfIdentity->getPeerId();
+    message.destination       = destination;
+    message.payload           = std::move(payload);
+
+    const uint64_t msgId = message.msgId;
+    this->inbox->events.push({ Event::SendRequested{ std::move(message) } });
     return msgId;
 }
 
@@ -145,7 +166,7 @@ std::vector<PeerId> Router::getNeighbors() const {
 }
 
 RouterStatistics Router::getStatistics() const {
-    return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load() };
+    return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(), this->localFloods.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -205,8 +226,11 @@ void Router::processEvent(Event& event) {
             // processed normally — only replies to that neighbor will fail.
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
-        } else {
+        } else if (RouterWire::reachesEveryNode(content.message.mode)) {
             this->sendOwnBroadcast(content.message);
+        } else {
+            this->seenMessages.remember({ content.message.sender, content.message.msgId }, content.message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+            this->forwardUnicast(content.message, std::nullopt);
         }
     }, event.content);
 }
@@ -320,7 +344,11 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
         this->handleIncomingBroadcast(std::move(routed), message.source);
         return;
     }
-    // Point-to-point modes and routed Router messages start in R-5
+    if (routed.mode == RoutingMode::Unicast && routed.group <= RouterWire::MAX_ROUTED_GROUP) {
+        this->handleIncomingUnicast(std::move(routed), message.source);
+        return;
+    }
+    // ROUTED (R-6) and the Router's own routed messages (ACK R-5 c, RECORD_ROUTE R-5 d)
     std::cerr << "Router: routed message mode " << static_cast<int>(routed.mode) << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
 }
 
@@ -396,7 +424,7 @@ void Router::acceptBroadcastWithKey(RoutedMessage message, const PeerId& receive
         std::lock_guard lock(this->routesMutex);
         this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
     }
-    this->deliverLocally(message);
+    this->deliverLocally(message, true);                                            // signature checked
     this->spreadNewMessage(message, receivedFrom);
 }
 
@@ -477,7 +505,50 @@ bool Router::sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& fr
     return true;
 }
 
-void Router::deliverLocally(const RoutedMessage& message) {
+// docs/router.md 4.2. Not signed (D12), so "seen" is recorded at once — and nothing is learned from it (D5: only
+// messages signed by the destination teach routes).
+void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom) {
+    if (message.sender == this->selfIdentity->getPeerId() || this->isAlreadySeen(message)) {   // local flooding brings copies
+        ++this->duplicatesDropped;
+        return;
+    }
+    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+
+    if (message.destination == this->selfIdentity->getPeerId()) {
+        this->deliverLocally(message, message.sender == receivedFrom);               // the link proves only a direct neighbor
+        return;
+    }
+    if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
+    message.ttlRemaining -= 1;
+    this->forwardUnicast(message, receivedFrom);
+}
+
+// The next hop for one node: the destination itself when it is a neighbor, else the learned routes in order (the first
+// that accepts the send), else every neighbor but the one it came from — local flooding, bounded by TTL and duplicates
+void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
+    const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
+    if (frame.empty()) return;
+    const PeerId& destination = *outgoing.destination;
+    const std::vector<PeerId> neighbors = this->neighborsSnapshot();
+
+    if (std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) return;
+
+    std::vector<PeerId> nextHops;
+    {
+        std::lock_guard lock(this->routesMutex);
+        nextHops = this->routes.nextHops(destination, receivedFrom);
+    }
+    for (const PeerId& nextHop : nextHops) {
+        if (nextHop != outgoing.sender && this->sendFullCopy(nextHop, frame)) return;
+    }
+
+    ++this->localFloods;
+    for (const PeerId& neighbor : neighbors) {
+        if (neighbor != receivedFrom && neighbor != outgoing.sender) this->sendFullCopy(neighbor, frame);
+    }
+}
+
+void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticated) {
     RoutedDelivery delivery;
     delivery.sender       = message.sender;
     delivery.msgId        = message.msgId;
@@ -485,6 +556,7 @@ void Router::deliverLocally(const RoutedMessage& message) {
     delivery.subtype      = message.subtype;
     delivery.mode         = message.mode;
     delivery.hopsTraveled = hopsTraveled(message);
+    delivery.senderAuthenticated = senderAuthenticated;
     delivery.payload      = message.payload;
 
     std::vector<std::shared_ptr<RouterEventListener>> snapshot;
