@@ -72,10 +72,10 @@ TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
     TcpServer listening("127.0.0.1", serverPort, 16);
     std::atomic<int> accepted{0};
     listening.onConnect([&](int fd, const sockaddr_storage*) { ++accepted; ::close(fd); });
-    ASSERT_EQ(listening.start(), 0);
+    ASSERT_TRUE(listening.start());
 
     TcpClient client;
-    ASSERT_EQ(client.connect("127.0.0.1", serverPort, 2s), 0);
+    ASSERT_EQ(client.connect("127.0.0.1", serverPort, 2s), ConnectError::None);
     const int fd = client.release();
     EXPECT_GE(fd, 1100);
     ::close(fd);
@@ -83,7 +83,7 @@ TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
     BlackholeListener blackhole;
     TcpClient hanging;
     const auto start = std::chrono::steady_clock::now();
-    EXPECT_EQ(hanging.connect("127.0.0.1", blackhole.port, 1s), 102);                         // 102 = timed out
+    EXPECT_EQ(hanging.connect("127.0.0.1", blackhole.port, 1s), ConnectError::TimedOut);
     EXPECT_GE(std::chrono::steady_clock::now() - start, 900ms);
 
     listening.stop();
@@ -93,7 +93,7 @@ TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
 // (Linux does, macOS/BSD may not). It must return promptly, not after the 500 ms safety timeout.
 TEST(TcpServerTest, StopReturnsPromptly) {
     TcpServer server("127.0.0.1", pickUnusedPort(), 16);
-    ASSERT_EQ(server.start(), 0);
+    ASSERT_TRUE(server.start());
     std::this_thread::sleep_for(50ms);                                                        // let the listener enter poll()
 
     const auto start = std::chrono::steady_clock::now();
@@ -104,12 +104,12 @@ TEST(TcpServerTest, StopReturnsPromptly) {
 // R8: the epoll descriptor used to leak on every start/stop. Restarting the server must not grow the descriptor table.
 TEST(TcpServerTest, RestartDoesNotLeakDescriptors) {
     TcpServer server("127.0.0.1", pickUnusedPort(), 16);
-    ASSERT_EQ(server.start(), 0);
+    ASSERT_TRUE(server.start());
     server.stop();
     const size_t baseline = countOpenFileDescriptors();
 
     for (int i = 0; i < 20; ++i) {
-        ASSERT_EQ(server.start(), 0);
+        ASSERT_TRUE(server.start());
         server.stop();
     }
     EXPECT_EQ(countOpenFileDescriptors(), baseline);
@@ -121,10 +121,10 @@ TEST(TcpServerTest, AcceptsEveryQueuedConnection) {
     TcpServer server("127.0.0.1", port, 64);
     std::atomic<int> accepted{0};
     server.onConnect([&](int fd, const sockaddr_storage*) { ++accepted; ::close(fd); });
-    ASSERT_EQ(server.start(), 0);
+    ASSERT_TRUE(server.start());
 
     std::vector<TcpClient> clients(20);
-    for (auto& client : clients) ASSERT_EQ(client.connect("127.0.0.1", port, 2s), 0);
+    for (auto& client : clients) ASSERT_EQ(client.connect("127.0.0.1", port, 2s), ConnectError::None);
 
     const auto deadline = std::chrono::steady_clock::now() + 2s;
     while (accepted.load() < 20 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(10ms);
@@ -136,7 +136,44 @@ TEST(TcpServerTest, AcceptsEveryQueuedConnection) {
 // Destroying a running server must stop its thread (a joinable std::thread in the destructor would terminate).
 TEST(TcpServerTest, DestructorStopsRunningServer) {
     auto server = std::make_unique<TcpServer>("127.0.0.1", pickUnusedPort(), 16);
-    ASSERT_EQ(server->start(), 0);
+    ASSERT_TRUE(server->start());
     server.reset();
     SUCCEED();
+}
+
+// P7: transport no longer logs — a failed start reports what failed and the errno, the caller decides how to log it.
+TEST(TcpServerTest, StartOnTakenPortReportsBind) {
+    const uint16_t port = pickUnusedPort();
+    TcpServer first("127.0.0.1", port, 16);
+    ASSERT_TRUE(first.start());
+
+    TcpServer second("127.0.0.1", port, 16);
+    const ListenStartResult result = second.start();
+    EXPECT_FALSE(result);
+    EXPECT_EQ(result.error, ListenError::Bind);
+    EXPECT_EQ(result.errorNumber, EADDRINUSE);
+    EXPECT_EQ(listenErrorName(result.error), "bind");
+}
+
+TEST(TcpServerTest, StartOnNonNumericAddressReportsInvalidAddress) {
+    TcpServer server("localhost", pickUnusedPort(), 16);
+    EXPECT_EQ(server.start().error, ListenError::InvalidAddress);
+}
+
+TEST(TcpClientTest, ResolveFailureIsReported) {
+    TcpClient client;
+    const ConnectError error = client.connect("no-such-host.invalid", 1, 1s);
+    EXPECT_EQ(error, ConnectError::ResolveFailed);
+    EXPECT_EQ(connectErrorName(error), "address resolution failed");
+}
+
+TEST(TcpClientTest, ExceptionFromConnectCallbackReachesCaller) {
+    const uint16_t port = pickUnusedPort();
+    TcpServer server("127.0.0.1", port, 16);
+    server.onConnect([](int fd, const sockaddr_storage*) { ::close(fd); });
+    ASSERT_TRUE(server.start());
+
+    TcpClient client;
+    client.onConnect([](int, const sockaddr_storage*) { throw std::runtime_error("callback failed"); });
+    EXPECT_THROW(client.connect("127.0.0.1", port, 2s), std::runtime_error);
 }

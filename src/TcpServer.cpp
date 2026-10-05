@@ -3,6 +3,20 @@
 #include <cerrno>
 #include <chrono>
 
+std::string_view invilite::Transport::listenErrorName(ListenError error) {
+    switch (error) {
+        case ListenError::None:           return "none";
+        case ListenError::InvalidAddress: return "listen address is not a numeric IPv4/IPv6 address";
+        case ListenError::SocketCreation: return "socket creation";
+        case ListenError::SocketOption:   return "socket option";
+        case ListenError::Bind:           return "bind";
+        case ListenError::Listen:         return "listen";
+        case ListenError::NonBlocking:    return "non-blocking mode";
+        case ListenError::WakeupSignal:   return "wakeup signal";
+    }
+    return "unknown";
+}
+
 invilite::Transport::TcpServer::TcpServer(std::string listenAddress, const int port, const int backlog)
     : listenAddress(std::move(listenAddress)), serverPort(port), backlog(backlog), serverSocket(-1) {}
 
@@ -10,7 +24,7 @@ invilite::Transport::TcpServer::~TcpServer() {
     this->stop();                                                                   // a still-running listener thread would std::terminate on destruction
 }
 
-int invilite::Transport::TcpServer::start() {
+invilite::Transport::ListenStartResult invilite::Transport::TcpServer::start() {
     // Stop server if running
     this->stop();
 
@@ -28,15 +42,13 @@ int invilite::Transport::TcpServer::start() {
         v4->sin_port   = htons(this->serverPort);
         bindAddressLength = sizeof(sockaddr_in);
     } else {
-        std::cerr << "Error: listen address is not a numeric IPv4/IPv6 address: " << this->listenAddress << std::endl;
-        return -8;
+        return {ListenError::InvalidAddress, 0};
     }
 
     // Create new server socket
     this->serverSocket = socket(bindAddress.ss_family, SOCK_STREAM, 0);
     if (this->serverSocket == -1) {
-        std::cerr << "Error: Cannot create socket" << std::endl;
-        return -1;
+        return {ListenError::SocketCreation, errno};
     }
 
     int opt;
@@ -48,53 +60,45 @@ int invilite::Transport::TcpServer::start() {
     // Set reuse address option
     opt = 1;
     if (setsockopt(this->serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-        perror("setsockopt");
-        return -2;
+        return {ListenError::SocketOption, errno};
     }
 
     // Set TCP keep alive option
     opt = 1;
     if (setsockopt(this->serverSocket, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt)) == -1) {
-        perror("setsockopt");
-        return -3;
+        return {ListenError::SocketOption, errno};
     }
 
     // Send max. socket data send time
     if (setsockopt(this->serverSocket, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout)) < 0) {
-        perror("setsockopt");
-        return -4;
+        return {ListenError::SocketOption, errno};
     }
 
     // "::" also accepts IPv4 (dual stack) — the OS default for IPV6_V6ONLY differs between systems, so set it explicitly
     if (bindsEveryIpv6Interface) {
         opt = 0;
         if (setsockopt(this->serverSocket, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
-            perror("setsockopt");
-            return -5;
+            return {ListenError::SocketOption, errno};
         }
     }
 
     if (bind(this->serverSocket, reinterpret_cast<sockaddr*>(&bindAddress), bindAddressLength) < 0) {
-        std::cerr << "Error: Cannot bind socket to " << this->listenAddress << ":" << this->serverPort << std::endl;
-        return -6;
+        return {ListenError::Bind, errno};
     }
 
     if (listen(this->serverSocket, this->backlog) < 0) {
-        std::cerr << "Error: Cannot listen on socket" << std::endl;
-        return -7;
+        return {ListenError::Listen, errno};
     }
 
     // Non-blocking accept: a client that resets between poll() and accept() must not leave the thread stuck in accept()
     if (!Platform::setNonBlocking(this->serverSocket)) {
-        std::cerr << "Error: Cannot set listening socket non-blocking" << std::endl;
-        return -9;
+        return {ListenError::NonBlocking, errno};
     }
 
     try {
         this->stopSignal.open();
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return -10;
+    } catch (const std::exception&) {
+        return {ListenError::WakeupSignal, 0};                                      // the exception carries no errno
     }
 
     // Start server accept thread
@@ -102,7 +106,7 @@ int invilite::Transport::TcpServer::start() {
     this->serverThread = std::thread(&TcpServer::serverListener, this);
     Platform::setThreadName(this->serverThread, "TcpServer");
 
-    return 0;
+    return {};
 }
 
 void invilite::Transport::TcpServer::stop() {
@@ -132,7 +136,7 @@ void invilite::Transport::TcpServer::serverListener() {
         const int ready = Platform::waitForSockets(watched, 2, 500);                // timeout is only a safety net — stop() wakes us
         if (ready < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "Error: poll on listening socket failed, errno=" << errno << std::endl;
+            if (this->onListenerFailureCallback) this->onListenerFailureCallback(ListenerFailure::PollFailed, errno);
             break;                                                                  // retrying a failing poll would spin at 100% CPU
         }
         if (ready == 0 || !(watched[0].revents & POLLIN)) continue;
@@ -148,7 +152,7 @@ void invilite::Transport::TcpServer::serverListener() {
                 if (errno == EINTR || errno == ECONNABORTED) continue;              // transient, try the next one
                 // Out of descriptors (EMFILE/ENFILE) or similar: the connection stays queued and poll() keeps reporting it.
                 // Back off briefly instead of spinning; a burst of refused clients is better than a pegged CPU.
-                std::cerr << "Error: Cannot accept client connection, errno=" << errno << std::endl;
+                if (this->onListenerFailureCallback) this->onListenerFailureCallback(ListenerFailure::AcceptFailed, errno);
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 break;
             }
@@ -164,4 +168,8 @@ void invilite::Transport::TcpServer::serverListener() {
 
 void invilite::Transport::TcpServer::onConnect(const OnConnectCallback &callback) {
     on_connect_callback_ = callback;
+}
+
+void invilite::Transport::TcpServer::onListenerFailure(const OnListenerFailureCallback& callback) {
+    this->onListenerFailureCallback = callback;
 }

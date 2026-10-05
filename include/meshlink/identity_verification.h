@@ -7,6 +7,8 @@
 #include "meshlink/identity.h"
 #include "meshlink/connection.h"
 #include <chrono>
+#include <cstdint>
+#include <string_view>
 
 using std::chrono::milliseconds;
 
@@ -36,13 +38,25 @@ enum class VerificationResult : uint8_t {
     InvalidMessage,
 };
 
+// Handshake message at which verification failed (None on success)
+enum class VerificationStep : uint8_t { None, Msg1, Msg2, Msg3 };
+
+// Result of a verification run. Verification does not log: the caller (Network) logs the outcome with its context.
+struct VerificationOutcome {
+    VerificationResult result;
+    VerificationStep   failedAt = VerificationStep::None;
+};
+
+std::string_view verificationResultName(VerificationResult result);
+std::string_view verificationStepName(VerificationStep step);
+
 class IdentityVerification {
 public:
     // Initiator side. `flagsSelf` is our intent for this session (e.g. probe=true when
     // we're validating a known peer's reachability without joining their peer pool).
     // On success, `remoteFlagsOut` receives the responder's flags byte (currently always 0,
     // but exposed for forward compatibility).
-    static VerificationResult runAsInitiator(
+    static VerificationOutcome runAsInitiator(
         Connection& conn,
         const LocalIdentity& selfIdentity,
         std::string_view nodeName,
@@ -54,7 +68,7 @@ public:
     // Responder side. Always replies with flags_self = 0 (no responder-side signalling
     // defined yet). `remoteFlagsOut` receives the initiator's flags byte — caller uses
     // this to distinguish probe vs. normal connection and branch accordingly.
-    static VerificationResult runAsResponder(
+    static VerificationOutcome runAsResponder(
         Connection& conn,
         const LocalIdentity& selfIdentity,
         std::string_view nodeName,

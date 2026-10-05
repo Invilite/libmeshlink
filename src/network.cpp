@@ -207,7 +207,9 @@ void Network::start() {
             this->onIncomingConnection(fd, addr);
         });
 
-        if (this->tcpServer->start() != 0) {
+        if (const Transport::ListenStartResult listening = this->tcpServer->start(); !listening) {
+            std::cerr << "Network: cannot listen on " << this->config.listenAddress << ":" << this->config.listenPort << ": "
+                      << Transport::listenErrorName(listening.error) << " (" << std::strerror(listening.errorNumber) << ")" << std::endl;
             this->tcpServer.reset();
             this->ioWakeup.close();
             this->running.store(false);
@@ -543,14 +545,14 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 
     PeerIdentity remoteIdentity;
     IdentityFlags remoteFlags;                                                          // 6.1: receive peer intent (probe vs normal)
-    const VerificationResult vr = IdentityVerification::runAsResponder(
+    const VerificationOutcome verification = IdentityVerification::runAsResponder(
             *conn, *this->selfIdentity, this->config.nodeName, remoteIdentity, remoteFlags,
             std::min(IDENTITY_STEP_TIMEOUT, timeRemaining())
     );
 
-    if (vr != VerificationResult::Success) {
-        std::cerr << "Network: incoming identity verification failed, result="
-                  << static_cast<int>(vr) << " fd=" << fd << std::endl;
+    if (verification.result != VerificationResult::Success) {
+        std::cerr << "Network: incoming identity verification failed: " << verificationResultName(verification.result)
+                  << " at " << verificationStepName(verification.failedAt) << " fd=" << fd << std::endl;
         conn->close();
         self->done.store(true, std::memory_order_release);
         return;
@@ -594,10 +596,10 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
         if (addr) remoteAddr = *addr;
     });
 
-    const uint8_t connectResult = client.connect(address, port, std::chrono::seconds(OUTBOUND_CONNECT_TIMEOUT));
-    if (connectResult != 0) {
+    const Transport::ConnectError connectResult = client.connect(address, port, std::chrono::seconds(OUTBOUND_CONNECT_TIMEOUT));
+    if (connectResult != Transport::ConnectError::None) {
         std::cerr << "Network: outgoing connect to " << address << ":" << port
-                  << " failed, code=" << static_cast<int>(connectResult) << std::endl;
+                  << " failed: " << Transport::connectErrorName(connectResult) << std::endl;
         return result;                                                              // verification defaults to ConnectionError
     }
 
@@ -634,16 +636,16 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     // ── Identity verification ─────────────────────────────────────────────────
     PeerIdentity  remoteIdentity;
     IdentityFlags remoteFlags;
-    const VerificationResult vr = IdentityVerification::runAsInitiator(
+    const VerificationOutcome verification = IdentityVerification::runAsInitiator(
             *connection, *this->selfIdentity, this->config.nodeName,
             flagsSelf, remoteIdentity, remoteFlags
     );
 
-    if (vr != VerificationResult::Success) {
+    if (verification.result != VerificationResult::Success) {
         std::cerr << "Network: outgoing identity verification failed for " << address << ":" << port
-                  << ", result=" << static_cast<int>(vr) << std::endl;
+                  << ": " << verificationResultName(verification.result) << " at " << verificationStepName(verification.failedAt) << std::endl;
         connection->close();
-        result.verification = vr;
+        result.verification = verification.result;
         return result;
     }
 

@@ -6,7 +6,6 @@
 #include <botan/auto_rng.h>
 
 #include <cstring>
-#include <iostream>
 #include <stdexcept>
 #include <algorithm>
 
@@ -83,7 +82,29 @@ PeerIdentity IdentityVerification::buildPeerIdentity(
 
 // ── Initiator ────────────────────────────────────────────────────────────────
 
-VerificationResult IdentityVerification::runAsInitiator(
+std::string_view verificationResultName(VerificationResult result) {
+    switch (result) {
+        case VerificationResult::Success:          return "success";
+        case VerificationResult::Timeout:          return "timeout";
+        case VerificationResult::InvalidSignature: return "invalid signature";
+        case VerificationResult::InvalidPeerID:    return "invalid peer id";
+        case VerificationResult::ConnectionError:  return "connection error";
+        case VerificationResult::InvalidMessage:   return "invalid message";
+    }
+    return "unknown";
+}
+
+std::string_view verificationStepName(VerificationStep step) {
+    switch (step) {
+        case VerificationStep::None: return "-";
+        case VerificationStep::Msg1: return "MSG1";
+        case VerificationStep::Msg2: return "MSG2";
+        case VerificationStep::Msg3: return "MSG3";
+    }
+    return "unknown";
+}
+
+VerificationOutcome IdentityVerification::runAsInitiator(
     Connection& conn,
     const LocalIdentity& selfIdentity,
     std::string_view nodeName,
@@ -115,7 +136,7 @@ VerificationResult IdentityVerification::runAsInitiator(
     // send() never blocks and may leave part of the message queued; the I/O thread does not own this connection yet,
     // so this worker pushes it out itself (blocking is fine on an ephemeral handshake thread).
     if (conn.send(&msg1) <= 0 || !conn.drainSendQueue(timeout)) {
-        return VerificationResult::ConnectionError;
+        return {VerificationResult::ConnectionError, VerificationStep::Msg1};
     }
 
     // ── Msg2: receive responder's intro + signature ───────────────────────────
@@ -123,9 +144,9 @@ VerificationResult IdentityVerification::runAsInitiator(
     std::vector<uint8_t> msg2;
     const ssize_t received = conn.receive(msg2, timeout);
 
-    if (received == 0) return VerificationResult::Timeout;
-    if (received < 0)  return VerificationResult::ConnectionError;
-    if (msg2.size() < MSG2_SIZE) return VerificationResult::InvalidMessage;
+    if (received == 0) return {VerificationResult::Timeout, VerificationStep::Msg2};
+    if (received < 0)  return {VerificationResult::ConnectionError, VerificationStep::Msg2};
+    if (msg2.size() < MSG2_SIZE) return {VerificationResult::InvalidMessage, VerificationStep::Msg2};
 
     const uint8_t* ptr = msg2.data();
     std::span<const uint8_t> nonceR      (ptr, NONCE_SIZE);      ptr += NONCE_SIZE;
@@ -138,7 +159,7 @@ VerificationResult IdentityVerification::runAsInitiator(
     // Verify responder's signature — payload must include their flags byte to prevent bit-flipping.
     const std::vector<uint8_t> payloadR = buildSignPayload(nonceI, flagsR, ed25519PubR, x25519PubR, nameR);
     if (!verifySignature(ed25519PubR, payloadR, sigR)) {
-        return VerificationResult::InvalidSignature;
+        return {VerificationResult::InvalidSignature, VerificationStep::Msg2};
     }
 
     // ── Msg3: send our signature ──────────────────────────────────────────────
@@ -155,17 +176,17 @@ VerificationResult IdentityVerification::runAsInitiator(
 
     std::vector<uint8_t> msg3(sigI.begin(), sigI.end());
     if (conn.send(&msg3) <= 0 || !conn.drainSendQueue(timeout)) {
-        return VerificationResult::ConnectionError;
+        return {VerificationResult::ConnectionError, VerificationStep::Msg3};
     }
 
     remoteIdentity = buildPeerIdentity(ed25519PubR, x25519PubR, sigR, nameR);
     remoteFlagsOut = flagsR;
-    return VerificationResult::Success;
+    return {VerificationResult::Success};
 }
 
 // ── Responder ────────────────────────────────────────────────────────────────
 
-VerificationResult IdentityVerification::runAsResponder(
+VerificationOutcome IdentityVerification::runAsResponder(
         Connection& conn,
         const LocalIdentity& selfIdentity,
         std::string_view nodeName,
@@ -180,9 +201,9 @@ VerificationResult IdentityVerification::runAsResponder(
     std::vector<uint8_t> msg1;
     const ssize_t received = conn.receive(msg1, timeout);
 
-    if (received == 0) return VerificationResult::Timeout;
-    if (received < 0)  { std::cerr << "IV responder: ConnectionError at MSG1 recv, code=" << received << std::endl; return VerificationResult::ConnectionError; }
-    if (msg1.size() < MSG1_SIZE) return VerificationResult::InvalidMessage;
+    if (received == 0) return {VerificationResult::Timeout, VerificationStep::Msg1};
+    if (received < 0)  return {VerificationResult::ConnectionError, VerificationStep::Msg1};
+    if (msg1.size() < MSG1_SIZE) return {VerificationResult::InvalidMessage, VerificationStep::Msg1};
 
     const uint8_t* ptr = msg1.data();
     std::span<const uint8_t> nonceI      (ptr, NONCE_SIZE);  ptr += NONCE_SIZE;
@@ -214,25 +235,24 @@ VerificationResult IdentityVerification::runAsResponder(
     msg2.insert(msg2.end(), sigR.begin(),                          sigR.end());
     msg2.insert(msg2.end(), packedName.begin(),                    packedName.end());
 
-    if (conn.send(&msg2) <= 0 || !conn.drainSendQueue(timeout)) { std::cerr << "IV responder: ConnectionError at MSG2 send" << std::endl; return VerificationResult::ConnectionError; }
+    if (conn.send(&msg2) <= 0 || !conn.drainSendQueue(timeout)) return {VerificationResult::ConnectionError, VerificationStep::Msg2};
 
     // ── Msg3: receive initiator's signature ───────────────────────────────────
     std::vector<uint8_t> msg3;
     const ssize_t received3 = conn.receive(msg3, timeout);
 
-    if (received3 == 0) return VerificationResult::Timeout;
-    if (received3 < 0)  { std::cerr << "IV responder: ConnectionError at MSG3 recv, code=" << received3 << std::endl; return VerificationResult::ConnectionError; }
-    if (msg3.size() < MSG3_SIZE) return VerificationResult::InvalidMessage;
+    if (received3 == 0) return {VerificationResult::Timeout, VerificationStep::Msg3};
+    if (received3 < 0)  return {VerificationResult::ConnectionError, VerificationStep::Msg3};
+    if (msg3.size() < MSG3_SIZE) return {VerificationResult::InvalidMessage, VerificationStep::Msg3};
 
     const std::vector<uint8_t> payloadI = buildSignPayload(nonceR, flagsI, ed25519PubI, x25519PubI, nameI);
     if (!verifySignature(ed25519PubI, payloadI, msg3)) {
-        std::cerr << "IV responder: InvalidSignature" << std::endl;
-        return VerificationResult::InvalidSignature;
+        return {VerificationResult::InvalidSignature, VerificationStep::Msg3};
     }
 
     remoteIdentity = buildPeerIdentity(ed25519PubI, x25519PubI, msg3, nameI);
     remoteFlagsOut = flagsI;
-    return VerificationResult::Success;
+    return {VerificationResult::Success};
 }
 
 } // namespace invilite::Mesh
