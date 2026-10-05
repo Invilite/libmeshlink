@@ -1284,6 +1284,11 @@ TEST(RouterTest, RoutedMessageForAnotherHopIsDropped) {
     EXPECT_EQ(mesh.routers[1]->getStatistics().routeErrorsSent, 0u);
     EXPECT_EQ(mesh.recorders[1]->total(), 0u);
     EXPECT_EQ(mesh.recorders[2]->total(), 0u);
+
+    // Control: the same crafted frame naming node 1 is relayed and delivered
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), craftRoutedFrame(mesh.id(0), mesh.id(2), { mesh.id(1) }, 0)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->total() == 1; }, 3s));
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routedForwarded, 1u);
 }
 
 // ROUTE_ERROR answers unsigned data whose sender is not authenticated: one neighbor gets at most one per interval
@@ -1309,6 +1314,17 @@ TEST(RouterTest, RouteErrorFromNodeOffTheRouteIsIgnored) {
     ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(error)), 0);
     std::this_thread::sleep_for(300ms);
     EXPECT_TRUE(mesh.recorders[0]->failuresFor(msgId).empty());
+
+    // Control: the same error signed by the route's relay counts — once, a repeat is ignored
+    for (int i = 0; i < 2; ++i) {
+        RoutedMessage genuine = testRouterMessage(mesh.id(1), mesh.id(0), RouterWire::SUBTYPE_ROUTE_ERROR, RouterWire::encodeRouteErrorPayload({ msgId, mesh.id(2), RouteErrorReason::NextHopSendRefused }));
+        genuine.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(genuine));
+        ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(genuine)), 0);
+    }
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(msgId).size() == 1; }, 3s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.recorders[0]->failuresFor(msgId).size(), 1u);
+    EXPECT_EQ(mesh.recorders[0]->failuresFor(msgId).front().reportedBy, mesh.id(1));
 }
 
 // The probe's destination answers along the reversed recorded route, which proves the route both ways
@@ -1319,4 +1335,21 @@ TEST(RouterTest, RouteReportReturnsAlongReversedRoute) {
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probeId).size() == 1; }, 5s));
     EXPECT_EQ(mesh.routers[1]->getStatistics().routedForwarded, 1u);
     EXPECT_EQ(mesh.routers[2]->getStatistics().routedForwarded, 1u);
+}
+
+// Review R-6 I1: a send refused for a local reason (here: larger than the send queue) says nothing about the route — the
+// sender hears of the failure, but the route it learned through that first hop stays
+TEST(RouterTest, LocallyRefusedSendKeepsTheRoute) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t fromTwo = mesh.routers[2]->broadcast(0x10, 0, { 'b' }).value();           // node 0 learns "2 via 1"
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(2), fromTwo) == 1; }, 5s));
+
+    const uint64_t msgId = mesh.routers[0]->sendAlongRoute(mesh.id(2), { mesh.id(1) }, 0x10, 0, std::vector<uint8_t>(2 * 1024 * 1024, 'x')).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(msgId).size() == 1; }, 5s));
+    const RouteFailure failure = mesh.recorders[0]->failuresFor(msgId).front();
+    EXPECT_EQ(failure.reportedBy, mesh.id(0));                                                // the first hop failed here
+    EXPECT_EQ(failure.unreachableHop, mesh.id(1));
+    EXPECT_EQ(failure.reason, RouteErrorReason::NextHopSendRefused);
+    EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).size(), 1u);
 }

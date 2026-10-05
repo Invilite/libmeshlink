@@ -160,6 +160,7 @@ namespace invilite::Mesh {
         void receiveRouteErrorForUs(const RoutedMessage& error);
         void concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, const PeerId& unreachableHop, RouteErrorReason reason);
         void sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFrom, const PeerId& unreachableHop, RouteErrorReason reason);
+        [[nodiscard]] bool isNeighbor(const PeerId& node) const;
         [[nodiscard]] bool knowsWayTo(const PeerId& node) const;
         // UNICAST, or ROUTED along `relays` when given
         [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload, std::optional<std::vector<PeerId>> relays = std::nullopt) const;

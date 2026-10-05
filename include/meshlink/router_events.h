@@ -46,8 +46,9 @@ namespace invilite::Mesh {
     };
 
     // A message we sent along a source route (Router::sendAlongRoute) did not get through: a relay of the route reported
-    // that it could not hand it on (ROUTE_ERROR, signed by that relay). The route we had learned through its first hop is
-    // dropped as well.
+    // that it could not hand it on (ROUTE_ERROR, signed by that relay), or our own send to the first hop failed. When the
+    // next hop was no neighbor, the route we had learned through the first hop is dropped as well; a refused send (full
+    // queue, message too large) leaves it.
     struct RouteFailure {
         PeerId              destination{};
         uint64_t            msgId = 0;

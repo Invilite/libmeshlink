@@ -110,6 +110,8 @@ void Router::start() {
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
     this->unknownModeReportedAt.clear();
+    this->unicastAcksByNeighbor.clear();
+    this->routeErrorReportedAt.clear();
     this->awaitedReplies.clear();
     this->awaitedReplyOrder.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
@@ -574,7 +576,8 @@ void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& 
 // it toward anyone (review R-5 I4). So an ACK goes only to a neighbor or over a route we learned from the sender's own
 // signed messages — never by local flooding — and one neighbor gets at most unicastAcksPerNeighborPerSecond of them.
 bool Router::mayAcknowledgeUnsigned(const PeerId& sender, const PeerId& receivedFrom) {
-    if (!this->knowsWayTo(sender)) return false;
+    // A neighbor that already left gets no budget entry: it would never be erased (review R-6 M1)
+    if (!this->isNeighbor(receivedFrom) || !this->knowsWayTo(sender)) return false;
 
     const auto now = std::chrono::steady_clock::now();
     auto& [windowStart, acknowledged] = this->unicastAcksByNeighbor[receivedFrom];
@@ -584,12 +587,14 @@ bool Router::mayAcknowledgeUnsigned(const PeerId& sender, const PeerId& received
     return true;
 }
 
+bool Router::isNeighbor(const PeerId& node) const {
+    std::lock_guard lock(this->neighborsMutex);
+    return this->neighbors.contains(node);
+}
+
 // A neighbor, or a node we have a learned route to — what we may answer without local flooding
 bool Router::knowsWayTo(const PeerId& node) const {
-    {
-        std::lock_guard lock(this->neighborsMutex);
-        if (this->neighbors.contains(node)) return true;
-    }
+    if (this->isNeighbor(node)) return true;
     std::lock_guard lock(this->routesMutex);
     return !this->routes.nextHops(node).empty();
 }
@@ -636,7 +641,8 @@ void Router::concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, cons
     }
 
     const PeerId destination = *awaited->second.addressee;
-    {
+    if (reason != RouteErrorReason::NextHopSendRefused) {
+        // A refused send (full queue, message too large) says nothing about the route — only a missing link does (review R-6 I1)
         std::lock_guard lock(this->routesMutex);
         this->routes.forgetRoute(destination, relays.empty() ? destination : relays.front());
     }
@@ -648,7 +654,7 @@ void Router::concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, cons
 // like an ACK (review R-5 I4) — the error goes only over a known way, and one neighbor's messages cause at most one per
 // routeErrorInterval: forged ROUTED frames must not turn us into a source of signed traffic toward anyone.
 void Router::sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFrom, const PeerId& unreachableHop, RouteErrorReason reason) {
-    if (!this->knowsWayTo(stuck.sender)) return;
+    if (!this->isNeighbor(receivedFrom) || !this->knowsWayTo(stuck.sender)) return;  // a departed neighbor's entry would never be erased
     const auto now = std::chrono::steady_clock::now();
     auto& lastReport = this->routeErrorReportedAt[receivedFrom];
     if (lastReport && now - *lastReport < this->config.routeErrorInterval) return;
