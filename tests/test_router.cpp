@@ -1120,3 +1120,32 @@ TEST(RouterTest, MessageArrivingAfterDisconnectTeachesNoRoute) {
     alphaRouter.stop();
     alpha.network->stop();
 }
+
+// Review R-5 C1: unsigned UNICASTs cost nothing to forge. Overflowing the duplicate memory with them (sentAt far in the
+// future) must neither make genuine signed traffic look already seen, nor silence unsigned traffic after the flood ends
+TEST(RouterTest, UnsignedFloodDoesNotSilenceRoutedTraffic) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& config) { config.duplicateCacheCapacity = 16; });
+    ASSERT_TRUE(mesh.ready);
+
+    const auto nowUnix = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    for (int i = 0; i < 40; ++i) {
+        RoutedMessage forged;
+        forged.group = 0x10;
+        forged.mode = RoutingMode::Unicast;
+        forged.ttlInitial = forged.ttlRemaining = 16;
+        forged.msgId = randomTestMsgId();
+        forged.sentAtUnixSeconds = nowUnix + 200;                                    // inside the accepted clock skew
+        forged.sender = RouterMesh::peerIdOf(static_cast<uint8_t>(0x80 + i));
+        forged.destination = RouterMesh::peerIdOf(0x77);
+        forged.payload = { 'f' };
+        ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(forged)), 0);
+    }
+    std::this_thread::sleep_for(300ms);
+
+    const uint64_t broadcastId = mesh.routers[1]->broadcast(0x10, 0, { 'b' }).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(1), broadcastId) == 1; }, 3s));
+
+    std::this_thread::sleep_for(1100ms);                                             // the flood is over: the next second is new
+    const uint64_t unicastId = mesh.routers[1]->send(mesh.id(0), 0x10, 0, { 'u' }).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(1), unicastId) == 1; }, 3s));
+}

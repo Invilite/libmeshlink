@@ -72,7 +72,7 @@ Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, s
                std::shared_ptr<Logger> logger)
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
       log(logger ? std::move(logger) : network.getLogger(), "Router"),
-      inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
+      inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity), unsignedSeenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
       plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
 
 Router::~Router() {
@@ -255,7 +255,7 @@ void Router::processEvent(Event& event) {
         } else {
             const bool isProbe = content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP && content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE;
             if (content.message.ackRequested || isProbe) this->awaitReply(content.message.msgId, content.message.destination);
-            this->seenMessages.remember({ content.message.sender, content.message.msgId }, content.message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+            this->rememberSeen(content.message);
             this->forwardUnicast(content.message, std::nullopt);
         }
     }, event.content);
@@ -443,7 +443,7 @@ void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, st
         this->log.formatRateLimited(this->routerThreadLogLimiter, "invalid signature:" + shortPeerId(receivedFrom), LogLevel::Warning, "message {:x} claiming sender {} has an invalid signature, dropped (from {})", message.msgId, shortPeerId(message.sender), shortPeerId(receivedFrom));
         return;
     }
-    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    this->rememberSeen(message);
     if (RouterWire::reachesEveryNode(message.mode)) this->acceptVerifiedBroadcast(message, receivedFrom);
     else                                            this->acceptVerifiedRouterMessage(std::move(message), receivedFrom);
 }
@@ -537,7 +537,7 @@ RoutedMessage Router::buildRouterMessage(const PeerId& destination, uint16_t sub
 }
 
 void Router::sendOwnRouterMessage(const RoutedMessage& message) {
-    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    this->rememberSeen(message);
     this->forwardUnicast(message, std::nullopt);
 }
 
@@ -607,11 +607,21 @@ void Router::reactToBroadcastDuplicate(const RoutedMessage& message, const PeerI
 
 // Remembered, or possibly forgotten early because the duplicate memory overflowed — either way it must not count as new
 bool Router::isAlreadySeen(const RoutedMessage& message) const {
-    return this->seenMessages.contains({ message.sender, message.msgId }) || this->seenMessages.predatesEvictedKeys(message.sentAtUnixSeconds);
+    const SeenMessageCache& seen = RouterWire::requiresSignature(message.group, message.mode) ? this->seenMessages : this->unsignedSeenMessages;
+    return seen.contains({ message.sender, message.msgId }) || seen.predatesEvictedKeys(message.sentAtUnixSeconds);
+}
+
+// Unsigned messages (UNICAST data, D12) cost nothing to forge, so they get their own memory: a flood of them cannot push
+// out signed keys nor raise the floor signed messages are judged by. Their sentAt is capped at our clock — a forged
+// future time would otherwise keep the floor up, and unsigned traffic silenced, for the whole clock skew (review R-5 C1).
+void Router::rememberSeen(const RoutedMessage& message) {
+    const auto now = std::chrono::steady_clock::now();
+    if (RouterWire::requiresSignature(message.group, message.mode)) this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, now);
+    else this->unsignedSeenMessages.remember({ message.sender, message.msgId }, std::min(message.sentAtUnixSeconds, currentUnixSeconds()), now);
 }
 
 void Router::sendOwnBroadcast(const RoutedMessage& message) {
-    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());   // echoes are dropped
+    this->rememberSeen(message);                                                    // echoes are dropped
     this->spreadNewMessage(message, std::nullopt);
 }
 
@@ -667,7 +677,7 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
         ++this->duplicatesDropped;
         return;
     }
-    this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    this->rememberSeen(message);
 
     if (message.destination == this->selfIdentity->getPeerId()) {
         this->deliverLocally(message, message.sender == receivedFrom);               // the link proves only a direct neighbor

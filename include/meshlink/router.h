@@ -137,6 +137,7 @@ namespace invilite::Mesh {
         void awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom);
         void retryPendingVerifications();
         [[nodiscard]] bool isAlreadySeen(const RoutedMessage& message) const;
+        void rememberSeen(const RoutedMessage& message);
         void acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
         void acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom);
         void acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom);
@@ -178,7 +179,8 @@ namespace invilite::Mesh {
         std::atomic<bool>                           running{false};
 
         // Router thread only
-        SeenMessageCache                            seenMessages;
+        SeenMessageCache                            seenMessages;                   // signed messages
+        SeenMessageCache                            unsignedSeenMessages;           // unsigned UNICAST data — kept apart (review R-5 C1)
         PlumtreeState                               plumtree;
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
