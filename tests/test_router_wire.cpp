@@ -660,3 +660,16 @@ TEST(RouterWireTest, PresenceTravelsToEveryNodeOnly) {
     ack[2] = RouterWire::SUBTYPE_PRESENCE & 0xFF;
     EXPECT_EQ(decodeFrame(ack, out), RoutedMessageStatus::PresenceToOneNode);
 }
+
+TEST(RouterWireTest, PresenceReplyIsAnEmptyRouterMessageToOneNode) {
+    const auto sender = LocalIdentity::generate();
+    RoutedMessage reply = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
+    reply.subtype = RouterWire::SUBTYPE_PRESENCE_REPLY;
+    reply.payload.clear();
+    reply.signature = sender.sign(RouterWire::bytesToSign(reply));
+    RoutedMessage out;
+    EXPECT_EQ(decodeFrame(RouterWire::encode(reply), out), RoutedMessageStatus::Success);
+    reply.payload = { 1 };
+    reply.signature = sender.sign(RouterWire::bytesToSign(reply));
+    EXPECT_EQ(decodeFrame(RouterWire::encode(reply), out), RoutedMessageStatus::MalformedEncoding);
+}

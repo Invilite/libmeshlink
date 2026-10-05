@@ -178,7 +178,7 @@ namespace {
         if (message.subtype == SUBTYPE_ROUTE_ERROR) { RouteErrorPayload error; return decodeRouteErrorPayload(message.payload, error); }
         if (message.subtype == SUBTYPE_RECORD_ROUTE)  { RecordRoutePayload probe; return decodeRecordRoutePayload(message.payload, probe); }
         if (message.subtype == SUBTYPE_ROUTE_REPORT)  { RouteReportPayload report; return decodeRouteReportPayload(message.payload, report); }
-        if (message.subtype == SUBTYPE_PRESENCE)      return message.payload.empty();
+        if (message.subtype == SUBTYPE_PRESENCE || message.subtype == SUBTYPE_PRESENCE_REPLY) return message.payload.empty();
         return true;
     }
 }

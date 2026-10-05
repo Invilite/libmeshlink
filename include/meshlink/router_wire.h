@@ -173,6 +173,7 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_RECORD_ROUTE          = 0x0102;                  // route probe (R-5)
         constexpr uint16_t SUBTYPE_ROUTE_REPORT          = 0x0103;                  // probe answer from the destination (R-5)
         constexpr uint16_t SUBTYPE_PRESENCE              = 0x0104;                  // "I am here": a node's Router to every other Router, empty — teaches the way back to it
+        constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender, empty — teaches it the way back to us
 
         // FLOOD and BROADCAST: to every node, no destination
         bool reachesEveryNode(RoutingMode mode);

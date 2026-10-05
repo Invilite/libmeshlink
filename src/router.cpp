@@ -133,6 +133,7 @@ void Router::start() {
         }
         this->presencePending = !this->neighbors.empty() && this->config.announcePresence && this->config.broadcastTtl > 0;
         this->lastPresenceAt.reset();
+        this->presenceRepliedAt.clear();
     }
 
     this->routerThread = std::thread(&Router::routerLoop, this);
@@ -244,7 +245,7 @@ std::optional<uint64_t> Router::sendAlongRoute(const PeerId& destination, std::v
 
 RouterStatistics Router::getStatistics() const {
     return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(),
-             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load() };
+             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -283,6 +284,23 @@ void Router::routerLoop() {
 // knows the way back to us (an ACK for unsigned data needs one, review R-5 I4) without the application having to
 // broadcast. At most once per presenceMinInterval; a neighbor arriving inside the interval is caught up when it ends, so
 // a later part of the network learns of us too.
+// A PRESENCE teaches us the way to its sender; our answer teaches the sender the way back to us — a node joining later
+// learns of nodes that get no new neighbor (and so send no PRESENCE). Over the route just learned, never by flooding; at
+// most once per presenceMinInterval to the same node.
+void Router::answerPresence(const PeerId& sender) {
+    const auto now = std::chrono::steady_clock::now();
+    if (this->presenceRepliedAt.size() >= 1024) {                                    // bounded: verified records are, but keep this map small
+        std::erase_if(this->presenceRepliedAt, [&](const auto& entry) { return now - entry.second >= this->config.presenceMinInterval; });
+        if (this->presenceRepliedAt.size() >= 1024) return;
+    }
+    const auto replied = this->presenceRepliedAt.find(sender);
+    if (replied != this->presenceRepliedAt.end() && now - replied->second < this->config.presenceMinInterval) return;
+    if (!this->knowsWayTo(sender)) return;                                          // the route was just learned — unless its neighbor left meanwhile
+    this->presenceRepliedAt[sender] = now;
+    ++this->presenceRepliesSent;
+    this->sendOwnRouterMessage(this->buildRouterMessage(sender, RouterWire::SUBTYPE_PRESENCE_REPLY, {}));
+}
+
 void Router::announcePresenceWhenDue(std::chrono::steady_clock::time_point now) {
     if (!this->presencePending || (this->lastPresenceAt && now - *this->lastPresenceAt < this->config.presenceMinInterval)) return;
     this->presencePending = false;
@@ -543,6 +561,8 @@ void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId&
     if (message.group != RouterWire::ROUTER_PROTOCOL_GROUP) {                       // PRESENCE is for Routers, not applications
         this->deliverLocally(message, true);                                        // signature checked
         if (message.ackRequested) this->sendAck(message);                           // every node is an addressee
+    } else if (message.subtype == RouterWire::SUBTYPE_PRESENCE) {
+        this->answerPresence(message.sender);
     }
     this->spreadNewMessage(message, receivedFrom);
 }
@@ -551,12 +571,13 @@ void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId&
 // every hop (D6, signed by the node it leads to — D5); the destination acts on it, relays forward it like any UNICAST —
 // a route probe with this relay added.
 void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom) {
-    const bool isAnswer = message.subtype == RouterWire::SUBTYPE_ACK || message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT;
+    const bool isAnswer = message.subtype == RouterWire::SUBTYPE_ACK || message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT || message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY;
     if (message.destination == this->selfIdentity->getPeerId()) {
         if (message.subtype == RouterWire::SUBTYPE_ACK)          this->receiveAckForUs(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT) this->receiveRouteReportForUs(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) this->sendRouteReport(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_ERROR)  this->receiveRouteErrorForUs(message);
+        if (message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
         return;                                                                     // unknown subtype: nothing
     }
     // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee

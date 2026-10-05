@@ -1386,3 +1386,24 @@ TEST(RouterTest, PresenceIsLimitedAndCaughtUp) {
     gammaRouter.stop();
     gamma.network->stop();
 }
+
+// A node that joins later learns the way to nodes that get no new neighbor (and so send no PRESENCE): every Router answers
+// a PRESENCE with a PRESENCE_REPLY to its sender — at most once per presenceMinInterval to the same node
+TEST(RouterTest, LateJoinerLearnsTheWayToEveryone) {
+    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& config) { config.announcePresence = true; });
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[2]->getRouteCandidates(mesh.id(0)).size() == 1; }, 5s));
+    const uint64_t repliesBefore = mesh.routers[0]->getStatistics().presenceRepliesSent;
+
+    TestNode gamma(mesh.secret, "gamma");
+    gamma.network->start();
+    gamma.network->connectToPeer("127.0.0.1", mesh.nodes[2]->port);
+    Router gammaRouter(*gamma.network, gamma.directory, gamma.identity);
+    gammaRouter.start();
+    EXPECT_TRUE(waitUntil([&] { return gammaRouter.getRouteCandidates(mesh.id(0)).size() == 1 && gammaRouter.getRouteCandidates(mesh.id(1)).size() == 1; }, 5s));
+    EXPECT_EQ(gammaRouter.getRouteCandidates(mesh.id(0)).front().via, mesh.id(2));
+    EXPECT_EQ(mesh.routers[0]->getStatistics().presenceRepliesSent, repliesBefore + 1);       // one answer to gamma
+    for (size_t i = 0; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->total(), 0u) << "node " << i;
+    gammaRouter.stop();
+    gamma.network->stop();
+}

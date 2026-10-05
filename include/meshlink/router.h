@@ -67,6 +67,7 @@ namespace invilite::Mesh {
         uint64_t    routedForwarded    = 0;                                         // ROUTED messages relayed along their source route
         uint64_t    routeErrorsSent    = 0;
         uint64_t    presenceSent       = 0;
+        uint64_t    presenceRepliesSent = 0;
     };
 
     struct SendOptions {
@@ -185,6 +186,7 @@ namespace invilite::Mesh {
         void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
         void announcePresenceWhenDue(std::chrono::steady_clock::time_point now);
+        void answerPresence(const PeerId& sender);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
         void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
@@ -213,6 +215,7 @@ namespace invilite::Mesh {
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
         bool                                        presencePending = false;        // a neighbor appeared since our last PRESENCE
         std::optional<std::chrono::steady_clock::time_point> lastPresenceAt;
+        std::unordered_map<PeerId, std::chrono::steady_clock::time_point, PeerIDHash> presenceRepliedAt;   // last PRESENCE_REPLY per node
         // Our messages waiting for answers (ACK_REQUESTED, route probes): by msgId, and in send order for expiry
         struct AwaitedReply {
             std::chrono::steady_clock::time_point   sentAt;
@@ -248,6 +251,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       routedForwarded{0};
         std::atomic<uint64_t>                       routeErrorsSent{0};
         std::atomic<uint64_t>                       presenceSent{0};
+        std::atomic<uint64_t>                       presenceRepliesSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;
