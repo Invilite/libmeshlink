@@ -51,6 +51,8 @@ namespace invilite::Mesh {
         size_t                      maxAwaitedReplies       = 4096;                 // messages waiting at once; the oldest is given up first
         size_t                      unicastAcksPerNeighborPerSecond = 32;           // ACKs we sign for unsigned UNICASTs one neighbor handed us (review R-5 I4)
         std::chrono::milliseconds   routeErrorInterval      = std::chrono::seconds(1);    // at most one ROUTE_ERROR per neighbor whose messages got stuck here
+        bool                        announcePresence        = true;                 // PRESENCE on new neighbors; off only for tests that count traffic
+        std::chrono::milliseconds   presenceMinInterval     = std::chrono::seconds(60);   // at most one PRESENCE per interval; a later new neighbor is caught up
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -64,6 +66,7 @@ namespace invilite::Mesh {
         uint64_t    acksSent           = 0;
         uint64_t    routedForwarded    = 0;                                         // ROUTED messages relayed along their source route
         uint64_t    routeErrorsSent    = 0;
+        uint64_t    presenceSent       = 0;
     };
 
     struct SendOptions {
@@ -181,6 +184,7 @@ namespace invilite::Mesh {
         void sendGraft(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
+        void announcePresenceWhenDue(std::chrono::steady_clock::time_point now);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
         void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
@@ -207,6 +211,8 @@ namespace invilite::Mesh {
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
+        bool                                        presencePending = false;        // a neighbor appeared since our last PRESENCE
+        std::optional<std::chrono::steady_clock::time_point> lastPresenceAt;
         // Our messages waiting for answers (ACK_REQUESTED, route probes): by msgId, and in send order for expiry
         struct AwaitedReply {
             std::chrono::steady_clock::time_point   sentAt;
@@ -241,6 +247,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       acksSent{0};
         std::atomic<uint64_t>                       routedForwarded{0};
         std::atomic<uint64_t>                       routeErrorsSent{0};
+        std::atomic<uint64_t>                       presenceSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

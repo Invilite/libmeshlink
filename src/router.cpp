@@ -131,6 +131,8 @@ void Router::start() {
             this->neighbors.insert(peerId);
             this->plumtree.addLink(peerId);
         }
+        this->presencePending = !this->neighbors.empty() && this->config.announcePresence && this->config.broadcastTtl > 0;
+        this->lastPresenceAt.reset();
     }
 
     this->routerThread = std::thread(&Router::routerLoop, this);
@@ -242,7 +244,7 @@ std::optional<uint64_t> Router::sendAlongRoute(const PeerId& destination, std::v
 
 RouterStatistics Router::getStatistics() const {
     return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(),
-             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load() };
+             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -273,13 +275,38 @@ void Router::routerLoop() {
             this->retryPendingVerifications();
             this->nextPendingRetryAt = std::chrono::steady_clock::now() + PENDING_RETRY_INTERVAL;
         }
+        this->announcePresenceWhenDue(std::chrono::steady_clock::now());
     }
+}
+
+// PRESENCE (docs/router.md 3.3): our Router tells every other Router "I am here" when a neighbor appears — every node then
+// knows the way back to us (an ACK for unsigned data needs one, review R-5 I4) without the application having to
+// broadcast. At most once per presenceMinInterval; a neighbor arriving inside the interval is caught up when it ends, so
+// a later part of the network learns of us too.
+void Router::announcePresenceWhenDue(std::chrono::steady_clock::time_point now) {
+    if (!this->presencePending || (this->lastPresenceAt && now - *this->lastPresenceAt < this->config.presenceMinInterval)) return;
+    this->presencePending = false;
+    this->lastPresenceAt  = now;
+
+    RoutedMessage presence;
+    presence.group             = RouterWire::ROUTER_PROTOCOL_GROUP;
+    presence.subtype           = RouterWire::SUBTYPE_PRESENCE;
+    presence.mode              = RoutingMode::Broadcast;
+    presence.ttlInitial        = this->config.broadcastTtl;
+    presence.ttlRemaining      = this->config.broadcastTtl;
+    presence.msgId             = randomMessageId();
+    presence.sentAtUnixSeconds = currentUnixSeconds();
+    presence.sender            = this->selfIdentity->getPeerId();
+    presence.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(presence));   // once a minute at most: fine on this thread
+    ++this->presenceSent;
+    this->sendOwnBroadcast(presence);
 }
 
 void Router::processEvent(Event& event) {
     std::visit([this](auto& content) {
         using T = std::decay_t<decltype(content)>;
         if constexpr (std::is_same_v<T, Event::NeighborConnected>) {
+            this->presencePending = this->config.announcePresence && this->config.broadcastTtl > 0;
             this->plumtree.addLink(content.peerId);
             std::lock_guard lock(this->neighborsMutex);
             this->neighbors.insert(content.peerId);
@@ -513,8 +540,10 @@ void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, st
 void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom) {
     // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
     this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
-    this->deliverLocally(message, true);                                            // signature checked
-    if (message.ackRequested) this->sendAck(message);                               // every node is an addressee
+    if (message.group != RouterWire::ROUTER_PROTOCOL_GROUP) {                       // PRESENCE is for Routers, not applications
+        this->deliverLocally(message, true);                                        // signature checked
+        if (message.ackRequested) this->sendAck(message);                           // every node is an addressee
+    }
     this->spreadNewMessage(message, receivedFrom);
 }
 

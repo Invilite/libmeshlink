@@ -128,6 +128,7 @@ struct RouterMesh {
 
         for (size_t i = 0; i < count; ++i) {
             RouterConfig config;
+            config.announcePresence = false;                                                  // tests count traffic exactly; PRESENCE tests turn it on
             if (adjustRouter) adjustRouter(i, config);
             this->routers.push_back(std::make_unique<Router>(*this->nodes[i]->network, this->nodes[i]->directory, this->nodes[i]->identity, config));
             this->recorders.push_back(std::make_shared<DeliveryRecorder>());
@@ -1352,4 +1353,36 @@ TEST(RouterTest, LocallyRefusedSendKeepsTheRoute) {
     EXPECT_EQ(failure.unreachableHop, mesh.id(1));
     EXPECT_EQ(failure.reason, RouteErrorReason::NextHopSendRefused);
     EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).size(), 1u);
+}
+
+// ── PRESENCE: the Router's own "I am here" to every other Router ────────────────────────────────────────────────────
+
+// Without any application traffic every node learns the way back to every other, and no application hears of it
+TEST(RouterTest, PresenceTeachesTheWayBackWithoutDelivery) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t, RouterConfig& config) { config.announcePresence = true; });
+    ASSERT_TRUE(mesh.ready);
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[3]->getRouteCandidates(mesh.id(0)).size() == 1 && mesh.routers[0]->getRouteCandidates(mesh.id(3)).size() == 1; }, 5s));
+    EXPECT_EQ(mesh.routers[3]->getRouteCandidates(mesh.id(0)).front().via, mesh.id(2));
+    for (size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(mesh.recorders[i]->total(), 0u) << "node " << i;
+        EXPECT_GE(mesh.routers[i]->getStatistics().presenceSent, 1u) << "node " << i;
+    }
+}
+
+// A new neighbor triggers PRESENCE at most once per presenceMinInterval; one arriving inside the interval is caught up after it
+TEST(RouterTest, PresenceIsLimitedAndCaughtUp) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceMinInterval = 2s; });
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().presenceSent == 1; }, 3s));
+
+    TestNode gamma(mesh.secret, "gamma");
+    gamma.network->start();
+    gamma.network->connectToPeer("127.0.0.1", mesh.nodes[0]->port);
+    Router gammaRouter(*gamma.network, gamma.directory, gamma.identity);
+    gammaRouter.start();
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getNeighbors().size() == 2; }, 5s));
+    EXPECT_EQ(mesh.routers[0]->getStatistics().presenceSent, 1u);                            // inside the interval: waits
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().presenceSent == 2; }, 4s));
+    gammaRouter.stop();
+    gamma.network->stop();
 }

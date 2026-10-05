@@ -141,11 +141,12 @@ namespace invilite::Mesh {
         NotRoutedGroup             =  -2,                                           // Group 0xFF and neighbor-only Group 0xFE subtypes carry no routing header
         UnsupportedVersion         =  -3,
         UnknownMode                =  -4,                                           // fixed header (sender, msgId, mode) is filled in: the neighbor gets UNKNOWN_DELIVERY_MODE
-        RouterMessageToEveryNode   =  -5,                                           // routed Router message (Group 0xFE) in FLOOD / BROADCAST
+        RouterMessageToEveryNode   =  -5,                                           // routed Router message (Group 0xFE) other than PRESENCE in FLOOD / BROADCAST
         InvalidTtl                 =  -6,                                           // ttlInitial == 0 or ttlRemaining > ttlInitial
         SourceRouteIndexOutOfRange =  -7,
         TimestampOutOfWindow       =  -8,
         UnknownCriticalExtension   =  -9,
+        PresenceToOneNode          = -10,                                           // PRESENCE outside FLOOD / BROADCAST
     };
 
     namespace RouterWire {
@@ -163,13 +164,15 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_GRAFT                 = 0x0003;
         constexpr uint16_t SUBTYPE_PRUNE                 = 0x0004;
         constexpr uint16_t SUBTYPE_UNKNOWN_DELIVERY_MODE = 0x0005;
-        // Group 0xFE subtypes 0x0100..0x01FF: the Router's own routed messages — routing header, always signed, ROUTED / UNICAST only
+        // Group 0xFE subtypes 0x0100..0x01FF: the Router's own routed messages — routing header, always signed, ROUTED / UNICAST
+        // only, except PRESENCE, which only travels to every node
         constexpr uint16_t FIRST_ROUTED_ROUTER_SUBTYPE   = 0x0100;
         constexpr uint16_t LAST_ROUTED_ROUTER_SUBTYPE    = 0x01FF;
         constexpr uint16_t SUBTYPE_ACK                   = 0x0100;
         constexpr uint16_t SUBTYPE_ROUTE_ERROR           = 0x0101;
         constexpr uint16_t SUBTYPE_RECORD_ROUTE          = 0x0102;                  // route probe (R-5)
         constexpr uint16_t SUBTYPE_ROUTE_REPORT          = 0x0103;                  // probe answer from the destination (R-5)
+        constexpr uint16_t SUBTYPE_PRESENCE              = 0x0104;                  // "I am here": a node's Router to every other Router, empty — teaches the way back to it
 
         // FLOOD and BROADCAST: to every node, no destination
         bool reachesEveryNode(RoutingMode mode);

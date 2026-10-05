@@ -630,3 +630,33 @@ TEST(RouterWireTest, MalformedProbeIsRejectedOnReceive) {
     RoutedMessage out;
     EXPECT_EQ(decodeFrame(RouterWire::encode(probe), out), RoutedMessageStatus::MalformedEncoding);
 }
+
+// PRESENCE (0xFE/0x0104): the only Router message that travels to every node — signed, empty, FLOOD / BROADCAST only
+TEST(RouterWireTest, PresenceTravelsToEveryNodeOnly) {
+    const auto sender = LocalIdentity::generate();
+    RoutedMessage presence;
+    presence.group = RouterWire::ROUTER_PROTOCOL_GROUP;
+    presence.subtype = RouterWire::SUBTYPE_PRESENCE;
+    presence.mode = RoutingMode::Broadcast;
+    presence.ttlInitial = presence.ttlRemaining = 16;
+    presence.msgId = 7;
+    presence.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(NOW.time_since_epoch()).count());
+    presence.sender = sender.getPeerId();
+    presence.signature = sender.sign(RouterWire::bytesToSign(presence));
+    const auto body = RouterWire::encode(presence);
+    ASSERT_FALSE(body.empty());
+    RoutedMessage out;
+    ASSERT_EQ(decodeFrame(body, out), RoutedMessageStatus::Success);
+    EXPECT_EQ(out, presence);
+
+    RoutedMessage withPayload = presence;                                           // payload shapes are checked on receive
+    withPayload.payload = { 1 };
+    EXPECT_EQ(decodeFrame(RouterWire::encode(withPayload), out), RoutedMessageStatus::MalformedEncoding);
+
+    // A PRESENCE header in UNICAST (an ACK frame relabelled): refused, it has no single addressee
+    const auto sender2 = LocalIdentity::generate();
+    auto ack = RouterWire::encode(makeMessage(sender2, RoutingMode::Unicast, Content::Ack));
+    ack[1] = RouterWire::SUBTYPE_PRESENCE >> 8;
+    ack[2] = RouterWire::SUBTYPE_PRESENCE & 0xFF;
+    EXPECT_EQ(decodeFrame(ack, out), RoutedMessageStatus::PresenceToOneNode);
+}
