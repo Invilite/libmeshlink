@@ -75,6 +75,8 @@ void Router::start() {
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
     this->unknownModeReportedAt.clear();
+    this->awaitedAckSentAt.clear();
+    this->awaitedAckOrder.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
     this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
     {
@@ -109,13 +111,14 @@ void Router::stop() {
     this->neighbors.clear();
 }
 
-std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode) {
+std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode, SendOptions options) {
     if (!this->running.load() || group > RouterWire::MAX_ROUTED_GROUP || !RouterWire::reachesEveryNode(mode) || this->config.broadcastTtl == 0) return std::nullopt;
 
     RoutedMessage message;
     message.group             = group;
     message.subtype           = subtype;
     message.mode              = mode;
+    message.ackRequested      = options.ackRequested;
     message.ttlInitial        = this->config.broadcastTtl;
     message.ttlRemaining      = this->config.broadcastTtl;
     message.msgId             = randomMessageId();
@@ -166,7 +169,8 @@ std::vector<PeerId> Router::getNeighbors() const {
 }
 
 RouterStatistics Router::getStatistics() const {
-    return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(), this->localFloods.load() };
+    return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(),
+             this->localFloods.load(), this->acksSent.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -227,8 +231,10 @@ void Router::processEvent(Event& event) {
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
         } else if (RouterWire::reachesEveryNode(content.message.mode)) {
+            this->awaitAcks(content.message);
             this->sendOwnBroadcast(content.message);
         } else {
+            this->awaitAcks(content.message);
             this->seenMessages.remember({ content.message.sender, content.message.msgId }, content.message.sentAtUnixSeconds, std::chrono::steady_clock::now());
             this->forwardUnicast(content.message, std::nullopt);
         }
@@ -311,6 +317,7 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now))         this->sendGraft(neighbor, keys);
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
+    this->dropExpiredAwaitedAcks(now);
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -340,20 +347,21 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
         return;
     }
 
-    if (RouterWire::reachesEveryNode(routed.mode)) {                               // Group 0xFE never travels to every node (decode refuses it)
-        this->handleIncomingBroadcast(std::move(routed), message.source);
+    // Signed: broadcasts (Group 0xFE never travels to every node — decode refuses it) and the Router's own UNICASTs
+    if (RouterWire::reachesEveryNode(routed.mode) || (routed.group == RouterWire::ROUTER_PROTOCOL_GROUP && routed.mode == RoutingMode::Unicast)) {
+        this->handleIncomingSigned(std::move(routed), message.source);
         return;
     }
     if (routed.mode == RoutingMode::Unicast && routed.group <= RouterWire::MAX_ROUTED_GROUP) {
         this->handleIncomingUnicast(std::move(routed), message.source);
         return;
     }
-    // ROUTED (R-6) and the Router's own routed messages (ACK R-5 c, RECORD_ROUTE R-5 d)
+    // ROUTED arrives in R-6
     std::cerr << "Router: routed message mode " << static_cast<int>(routed.mode) << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
 }
 
-// docs/router.md 4.1 for BROADCAST: duplicate → sender's key → signature → seen → deliver → forward
-void Router::handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom) {
+// docs/router.md 4.1 for signed messages: duplicate → sender's key → signature → seen → deliver / forward
+void Router::handleIncomingSigned(RoutedMessage message, const PeerId& receivedFrom) {
     // Our own message coming back is a duplicate too — also after a restart emptied the memory (no record of ourselves
     // to verify against, so without this it would only waste a PEX_REQUEST and a verification slot)
     if (message.sender == this->selfIdentity->getPeerId() || this->isAlreadySeen(message)) {
@@ -367,7 +375,7 @@ void Router::handleIncomingBroadcast(RoutedMessage message, const PeerId& receiv
         this->awaitSenderRecord(std::move(message), receivedFrom);
         return;
     }
-    this->acceptBroadcastWithKey(std::move(message), receivedFrom, senderEntry->record.ed25519Pub);
+    this->acceptWithKey(std::move(message), receivedFrom, senderEntry->record.ed25519Pub);
 }
 
 // The neighbor that forwarded the message verified it first, so it holds the sender's record: ask it (PEX_REQUEST) and
@@ -381,7 +389,7 @@ void Router::awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom
         if (pending.receivedFrom == receivedFrom) ++fromThisNeighbor;
     }
     if (this->pendingVerifications.size() >= this->config.pendingVerificationLimit || fromThisNeighbor >= this->config.pendingVerificationPerNeighbor) {
-        std::cerr << "Router: broadcast from unknown " << shortPeerId(message.sender) << " dropped, verification queue full (from "
+        std::cerr << "Router: message from unknown " << shortPeerId(message.sender) << " dropped, verification queue full (from "
                   << shortPeerId(receivedFrom) << ")" << std::endl;
         return;
     }
@@ -402,9 +410,9 @@ void Router::retryPendingVerifications() {
         if (this->isAlreadySeen(pending.message)) continue;                        // another copy got through meanwhile
 
         if (const auto senderEntry = this->peerDirectory->findPeer(pending.message.sender)) {
-            this->acceptBroadcastWithKey(std::move(pending.message), pending.receivedFrom, senderEntry->record.ed25519Pub);
+            this->acceptWithKey(std::move(pending.message), pending.receivedFrom, senderEntry->record.ed25519Pub);
         } else if (now >= pending.deadline) {
-            std::cerr << "Router: broadcast from unknown " << shortPeerId(pending.message.sender) << " dropped, record did not arrive" << std::endl;
+            std::cerr << "Router: message from unknown " << shortPeerId(pending.message.sender) << " dropped, record did not arrive" << std::endl;
         } else {
             this->pendingVerifications.push_back(std::move(pending));
         }
@@ -412,20 +420,99 @@ void Router::retryPendingVerifications() {
 }
 
 // Signature first, and only then "seen": a forgery must not occupy the msgId of the genuine message
-void Router::acceptBroadcastWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub) {
+void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub) {
     if (!RouterWire::verifySignature(message, senderEd25519Pub)) {
-        std::cerr << "Router: broadcast " << std::hex << message.msgId << std::dec << " claiming sender " << shortPeerId(message.sender)
+        std::cerr << "Router: message " << std::hex << message.msgId << std::dec << " claiming sender " << shortPeerId(message.sender)
                   << " has an invalid signature, dropped (from " << shortPeerId(receivedFrom) << ")" << std::endl;
         return;
     }
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    if (RouterWire::reachesEveryNode(message.mode)) this->acceptVerifiedBroadcast(message, receivedFrom);
+    else                                            this->acceptVerifiedRouterMessage(std::move(message), receivedFrom);
+}
+
+void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom) {
     {
         // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
         std::lock_guard lock(this->routesMutex);
         this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
     }
     this->deliverLocally(message, true);                                            // signature checked
+    if (message.ackRequested) this->sendAck(message);                               // every node is an addressee
     this->spreadNewMessage(message, receivedFrom);
+}
+
+// A verified routed Router message (Group 0xFE, UNICAST). An ACK teaches the way to its signer on every hop (D6, signed
+// by the node it leads to — D5); the destination acts on it, relays forward it like any UNICAST.
+void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom) {
+    const bool isAck = message.subtype == RouterWire::SUBTYPE_ACK;
+    if (message.destination == this->selfIdentity->getPeerId()) {
+        if (isAck) this->receiveAckForUs(message, receivedFrom);
+        return;                                                                     // ROUTE_ERROR (R-6), RECORD_ROUTE (R-5 d), unknown: nothing yet
+    }
+    if (isAck) {
+        std::lock_guard lock(this->routesMutex);
+        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Ack, std::chrono::steady_clock::now());
+    }
+    if (message.ttlRemaining <= 1) return;
+    message.ttlRemaining -= 1;
+    this->forwardUnicast(message, receivedFrom);
+}
+
+void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom) {
+    AckPayload payload;
+    RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
+    const auto now = std::chrono::steady_clock::now();
+    const auto awaited = this->awaitedAckSentAt.find(payload.acknowledgedMsgId);
+    const std::optional<std::chrono::milliseconds> rtt = awaited == this->awaitedAckSentAt.end() ? std::nullopt
+        : std::optional(std::chrono::duration_cast<std::chrono::milliseconds>(now - awaited->second));
+    {
+        std::lock_guard lock(this->routesMutex);
+        this->routes.learn(ack.sender, receivedFrom, hopsTraveled(ack), RouteEvidence::Ack, now, rtt);
+    }
+    if (!rtt) return;                                                               // not asked for (or too late): teaches the route, nothing to report
+
+    // Kept until the window ends: a broadcast collects one ACK from every node
+    const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
+    this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
+}
+
+// An addressee answers ACK_REQUESTED: a signed UNICAST back to the sender (docs/router.md 3.3)
+void Router::sendAck(const RoutedMessage& acknowledged) {
+    RoutedMessage ack;
+    ack.group             = RouterWire::ROUTER_PROTOCOL_GROUP;
+    ack.subtype           = RouterWire::SUBTYPE_ACK;
+    ack.mode              = RoutingMode::Unicast;
+    ack.ttlInitial        = this->config.unicastTtl;
+    ack.ttlRemaining      = this->config.unicastTtl;
+    ack.msgId             = randomMessageId();
+    ack.sentAtUnixSeconds = currentUnixSeconds();
+    ack.sender            = this->selfIdentity->getPeerId();
+    ack.destination       = acknowledged.sender;
+    ack.payload           = RouterWire::encodeAckPayload({ acknowledged.msgId });
+    ack.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(ack));
+    this->seenMessages.remember({ ack.sender, ack.msgId }, ack.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    ++this->acksSent;
+    this->forwardUnicast(ack, std::nullopt);
+}
+
+void Router::awaitAcks(const RoutedMessage& message) {
+    if (!message.ackRequested) return;
+    const auto now = std::chrono::steady_clock::now();
+    this->dropExpiredAwaitedAcks(now);
+    if (this->awaitedAckOrder.size() >= this->config.maxAwaitedAcks && !this->awaitedAckOrder.empty()) {
+        this->awaitedAckSentAt.erase(this->awaitedAckOrder.front().second);
+        this->awaitedAckOrder.pop_front();
+    }
+    this->awaitedAckSentAt[message.msgId] = now;
+    this->awaitedAckOrder.emplace_back(now, message.msgId);
+}
+
+void Router::dropExpiredAwaitedAcks(std::chrono::steady_clock::time_point now) {
+    while (!this->awaitedAckOrder.empty() && now - this->awaitedAckOrder.front().first >= this->config.ackWaitWindow) {
+        this->awaitedAckSentAt.erase(this->awaitedAckOrder.front().second);
+        this->awaitedAckOrder.pop_front();
+    }
 }
 
 // A BROADCAST copy we already have: the link it came by is redundant (PRUNE) — unless the copy has a higher TTL than ours.
@@ -516,6 +603,7 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
 
     if (message.destination == this->selfIdentity->getPeerId()) {
         this->deliverLocally(message, message.sender == receivedFrom);               // the link proves only a direct neighbor
+        if (message.ackRequested) this->sendAck(message);
         return;
     }
     if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
@@ -558,7 +646,11 @@ void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticat
     delivery.hopsTraveled = hopsTraveled(message);
     delivery.senderAuthenticated = senderAuthenticated;
     delivery.payload      = message.payload;
+    this->notifyListeners([&](RouterEventListener& listener) { listener.onMessageDelivered(delivery); }, "onMessageDelivered");
+}
 
+// Snapshot under the lock, call without it (a listener may add or remove listeners); one failing listener does not stop the rest
+void Router::notifyListeners(const std::function<void(RouterEventListener&)>& call, const char* event) {
     std::vector<std::shared_ptr<RouterEventListener>> snapshot;
     {
         std::shared_lock lock(this->listenersMutex);
@@ -566,11 +658,11 @@ void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticat
     }
     for (const auto& listener : snapshot) {
         try {
-            listener->onMessageDelivered(delivery);
+            call(*listener);
         } catch (const std::exception& e) {
-            std::cerr << "Router: listener->onMessageDelivered threw: " << e.what() << std::endl;
+            std::cerr << "Router: listener->" << event << " threw: " << e.what() << std::endl;
         } catch (...) {
-            std::cerr << "Router: listener->onMessageDelivered threw unknown exception" << std::endl;
+            std::cerr << "Router: listener->" << event << " threw unknown exception" << std::endl;
         }
     }
 }

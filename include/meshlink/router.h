@@ -19,6 +19,8 @@
 #include <optional>
 #include <shared_mutex>
 #include <array>
+#include <deque>
+#include <functional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,6 +46,8 @@ namespace invilite::Mesh {
         std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
         size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
         RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
+        std::chrono::seconds        ackWaitWindow           = std::chrono::seconds(60);   // how long our ACK_REQUESTED messages wait for ACKs
+        size_t                      maxAwaitedAcks          = 4096;                 // messages waiting at once; the oldest is given up first
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -54,6 +58,7 @@ namespace invilite::Mesh {
         uint64_t    graftsSent         = 0;                                         // GRAFT frames, fast-repair ones included
         uint64_t    prunesSent         = 0;
         uint64_t    localFloods        = 0;                                         // UNICASTs sent to every neighbor for lack of a route
+        uint64_t    acksSent           = 0;
     };
 
     struct SendOptions {
@@ -87,7 +92,8 @@ namespace invilite::Mesh {
         // nothing when the Router is not running, `group` is not a user group (0x00..0xFD) or `mode` does not reach every
         // node. Not delivered locally. The mode is signed and applies on every hop: Flood trades traffic for no tree-repair
         // delay (docs/router.md 4.3).
-        std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode = RoutingMode::Broadcast);
+        // With options.ackRequested every node that receives it answers with an ACK (onAckReceived).
+        std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode = RoutingMode::Broadcast, SendOptions options = {});
 
         // Send to one node (UNICAST): each hop picks the next one — a direct neighbor, a learned route, or local flooding
         // when nothing is known. Not signed (D12). Returns the message id, or nothing when the Router is not running,
@@ -121,11 +127,18 @@ namespace invilite::Mesh {
         void handleRouterControl(const NetworkMessage& message);                   // Group 0xFE neighbor-only subtypes
         void handleRoutedMessage(const NetworkMessage& message);                   // routing header: Group 0x00..0xFD, routed Group 0xFE subtypes
         void reportUnknownMode(const RoutedMessage& message, const PeerId& receivedFrom);
-        void handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom);
+        void handleIncomingSigned(RoutedMessage message, const PeerId& receivedFrom);   // broadcasts and the Router's own routed messages
         void awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom);
         void retryPendingVerifications();
         [[nodiscard]] bool isAlreadySeen(const RoutedMessage& message) const;
-        void acceptBroadcastWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
+        void acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
+        void acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom);
+        void acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom);
+        void receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom);
+        void sendAck(const RoutedMessage& acknowledged);
+        void awaitAcks(const RoutedMessage& message);
+        void dropExpiredAwaitedAcks(std::chrono::steady_clock::time_point now);
+        void notifyListeners(const std::function<void(RouterEventListener&)>& call, const char* event);
         void reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom);
         void sendOwnBroadcast(const RoutedMessage& message);
         void spreadNewMessage(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom);
@@ -156,6 +169,9 @@ namespace invilite::Mesh {
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
+        // Our ACK_REQUESTED messages: send time by msgId, and the same in send order for expiry
+        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> awaitedAckSentAt;
+        std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedAckOrder;
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
 
@@ -173,6 +189,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       graftsSent{0};
         std::atomic<uint64_t>                       prunesSent{0};
         std::atomic<uint64_t>                       localFloods{0};
+        std::atomic<uint64_t>                       acksSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

@@ -5,6 +5,8 @@
 
 #include "meshlink/router_wire.h"
 
+#include <chrono>
+
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +27,15 @@ namespace invilite::Mesh {
         std::vector<uint8_t>    payload;
     };
 
+    // An ACK for a message this node sent with ACK_REQUESTED: one per destination of a UNICAST, one per node for a
+    // broadcast. Signed by the acknowledging node (verified).
+    struct AckReceipt {
+        uint64_t                    acknowledgedMsgId = 0;
+        PeerId                      acknowledgedBy{};
+        std::chrono::milliseconds   rtt{0};                                         // from our send to this ACK's arrival
+        uint8_t                     hopsTraveled = 0;                               // of the ACK on its way back
+    };
+
     // Observer for Router deliveries. Callbacks fire on the Router thread, which serves every peer: listeners MUST be
     // fast and non-blocking (enqueue and return), and MUST NOT call Router::stop() (it joins the very thread running the
     // callback). Exceptions are caught per listener. Default implementations are empty.
@@ -33,6 +44,7 @@ namespace invilite::Mesh {
         virtual ~RouterEventListener() = default;
 
         virtual void onMessageDelivered(const RoutedDelivery& delivery) { (void)delivery; }
+        virtual void onAckReceived(const AckReceipt& receipt) { (void)receipt; }
     };
 
 } // namespace invilite::Mesh

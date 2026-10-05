@@ -6,6 +6,8 @@
 #include "network_test_node.h"
 
 #include <mutex>
+#include <random>
+#include <set>
 
 using namespace invilite::Mesh;
 using namespace invilite::Mesh::TestHelpers;
@@ -48,8 +50,21 @@ struct DeliveryRecorder : RouterEventListener {
         return this->deliveries.size();
     }
 
+    void onAckReceived(const AckReceipt& receipt) override {
+        std::lock_guard lock(this->mutex);
+        this->acks.push_back(receipt);
+    }
+
+    std::vector<AckReceipt> acksFor(uint64_t msgId) const {
+        std::lock_guard lock(this->mutex);
+        std::vector<AckReceipt> matching;
+        for (const auto& ack : this->acks) if (ack.acknowledgedMsgId == msgId) matching.push_back(ack);
+        return matching;
+    }
+
     mutable std::mutex           mutex;
     std::vector<RoutedDelivery>  deliveries;
+    std::vector<AckReceipt>      acks;
 };
 
 using Edge = std::pair<size_t, size_t>;                                                       // (dialer, listener)
@@ -108,6 +123,7 @@ struct RouterMesh {
     }
 
     PeerId id(size_t i) const { return this->nodes[i]->identity->getPeerId(); }
+    static PeerId peerIdOf(uint8_t fill) { PeerId id; id.fill(fill); return id; }
 
     // Every node except `sender` delivered (sender, msgId) at least once
     bool allOthersDelivered(size_t sender, uint64_t msgId) const {
@@ -143,6 +159,11 @@ struct ControlFrameRecorder : NetworkEventListener {
     mutable std::mutex           mutex;
     std::vector<NetworkMessage>  frames;
 };
+
+uint64_t randomTestMsgId() {
+    static std::mt19937_64 generator{ std::random_device{}() };
+    return generator();
+}
 
 // A broadcast built by hand — for frames a well-behaved Router would never send (forgeries, replays)
 RoutedMessage craftBroadcast(const PeerId& claimedSender, const LocalIdentity& signer, std::vector<uint8_t> payload) {
@@ -881,4 +902,102 @@ TEST(RouterTest, SendRefusesOwnNodeAndNonUserGroups) {
     EXPECT_FALSE(mesh.routers[0]->send(mesh.id(1), RouterWire::ROUTER_PROTOCOL_GROUP, 0, { 1 }).has_value());
     mesh.routers[0]->stop();
     EXPECT_FALSE(mesh.routers[0]->send(mesh.id(1), 0x10, 0, { 1 }).has_value());
+}
+
+
+// ── ACK (R-5 c) ─────────────────────────────────────────────────────────────
+
+TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'a' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
+    const AckReceipt receipt = mesh.recorders[0]->acksFor(msgId).front();
+    EXPECT_EQ(receipt.acknowledgedBy, mesh.id(3));
+    EXPECT_EQ(receipt.hopsTraveled, 3);
+    EXPECT_LT(receipt.rtt, 2s);
+
+    // The signed ACK taught the way to node 3 on every hop it crossed, our own end with an RTT
+    const auto atSender = mesh.routers[0]->getRouteCandidates(mesh.id(3));
+    ASSERT_EQ(atSender.size(), 1u);
+    EXPECT_EQ(atSender.front().evidence, RouteEvidence::Ack);
+    EXPECT_EQ(atSender.front().via, mesh.id(1));
+    EXPECT_TRUE(atSender.front().rtt.has_value());
+    for (size_t i = 1; i < 3; ++i) {
+        const auto atRelay = mesh.routers[i]->getRouteCandidates(mesh.id(3));
+        ASSERT_EQ(atRelay.size(), 1u) << "node " << i;
+        EXPECT_EQ(atRelay.front().evidence, RouteEvidence::Ack);
+        EXPECT_EQ(atRelay.front().hops, 3 - i);
+    }
+    EXPECT_EQ(mesh.routers[3]->getStatistics().acksSent, 1u);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().acksSent, 0u);                                 // relays never acknowledge
+}
+
+TEST(RouterTest, BroadcastAckComesFromEveryNode) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'c' }, RoutingMode::Broadcast, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 7; }, 5s));
+    std::set<PeerId> acknowledgedBy;
+    for (const auto& ack : mesh.recorders[0]->acksFor(msgId)) acknowledgedBy.insert(ack.acknowledgedBy);
+    EXPECT_EQ(acknowledgedBy.size(), 7u);                                                     // a count of the network
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.recorders[0]->acksFor(msgId).size(), 7u);                                  // each once
+}
+
+TEST(RouterTest, NoAckWithoutRequest) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(1), 0x10, 0, { 'n' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().acksSent, 0u);
+    EXPECT_TRUE(mesh.recorders[0]->acksFor(msgId).empty());
+}
+
+// An ACK claiming to be node 1's but signed by someone else is dropped; the genuine one counts
+TEST(RouterTest, ForgedAckIsDropped) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t awaited = mesh.routers[0]->send(mesh.peerIdOf(0x77), 0x10, 0, { 'w' }, { .ackRequested = true }).value();   // nobody: no real ACK
+
+    auto craftAck = [&](const LocalIdentity& signer) {
+        RoutedMessage ack;
+        ack.group = RouterWire::ROUTER_PROTOCOL_GROUP;
+        ack.subtype = RouterWire::SUBTYPE_ACK;
+        ack.mode = RoutingMode::Unicast;
+        ack.ttlInitial = ack.ttlRemaining = 16;
+        ack.msgId = randomTestMsgId();
+        ack.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+        ack.sender = mesh.id(1);
+        ack.destination = mesh.id(0);
+        ack.payload = RouterWire::encodeAckPayload({ awaited });
+        ack.signature = signer.sign(RouterWire::bytesToSign(ack));
+        return RouterWire::encode(ack);
+    };
+    const auto stranger = LocalIdentity::generate();
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAck(stranger)), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->acksFor(awaited).empty());
+
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAck(*mesh.nodes[1]->identity)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(awaited).size() == 1; }, 5s));
+
+    // Genuine, but for nothing we asked about: teaches the route, reports nothing
+    const uint64_t neverSent = awaited ^ 0xFFFF;
+    auto unsolicited = RouterWire::encode([&] {
+        RoutedMessage ack;
+        RoutedMessageStatus status = RouterWire::decode(RouterWire::ROUTER_PROTOCOL_GROUP, RouterWire::SUBTYPE_ACK,
+                                                        std::span<const uint8_t>(craftAck(*mesh.nodes[1]->identity)).subspan(3), std::chrono::system_clock::now(), ack);
+        EXPECT_EQ(status, RoutedMessageStatus::Success);
+        ack.msgId   = randomTestMsgId();
+        ack.payload = RouterWire::encodeAckPayload({ neverSent });
+        ack.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(ack));
+        return ack;
+    }());
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), unsolicited), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->acksFor(neverSent).empty());
 }
