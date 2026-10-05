@@ -73,34 +73,6 @@ namespace invilite::Mesh {
         std::atomic<bool>        debugDetailsEnabled;
     };
 
-    // A Logger bound to one component name — what Network and Router hold. Formatting happens only after the filter
-    // passed, so a disabled message costs two atomic loads.
-    class ComponentLog {
-    public:
-        ComponentLog(std::shared_ptr<Logger> logger, std::string_view component);       // null logger → default Logger (stderr, Info)
-
-        [[nodiscard]] bool isEnabled(LogLevel level, bool isDebug = false) const { return this->logger->isEnabled(level, isDebug); }
-
-        template <class... Args>
-        void format(LogLevel level, std::format_string<Args...> fmt, Args&&... args) const {
-            if (!this->logger->isEnabled(level)) return;
-            this->logger->write(level, this->component, std::format(fmt, std::forward<Args>(args)...));
-        }
-
-        // Debug record with isDebug set — the noisy details shown only with -v and --debug together
-        template <class... Args>
-        void formatDebugDetail(std::format_string<Args...> fmt, Args&&... args) const {
-            if (!this->logger->isEnabled(LogLevel::Debug, true)) return;
-            this->logger->write(LogLevel::Debug, this->component, std::format(fmt, std::forward<Args>(args)...), true);
-        }
-
-        [[nodiscard]] const std::shared_ptr<Logger>& getLogger() const { return this->logger; }
-
-    private:
-        std::shared_ptr<Logger> logger;
-        std::string_view        component;                                              // always a string literal
-    };
-
     // Bounds messages a remote peer can trigger (malformed frames, protocol violations), so a misbehaving neighbor
     // cannot flood the log. Per key (event kind + neighbor), the first record in each window passes and the rest are
     // counted; the next record let through reports how many were suppressed. The key count is bounded too — at the cap
@@ -130,6 +102,44 @@ namespace invilite::Mesh {
         Clock::duration                           window;
         size_t                                    maxKeys;
         std::unordered_map<std::string, KeyState> states;
+    };
+
+    // A Logger bound to one component name — what Network and Router hold. Formatting happens only after the filter
+    // passed, so a disabled message costs two atomic loads.
+    class ComponentLog {
+    public:
+        ComponentLog(std::shared_ptr<Logger> logger, std::string_view component);       // null logger → default Logger (stderr, Info)
+
+        [[nodiscard]] bool isEnabled(LogLevel level, bool isDebug = false) const { return this->logger->isEnabled(level, isDebug); }
+
+        template <class... Args>
+        void format(LogLevel level, std::format_string<Args...> fmt, Args&&... args) const {
+            if (!this->logger->isEnabled(level)) return;
+            this->logger->write(level, this->component, std::format(fmt, std::forward<Args>(args)...));
+        }
+
+        // Debug record with isDebug set — the noisy details shown only with -v and --debug together
+        template <class... Args>
+        void formatDebugDetail(std::format_string<Args...> fmt, Args&&... args) const {
+            if (!this->logger->isEnabled(LogLevel::Debug, true)) return;
+            this->logger->write(LogLevel::Debug, this->component, std::format(fmt, std::forward<Args>(args)...), true);
+        }
+
+        // For messages a remote peer can trigger: at most one per window per key (event kind + peer); the record let
+        // through after suppression reports how many were dropped. `limiter` must belong to the calling thread.
+        template <class... Args>
+        void formatRateLimited(LogRateLimiter& limiter, std::string_view key, LogLevel level, std::format_string<Args...> fmt, Args&&... args) const {
+            if (!this->logger->isEnabled(level)) return;                                // a filtered record must not use up the window
+            const std::optional<uint32_t> suppressed = limiter.admit(key, LogRateLimiter::Clock::now());
+            if (!suppressed) return;
+            this->logger->write(level, this->component, std::format(fmt, std::forward<Args>(args)...) + LogRateLimiter::suppressedNote(*suppressed));
+        }
+
+        [[nodiscard]] const std::shared_ptr<Logger>& getLogger() const { return this->logger; }
+
+    private:
+        std::shared_ptr<Logger> logger;
+        std::string_view        component;                                              // always a string literal
     };
 
 } // namespace invilite::Mesh

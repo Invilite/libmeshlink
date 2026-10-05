@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "meshlink/log.h"
+#include "collecting_log_sink.h"
 
 #include <mutex>
 #include <sstream>
@@ -7,23 +8,10 @@
 #include <vector>
 
 using namespace invilite::Mesh;
+using invilite::Mesh::TestHelpers::CollectingLogSink;
 using namespace std::chrono_literals;
 
 namespace {
-
-struct CollectedRecord { LogLevel level; bool isDebug; std::string component; std::string text; };
-
-class CollectingLogSink : public LogSink {
-public:
-    void write(const LogRecord& record) override {
-        std::lock_guard lock(this->mutex);
-        this->records.push_back({record.level, record.isDebug, std::string(record.component), std::string(record.text)});
-    }
-    std::vector<CollectedRecord> snapshot() { std::lock_guard lock(this->mutex); return this->records; }
-private:
-    std::mutex                   mutex;
-    std::vector<CollectedRecord> records;
-};
 
 class ThrowingLogSink : public LogSink {
 public:
@@ -168,4 +156,26 @@ TEST(LogRateLimiterTest, EvictsLeastRecentlySeenKeyAtCap) {
 TEST(LogRateLimiterTest, SuppressedNote) {
     EXPECT_EQ(LogRateLimiter::suppressedNote(0), "");
     EXPECT_EQ(LogRateLimiter::suppressedNote(3), " (3 similar suppressed)");
+}
+
+TEST(LoggerTest, RateLimitedFormatLetsFirstThroughAndReportsSuppressed) {
+    auto sink = std::make_shared<CollectingLogSink>();
+    ComponentLog log(std::make_shared<Logger>(sink, LogLevel::Info), "Router");
+    LogRateLimiter limiter(std::chrono::hours(1), 16);                              // nothing expires during the test
+
+    for (int i = 0; i < 5; ++i) log.formatRateLimited(limiter, "malformed PRUNE:ab", LogLevel::Warning, "malformed PRUNE from {}", "ab");
+    const auto records = sink->snapshot();
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].text, "malformed PRUNE from ab");
+}
+
+TEST(LoggerTest, RateLimitedFormatSkipsLimiterWhenDisabled) {
+    auto sink = std::make_shared<CollectingLogSink>();
+    ComponentLog log(std::make_shared<Logger>(sink, LogLevel::Error), "Router");
+    LogRateLimiter limiter(std::chrono::hours(1), 16);
+    log.formatRateLimited(limiter, "k", LogLevel::Warning, "hidden");                // filtered out — must not consume the window
+    log.getLogger()->setThreshold(LogLevel::Info);
+    log.formatRateLimited(limiter, "k", LogLevel::Warning, "shown");
+    ASSERT_EQ(sink->snapshot().size(), 1u);
+    EXPECT_EQ(sink->snapshot()[0].text, "shown");
 }

@@ -29,13 +29,13 @@ struct TestNode {
     uint16_t                       port      = pickUnusedPort();
     std::unique_ptr<Network>       network;
 
-    TestNode(const std::shared_ptr<std::array<uint8_t, 64>>& secret, const std::string& name, const std::function<void(NetworkConfig&)>& adjustConfig = {}) {
+    TestNode(const std::shared_ptr<std::array<uint8_t, 64>>& secret, const std::string& name, const std::function<void(NetworkConfig&)>& adjustConfig = {}, std::shared_ptr<Logger> logger = {}) {
         NetworkConfig config;
         config.listenPort         = this->port;
         config.nodeName           = name;
         config.announcedAddresses = { ipv4("127.0.0.1", this->port) };
         if (adjustConfig) adjustConfig(config);
-        this->network = std::make_unique<Network>(this->identity, secret, this->directory, config);
+        this->network = std::make_unique<Network>(this->identity, secret, this->directory, config, std::move(logger));
     }
 
     std::optional<KnownPeer> knownPeer(const TestNode& other) const { return this->directory->findPeer(other.identity->getPeerId()); }

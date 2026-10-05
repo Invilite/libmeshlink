@@ -13,7 +13,6 @@
 #include <random>
 #include <cstring>
 #include <iomanip>
-#include <iostream>
 #include <algorithm>
 #include <stdexcept>
 #include <system_error>
@@ -75,6 +74,13 @@ namespace invilite::Mesh {
     return BACKOFF_SCHEDULE[idx];
 }
 
+// "addr:port, addr:port" — the full address list for debug-detail records
+std::string describeAddresses(const std::vector<PeerAddress>& addresses) {
+    std::string out;
+    for (const PeerAddress& a : addresses) out += (out.empty() ? "" : ", ") + a.address + ":" + std::to_string(a.port);
+    return out;
+}
+
 std::string peerIdShort(const PeerId& id) {
     char buf[13];
     std::snprintf(buf, sizeof(buf), "%02x%02x%02x%02x%02x%02x", id[0], id[1], id[2], id[3], id[4], id[5]);
@@ -132,10 +138,12 @@ bool recordAnnouncesDialedAddress(const SignedPeerRecord& record, const std::str
 Network::Network(std::shared_ptr<LocalIdentity> selfIdentity,
                  std::shared_ptr<std::array<uint8_t, 64>> networkSecret,
                  std::shared_ptr<PeerDirectory> peerDirectory,
-                 NetworkConfig config)
+                 NetworkConfig config,
+                 std::shared_ptr<Logger> logger)
         : selfIdentity(std::move(selfIdentity))
         , networkSecret(std::move(networkSecret))
         , config(std::move(config))
+        , log(std::move(logger), "Network")
         , peerDirectory(std::move(peerDirectory)) {
 
     if (!this->selfIdentity)  throw std::invalid_argument("Network requires a valid LocalIdentity");
@@ -189,9 +197,8 @@ void Network::start() {
             this->running.store(false);
             throw std::runtime_error("Failed to serialize selfRecord");
         }
-        std::cerr << "Network: built selfRecord for " << peerIdShort(rec.peerId)
-                  << " with " << rec.addresses.size() << " announced address(es), size="
-                  << this->selfRecordSerialized.size() << "B" << std::endl;
+        this->log.format(LogLevel::Debug, "built selfRecord for {} with {} announced address(es), {} B", peerIdShort(rec.peerId), rec.addresses.size(), this->selfRecordSerialized.size());
+        this->log.formatDebugDetail("selfRecord addresses: {}", describeAddresses(rec.addresses));
     }
 
     try {
@@ -206,15 +213,23 @@ void Network::start() {
         this->tcpServer->onConnect([this](int fd, const sockaddr_storage* addr) {
             this->onIncomingConnection(fd, addr);
         });
+        // Runs on the TcpServer thread — it uses its own limiter (accept failures repeat every 100 ms when out of descriptors)
+        this->tcpServer->onListenerFailure([this](Transport::ListenerFailure failure, int errorNumber) {
+            if (failure == Transport::ListenerFailure::PollFailed) {
+                this->log.format(LogLevel::Alert, "listener poll() failed: {} — no inbound connections are accepted any more", std::strerror(errorNumber));
+            } else {
+                this->log.formatRateLimited(this->listenerThreadLogLimiter, "accept", LogLevel::Error, "cannot accept inbound connection: {}", std::strerror(errorNumber));
+            }
+        });
 
         if (const Transport::ListenStartResult listening = this->tcpServer->start(); !listening) {
-            std::cerr << "Network: cannot listen on " << this->config.listenAddress << ":" << this->config.listenPort << ": "
-                      << Transport::listenErrorName(listening.error) << " (" << std::strerror(listening.errorNumber) << ")" << std::endl;
+            this->log.format(LogLevel::Critical, "cannot listen on {}:{}: {} ({})", this->config.listenAddress, this->config.listenPort, Transport::listenErrorName(listening.error), std::strerror(listening.errorNumber));
             this->tcpServer.reset();
             this->ioWakeup.close();
             this->running.store(false);
             throw std::runtime_error("Failed to start TcpServer");
         }
+        this->log.format(LogLevel::Notice, "listening on {}:{}", this->config.listenAddress, this->config.listenPort);
     }
 
     this->dispatchThread = std::thread(&Network::dispatchLoop, this);
@@ -292,6 +307,7 @@ void Network::stop() {
     this->tcpServer.reset();
 
     this->ioWakeup.close();
+    this->log.format(LogLevel::Notice, "stopped");
 }
 
 // ============================================================
@@ -310,7 +326,7 @@ void Network::dialAddresses(std::vector<PeerAddress> addresses) {
     // Outbound hard limit (R10) — counts established outbound peers, dials and probes in progress alike
     auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
     if (!slot) {
-        std::cerr << "Network: not dialing " << address << ":" << port << " — outbound hard limit reached" << std::endl;
+        this->log.format(LogLevel::Info, "not dialing {}:{} — outbound hard limit reached", address, port);
         return;
     }
 
@@ -324,7 +340,7 @@ void Network::dialAddresses(std::vector<PeerAddress> addresses) {
             this->runOutgoingHandshake(std::move(addresses), std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
-        std::cerr << "Network: cannot start dial worker: " << e.what() << std::endl;   // slot returns with the lambda
+        this->log.format(LogLevel::Critical, "cannot start dial worker: {}", e.what());   // slot returns with the lambda
         return;
     }
     this->handshakeWorkers.push_back(std::move(worker));
@@ -426,9 +442,9 @@ void Network::notifyPeerConnected(const PeerIdentity& identity) {
         try {
             l->onPeerConnected(identity);
         } catch (const std::exception& e) {
-            std::cerr << "Network: listener->onPeerConnected threw: " << e.what() << std::endl;
+            this->log.format(LogLevel::Error, "listener->onPeerConnected threw: {}", e.what());
         } catch (...) {
-            std::cerr << "Network: listener->onPeerConnected threw unknown exception" << std::endl;
+            this->log.format(LogLevel::Error, "listener->onPeerConnected threw unknown exception");
         }
     }
 }
@@ -444,9 +460,9 @@ void Network::notifyPeerDisconnected(const PeerId& peerId) {
         try {
             l->onPeerDisconnected(peerId);
         } catch (const std::exception& e) {
-            std::cerr << "Network: listener->onPeerDisconnected threw: " << e.what() << std::endl;
+            this->log.format(LogLevel::Error, "listener->onPeerDisconnected threw: {}", e.what());
         } catch (...) {
-            std::cerr << "Network: listener->onPeerDisconnected threw unknown exception" << std::endl;
+            this->log.format(LogLevel::Error, "listener->onPeerDisconnected threw unknown exception");
         }
     }
 }
@@ -462,9 +478,9 @@ void Network::notifyMessageReceived(const NetworkMessage& msg) {
         try {
             l->onMessageReceived(msg);
         } catch (const std::exception& e) {
-            std::cerr << "Network: listener->onMessageReceived threw: " << e.what() << std::endl;
+            this->log.format(LogLevel::Error, "listener->onMessageReceived threw: {}", e.what());
         } catch (...) {
-            std::cerr << "Network: listener->onMessageReceived threw unknown exception" << std::endl;
+            this->log.format(LogLevel::Error, "listener->onMessageReceived threw unknown exception");
         }
     }
 }
@@ -489,7 +505,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
     const std::string remoteAddress = addressLimitKeyOf(*addr);
     auto slot = this->connectionSlots.tryTakeInbound(remoteAddress, inbound.effectiveHard(), inbound.perAddress);
     if (!slot) {
-        std::cerr << "Network: refused inbound from " << remoteAddress << " — inbound hard or per-address limit reached" << std::endl;
+        this->log.format(LogLevel::Info, "refused inbound from {} — inbound hard or per-address limit reached", remoteAddress);
         ::close(fd);
         return;
     }
@@ -509,7 +525,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
         });
     } catch (const std::system_error& e) {
         // Out of threads: refuse this one instead of letting the exception terminate the process (R1)
-        std::cerr << "Network: cannot start handshake worker: " << e.what() << std::endl;
+        this->log.format(LogLevel::Critical, "cannot start handshake worker: {}", e.what());
         ::close(fd);
         return;
     }
@@ -529,7 +545,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
     try {
         conn = std::make_shared<Connection>(fd, &addr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
-        std::cerr << "Network: incoming Connection construction failed: " << e.what() << std::endl;
+        this->log.format(LogLevel::Error, "incoming Connection construction failed: {}", e.what());
         ::close(fd);
         self->done.store(true, std::memory_order_release);
         return;
@@ -537,7 +553,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 
     const int hs = conn->waitForHandshake(timeRemaining());
     if (hs < 0) {
-        std::cerr << "Network: incoming handshake failed, code=" << hs << std::endl;
+        this->log.format(LogLevel::Info, "incoming transport handshake failed, code={}", hs);           // usually a scanner without the network secret
         conn->close();
         self->done.store(true, std::memory_order_release);
         return;
@@ -551,8 +567,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
     );
 
     if (verification.result != VerificationResult::Success) {
-        std::cerr << "Network: incoming identity verification failed: " << verificationResultName(verification.result)
-                  << " at " << verificationStepName(verification.failedAt) << " fd=" << fd << std::endl;
+        this->log.format(LogLevel::Warning, "incoming identity verification failed: {} at {}", verificationResultName(verification.result), verificationStepName(verification.failedAt));
         conn->close();
         self->done.store(true, std::memory_order_release);
         return;
@@ -562,8 +577,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
     // without joining our peer pool. We respond by closing — they've already verified us
     // through the IdentityVerification handshake itself.
     if (remoteFlags.probe()) {
-        std::cerr << "Network: incoming probe from " << peerIdShort(remoteIdentity.getPeerId())
-                  << " — identity verified, closing connection" << std::endl;
+        this->log.format(LogLevel::Debug, "incoming probe from {} — identity verified, closing connection", peerIdShort(remoteIdentity.getPeerId()));
         conn->close();
         self->done.store(true, std::memory_order_release);
         return;
@@ -598,14 +612,13 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
 
     const Transport::ConnectError connectResult = client.connect(address, port, std::chrono::seconds(OUTBOUND_CONNECT_TIMEOUT));
     if (connectResult != Transport::ConnectError::None) {
-        std::cerr << "Network: outgoing connect to " << address << ":" << port
-                  << " failed: " << Transport::connectErrorName(connectResult) << std::endl;
+        this->log.format(LogLevel::Warning, "outgoing connect to {}:{} failed: {}", address, port, Transport::connectErrorName(connectResult));
         return result;                                                              // verification defaults to ConnectionError
     }
 
     const int fd = client.release();
     if (fd < 0) {
-        std::cerr << "Network: TcpClient released invalid socket" << std::endl;
+        this->log.format(LogLevel::Error, "TcpClient released invalid socket");
         return result;
     }
 
@@ -614,21 +627,20 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     try {
         connection = std::make_shared<Connection>(fd, &remoteAddr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
-        std::cerr << "Network: outgoing Connection construction failed: " << e.what() << std::endl;
+        this->log.format(LogLevel::Error, "outgoing Connection construction failed: {}", e.what());
         ::close(fd);
         return result;
     }
 
     if (connection->initHandshake() != 0) {
-        std::cerr << "Network: initHandshake failed for " << address << ":" << port << std::endl;
+        this->log.format(LogLevel::Warning, "outgoing transport handshake to {}:{} could not start", address, port);
         connection->close();
         return result;
     }
 
     const int handshakeResult = connection->waitForHandshake();
     if (handshakeResult < 0) {
-        std::cerr << "Network: outgoing handshake failed for " << address << ":" << port
-                  << ", code=" << handshakeResult << std::endl;
+        this->log.format(LogLevel::Warning, "outgoing transport handshake with {}:{} failed, code={}", address, port, handshakeResult);
         connection->close();
         return result;
     }
@@ -642,8 +654,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     );
 
     if (verification.result != VerificationResult::Success) {
-        std::cerr << "Network: outgoing identity verification failed for " << address << ":" << port
-                  << ": " << verificationResultName(verification.result) << " at " << verificationStepName(verification.failedAt) << std::endl;
+        this->log.format(LogLevel::Warning, "outgoing identity verification with {}:{} failed: {} at {}", address, port, verificationResultName(verification.result), verificationStepName(verification.failedAt));
         connection->close();
         result.verification = verification.result;
         return result;
@@ -728,9 +739,7 @@ void Network::recordConnectionAttemptFailure(const std::string& address, uint16_
 
     if (!mutated) return;                                                           // peer was removed between snapshot and mutate
 
-    std::cerr << "Network: connection failure recorded for " << peerIdShort(matchedId)
-              << " (failures=" << static_cast<int>(newFailureCount)
-              << ", next attempt in " << waitDuration.count() << "s)" << std::endl;
+    this->log.format(LogLevel::Info, "connection failure recorded for {} (failures={}, next attempt in {}s)", peerIdShort(matchedId), static_cast<int>(newFailureCount), waitDuration.count());
 
     this->demoteAfterRepeatedDialFailures(matchedId, newFailureCount);
 }
@@ -750,8 +759,7 @@ void Network::demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t cons
     });
 
     if (demoted) {
-        std::cerr << "Network: " << peerIdShort(peerId) << " unreachable after " << static_cast<int>(consecutiveFailures)
-                  << " failed dials, handing it to the probe" << std::endl;
+        this->log.format(LogLevel::Notice, "{} unreachable after {} failed dials, handing it to the probe", peerIdShort(peerId), static_cast<int>(consecutiveFailures));
     }
 }
 
@@ -837,7 +845,7 @@ void Network::ioLoop() {
                 // Departure window bound (B3): the remote normally closes right after our GOODBYE; one that does not is
                 // closed by us. wasEverDeparting guards the instant between the state change and its timestamp.
                 if (peer->isDeparting() && peer->wasEverDeparting() && now - peer->getDepartingSince() > DEPARTURE_TIMEOUT) {
-                    std::cerr << "Network: peer " << peerIdShort(peer->getPeerId()) << " did not close within the departure window, closing" << std::endl;
+                    this->log.format(LogLevel::Warning, "peer {} did not close within the departure window, closing", peerIdShort(peer->getPeerId()));
                     peer->markForClose();
                     continue;
                 }
@@ -846,7 +854,7 @@ void Network::ioLoop() {
                 // otherwise pin its full send queue in memory for as long as TCP keeps the connection open.
                 const auto sendIdle = peer->timeSinceSendProgress();                // nullopt — nothing queued
                 if (sendIdle && *sendIdle > this->config.sendStallTimeout) {
-                    std::cerr << "Network: peer " << peerIdShort(peer->getPeerId()) << " stopped reading (send stalled), closing" << std::endl;
+                    this->log.format(LogLevel::Warning, "peer {} stopped reading (send stalled), closing", peerIdShort(peer->getPeerId()));
                     peer->markForClose();
                     continue;
                 }
@@ -860,7 +868,7 @@ void Network::ioLoop() {
         const int ready = Transport::Platform::waitForSockets(fds.data(), fds.size(), pollTimeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
-            std::cerr << "Network::ioLoop: poll() failed errno=" << errno << std::endl;
+            this->log.format(LogLevel::Alert, "I/O loop poll() failed: {} — no peer traffic is handled any more", std::strerror(errno));
             break;
         }
 
@@ -905,7 +913,7 @@ void Network::handleWakeup() {
                 }
 
                 if (cmd.peer->getPeerId() == this->selfIdentity->getPeerId()) {
-                    std::cerr << "Network: rejecting self-connection attempt" << std::endl;
+                    this->log.format(LogLevel::Info, "rejecting self-connection attempt");
                     cmd.peer->markForClose();
                     cmd.peer->closeConnection();
                     break;
@@ -937,7 +945,7 @@ void Network::handleWakeup() {
                             this->peersBySocket[fd] = cmd.peer;
                             cmd.peer->markActive();
                             activatedPeer = cmd.peer;
-                            std::cerr << "Network: replaced existing peer (tie-break favored new connection)" << std::endl;
+                            this->log.format(LogLevel::Debug, "replaced existing peer {} (tie-break favored new connection)", peerIdShort(cmd.peer->getPeerId()));
                         } else {
                             rejectedDuplicate = true;
                         }
@@ -957,15 +965,15 @@ void Network::handleWakeup() {
                             cmd.peer->markActive();
                             activatedPeer = cmd.peer;
                         }
-                        std::cerr << "Network: peer " << (dismissedPeer ? "registered for dismissal (NoSlots) " : "added ")
-                                  << peerIdShort(cmd.peer->getPeerId()) << ", registered=" << this->peersById.size() << std::endl;
+                        if (dismissedPeer) this->log.format(LogLevel::Info, "peer {} registered for dismissal (NoSlots), registered={}", peerIdShort(cmd.peer->getPeerId()), this->peersById.size());
+                        else               this->log.format(LogLevel::Notice, "peer {} connected, registered={}", peerIdShort(cmd.peer->getPeerId()), this->peersById.size());
                     }
                 }
 
                 if (rejectedDuplicate) {
                     cmd.peer->markForClose();
                     cmd.peer->closeConnection();
-                    std::cerr << "Network: rejected duplicate peer (tie-break favored existing)" << std::endl;
+                    this->log.format(LogLevel::Debug, "rejected duplicate peer {} (tie-break favored existing)", peerIdShort(cmd.peer->getPeerId()));
                     break;
                 }
 
@@ -1029,13 +1037,11 @@ bool Network::handleConnectionReadable(int fd, short revents) {
         try {
             n = peer->getConnection()->receive(message, std::chrono::milliseconds(0));
         } catch (const std::exception& e) {
-            std::cerr << "Network: receive threw exception for peer "
-                      << peerIdShort(peer->getPeerId()) << ": " << e.what() << std::endl;
+            this->log.format(LogLevel::Error, "receive threw for peer {}: {}", peerIdShort(peer->getPeerId()), e.what());
             peer->markForClose();
             return false;
         } catch (...) {
-            std::cerr << "Network: receive threw unknown exception for peer "
-                      << peerIdShort(peer->getPeerId()) << std::endl;
+            this->log.format(LogLevel::Error, "receive threw unknown exception for peer {}", peerIdShort(peer->getPeerId()));
             peer->markForClose();
             return false;
         }
@@ -1048,8 +1054,7 @@ bool Network::handleConnectionReadable(int fd, short revents) {
         }
 
         if (n < 0) {
-            std::cerr << "Network: receive error " << n << " from peer "
-                      << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
+            this->log.format(LogLevel::Error, "receive error {} from peer {}, closing", n, peerIdShort(peer->getPeerId()));
             peer->markForClose();
             return false;
         }
@@ -1059,9 +1064,7 @@ bool Network::handleConnectionReadable(int fd, short revents) {
         //   - terminal event (POLLHUP/ERR/NVAL) without new data: the socket is done. If we don't
         //     close now, poll() will keep firing this revent forever and busy-loop the I/O thread.
         if (terminalEvent) {
-            std::cerr << "Network: peer " << peerIdShort(peer->getPeerId())
-                      << " socket closed by remote (revents=0x" << std::hex << revents << std::dec
-                      << "), closing" << std::endl;
+            this->log.format(LogLevel::Debug, "peer {} socket closed by remote (revents=0x{:x}), closing", peerIdShort(peer->getPeerId()), static_cast<unsigned>(revents));
             peer->markForClose();
         }
         return false;
@@ -1081,14 +1084,13 @@ void Network::handleConnectionWritable(int fd) {
 
     const ssize_t written = peer->writeQueuedFrames();                              // a failure marks the peer for close
     if (written < 0) {
-        std::cerr << "Network: send error " << written << " to peer " << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
+        this->log.format(LogLevel::Error, "send error {} to peer {}, closing", written, peerIdShort(peer->getPeerId()));
     }
 }
 
 void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vector<uint8_t> message) {
     if (message.size() < FRAME_HEADER_SIZE) {
-        std::cerr << "Network: malformed frame (size=" << message.size()
-                  << "B) from peer " << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
+        this->log.formatRateLimited(this->ioThreadLogLimiter, "malformed frame:" + peerIdShort(peer->getPeerId()), LogLevel::Warning, "malformed frame ({} B) from peer {}, closing", message.size(), peerIdShort(peer->getPeerId()));
         peer->markForClose();
         return;
     }
@@ -1098,8 +1100,7 @@ void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vect
 
     // In the departure window only the last management messages are expected; anything else is a protocol violation
     if (peer->isDeparting() && group != GROUP_INTERNAL) {
-        std::cerr << "Network: group 0x" << std::hex << static_cast<int>(group) << std::dec << " from departing peer "
-                  << peerIdShort(peer->getPeerId()) << ", closing" << std::endl;
+        this->log.formatRateLimited(this->ioThreadLogLimiter, "group from departing:" + peerIdShort(peer->getPeerId()), LogLevel::Warning, "group 0x{:02x} from departing peer {}, closing", static_cast<int>(group), peerIdShort(peer->getPeerId()));
         peer->markForClose();
         return;
     }
@@ -1142,6 +1143,7 @@ void Network::cleanClosedPeers() {
     for (auto& peer : toClose) {
         peer->closeConnection();
         this->peerSlots.erase(peer.get());                                          // the connection's limit slot returns now
+        this->log.format(LogLevel::Notice, "peer {} disconnected", peerIdShort(peer->getPeerId()));
     }
 
     // Fire disconnect events outside the peersMutex. Skip while stopping — Network::stop()
@@ -1157,8 +1159,7 @@ void Network::cleanClosedPeers() {
     }
 
     if (!toClose.empty()) {
-        std::cerr << "Network: closed " << toClose.size() << " peer(s), connected="
-                  << this->getConnectedPeerCount() << std::endl;
+        this->log.format(LogLevel::Debug, "closed {} peer(s), connected={}", toClose.size(), this->getConnectedPeerCount());
     }
 }
 
@@ -1245,9 +1246,7 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
             break;
 
         default:
-            std::cerr << "Network: unknown 0xFF subtype=0x" << std::hex << msg.subtype
-                      << std::dec << " from peer " << peerIdShort(msg.peer->getPeerId())
-                      << " payload=" << msg.payload.size() << "B, ignoring" << std::endl;
+            this->log.formatRateLimited(this->managementThreadLogLimiter, "unknown 0xFF subtype:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "unknown 0xFF subtype=0x{:04x} from peer {} ({} B), ignoring", msg.subtype, peerIdShort(msg.peer->getPeerId()), msg.payload.size());
             break;
     }
 }
@@ -1303,8 +1302,8 @@ std::chrono::milliseconds Network::tickTopology() {
             entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + attemptDuration);
         });
 
-        std::cerr << "Network: topology — dialing " << peerIdShort(decision.connectTo->peerId) << " at " << decision.connectTo->addresses.size()
-                  << " address(es), first " << decision.connectTo->addresses.front().address << ":" << decision.connectTo->addresses.front().port << std::endl;
+        this->log.format(LogLevel::Info, "topology — dialing {} at {} address(es)", peerIdShort(decision.connectTo->peerId), decision.connectTo->addresses.size());
+        this->log.formatDebugDetail("topology dial addresses for {}: {}", peerIdShort(decision.connectTo->peerId), describeAddresses(decision.connectTo->addresses));
         this->dialAddresses(decision.connectTo->addresses);
     }
 
@@ -1324,7 +1323,7 @@ void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::s
     const auto hello = this->buildHelloFrame();
     if (!hello.empty()) {
         const ssize_t sent = this->sendFrameTo(peer, hello);
-        std::cerr << "Network: HELLO to " << peerIdShort(peer->getPeerId()) << (sent > 0 ? " sent" : " failed, code=") << (sent > 0 ? "" : std::to_string(sent)) << std::endl;
+        this->log.format(LogLevel::Debug, "HELLO to {} {}", peerIdShort(peer->getPeerId()), sent > 0 ? std::string("sent") : "failed, code=" + std::to_string(sent));
     }
 
     // It dialed us: tell it where it comes from — behind NAT it cannot know (F7, first step)
@@ -1335,8 +1334,7 @@ void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::s
     if (auto pex = this->buildInitialPexFor(peer->getPeerId())) {
         const ssize_t sent = this->sendFrameTo(peer, pex->frame);
         if (sent > 0) this->markRecordsAnnounced(pex->recordIds);
-        std::cerr << "Network: initial PEX to " << peerIdShort(peer->getPeerId()) << " (" << pex->recordIds.size() << " record(s))"
-                  << (sent > 0 ? " sent" : " failed") << std::endl;
+        this->log.format(LogLevel::Debug, "initial PEX to {} ({} record(s)) {}", peerIdShort(peer->getPeerId()), pex->recordIds.size(), sent > 0 ? "sent" : "failed");
     }
 }
 
@@ -1362,15 +1360,12 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
     const SignedRecordStatus status = SignedPeerRecordCodec::deserialize(msg.payload, record);
 
     if (status != SignedRecordStatus::Success) {
-        std::cerr << "Network: HELLO from " << peerIdShort(msg.peer->getPeerId())
-                  << " failed verification, status=" << static_cast<int>(status) << std::endl;
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "HELLO verification:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "HELLO from {} failed verification, status={}", peerIdShort(msg.peer->getPeerId()), static_cast<int>(status));
         return;
     }
 
     if (record.peerId != msg.peer->getPeerId()) {
-        std::cerr << "Network: HELLO from " << peerIdShort(msg.peer->getPeerId())
-                  << " described a different peerId (" << peerIdShort(record.peerId)
-                  << "), discarding" << std::endl;
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "HELLO peerId:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "HELLO from {} described a different peerId ({}), discarding", peerIdShort(msg.peer->getPeerId()), peerIdShort(record.peerId));
         return;
     }
 
@@ -1390,10 +1385,7 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
         this->enqueuePexBroadcast(peerId, msg.peer->getPeerId());
     }
 
-    std::cerr << "Network: HELLO processed from " << peerIdShort(msg.peer->getPeerId())
-              << (outboundMatch ? ", verified" : ", unverified")
-              << (shouldBroadcast ? ", broadcasting" : "")
-              << ", knownPeers=" << this->peerDirectory->size() << std::endl;
+    this->log.format(LogLevel::Debug, "HELLO processed from {}{}{}, knownPeers={}", peerIdShort(msg.peer->getPeerId()), outboundMatch ? ", verified" : ", unverified", shouldBroadcast ? ", broadcasting" : "", this->peerDirectory->size());
 }
 
 // Only a peer we dialed sees our source address; one that dialed us would be telling us about its own connection
@@ -1401,7 +1393,7 @@ void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
     if (msg.dialedAddress.empty()) return;
     const auto address = ObservedAddressCodec::decode(msg.payload);
     if (!address) {
-        std::cerr << "Network: malformed OBSERVED_ADDRESS from " << peerIdShort(msg.peer->getPeerId()) << std::endl;
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "malformed OBSERVED_ADDRESS:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "malformed OBSERVED_ADDRESS from {}", peerIdShort(msg.peer->getPeerId()));
         return;
     }
 
@@ -1418,8 +1410,8 @@ void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
 
     const bool announced = std::any_of(this->config.announcedAddresses.begin(), this->config.announcedAddresses.end(), [&](const PeerAddress& a) { return a.address == *address; });
     if (firstTime && !announced && !isPrivateAddress(*address)) {
-        std::cerr << "Network: peers see this node as " << *address << ", which it does not announce — it is behind NAT and cannot be dialed "
-                  << "from outside; with port forwarding, announce " << *address << " (reported by " << peerIdShort(msg.peer->getPeerId()) << ")" << std::endl;
+        this->log.format(LogLevel::Warning, "peers see this node as {}, which it does not announce — it is behind NAT and cannot be dialed from outside; with port forwarding, announce {} (reported by {})",
+                 *address, *address, peerIdShort(msg.peer->getPeerId()));
     }
 }
 
@@ -1432,7 +1424,7 @@ void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason rea
     const std::vector<uint8_t> payload{ static_cast<uint8_t>(reason) };
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_GOODBYE, payload);
     peer->sendFarewell(frame);  // best-effort — we're leaving anyway, ignore send errors
-    std::cerr << "Network: sent GOODBYE to " << peerIdShort(peer->getPeerId()) << " reason=" << static_cast<int>(reason) << std::endl;
+    this->log.format(LogLevel::Notice, "sent GOODBYE to {} reason={}", peerIdShort(peer->getPeerId()), static_cast<int>(reason));
 }
 
 void Network::processGoodbyeMessage(const ProtocolMessage& msg) {
@@ -1440,7 +1432,7 @@ void Network::processGoodbyeMessage(const ProtocolMessage& msg) {
                                  ? static_cast<GoodbyeReason>(msg.payload[0])
                                  : GoodbyeReason::Shutdown;  // malformed frame — treat as shutdown, close gracefully
 
-    std::cerr << "Network: received GOODBYE from " << peerIdShort(msg.peer->getPeerId()) << " reason=" << static_cast<int>(reason) << std::endl;
+    this->log.format(LogLevel::Notice, "received GOODBYE from {} reason={}", peerIdShort(msg.peer->getPeerId()), static_cast<int>(reason));
 
     // We dialed a peer that is reachable but full: back off with growing intervals on the rejection channel.
     // Its HELLO, processed just before (same connection, in order), already proved it Available.
@@ -1471,8 +1463,7 @@ void Network::recordNoSlotsRejection(const PeerId& peerId) {
         waitDuration = computeBackoffInterval(rejections);
         entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + waitDuration);
     });
-    std::cerr << "Network: " << peerIdShort(peerId) << " has no free slots (rejections=" << static_cast<int>(rejections)
-              << "), next attempt in " << waitDuration.count() << "s" << std::endl;
+    this->log.format(LogLevel::Notice, "{} has no free slots (rejections={}), next attempt in {}s", peerIdShort(peerId), static_cast<int>(rejections), waitDuration.count());
 }
 
 std::optional<Network::InitialPexBatch> Network::buildInitialPexFor(const PeerId& targetId) const {
@@ -1558,11 +1549,11 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
         for (const auto& peer : this->activePeersSnapshot()) connected.push_back(peer->getPeerId());
         const auto victim = chooseEvictionVictim(this->peerDirectory->listPeers(), connected, outboundMatch);
         if (!victim) {
-            std::cerr << "Network: address book full, dropping record " << peerIdShort(peerId) << std::endl;
+            this->log.format(LogLevel::Warning, "address book full, dropping record {}", peerIdShort(peerId));
             return false;
         }
         this->peerDirectory->removePeer(*victim);
-        std::cerr << "Network: address book full, evicted " << peerIdShort(*victim) << " for " << peerIdShort(peerId) << std::endl;
+        this->log.format(LogLevel::Warning, "address book full, evicted {} for {}", peerIdShort(*victim), peerIdShort(peerId));
     }
 
     this->peerDirectory->upsertPeer(peerId, [&](KnownPeer& entry, bool isNewEntry) {
@@ -1654,8 +1645,7 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
     if (status != PexAnnounceStatus::Success) {
         // Framing error — peer is broken or malicious. Drop the connection.
         // (Individual record verification failures are silently dropped by the codec and do not reach here.)
-        std::cerr << "Network: PEX_ANNOUNCE from " << peerIdShort(msg.peer->getPeerId())
-                  << " malformed, closing connection" << std::endl;
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "malformed PEX_ANNOUNCE:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "PEX_ANNOUNCE from {} malformed, closing connection", peerIdShort(msg.peer->getPeerId()));
         msg.peer->markForClose();
         return;
     }
@@ -1683,15 +1673,13 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
         }
     }
 
-    std::cerr << "Network: PEX_ANNOUNCE from " << peerIdShort(senderId)
-              << " — " << records.size() << " record(s), " << broadcastCount
-              << " broadcasted, knownPeers=" << this->peerDirectory->size() << std::endl;
+    this->log.format(LogLevel::Debug, "PEX_ANNOUNCE from {} — {} record(s), {} broadcasted, knownPeers={}", peerIdShort(senderId), records.size(), broadcastCount, this->peerDirectory->size());
 }
 
 void Network::processPexRequestMessage(const ProtocolMessage& msg) {
     std::vector<PeerId> wanted;
     if (PexRequestCodec::deserialize(msg.payload, wanted) != PexAnnounceStatus::Success) {
-        std::cerr << "Network: PEX_REQUEST from " << peerIdShort(msg.peer->getPeerId()) << " malformed, closing connection" << std::endl;
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "malformed PEX_REQUEST:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "PEX_REQUEST from {} malformed, closing connection", peerIdShort(msg.peer->getPeerId()));
         msg.peer->markForClose();
         return;
     }
@@ -1749,7 +1737,7 @@ void Network::sendPendingPexBroadcasts() {
     // Nobody got it (no targets, or every send refused, e.g. SendQueueFull): leave the record unannounced (B10). Its
     // empty lastAnnouncedAt puts it first in line for the next anti-entropy tick — no separate retry loop needed.
     if (sent == 0) {
-        std::cerr << "Network: PEX_ANNOUNCE for " << peerIdShort(pending.recordPeerId) << " reached nobody, left for anti-entropy" << std::endl;
+        this->log.format(LogLevel::Debug, "PEX_ANNOUNCE for {} reached nobody, left for anti-entropy", peerIdShort(pending.recordPeerId));
         return;
     }
 
@@ -1762,8 +1750,7 @@ void Network::sendPendingPexBroadcasts() {
         kp.pendingPexBroadcast = false;
     });
 
-    std::cerr << "Network: broadcasted PEX_ANNOUNCE for " << peerIdShort(pending.recordPeerId)
-              << " to " << sent << "/" << targets.size() << " peer(s)" << std::endl;
+    this->log.format(LogLevel::Debug, "broadcasted PEX_ANNOUNCE for {} to {}/{} peer(s)", peerIdShort(pending.recordPeerId), sent, targets.size());
 }
 
 // ============================================================
@@ -1816,7 +1803,7 @@ void Network::tickPeriodicPex() {
 
     // Every send refused: the batch keeps its place at the front of the anti-entropy order (B10)
     if (sent == 0) {
-        std::cerr << "Network: anti-entropy PEX tick — " << batch.size() << " record(s) reached nobody" << std::endl;
+        this->log.format(LogLevel::Debug, "anti-entropy PEX tick — {} record(s) reached nobody", batch.size());
         return;
     }
 
@@ -1830,8 +1817,7 @@ void Network::tickPeriodicPex() {
         });
     }
 
-    std::cerr << "Network: anti-entropy PEX tick — " << batch.size() << " record(s) to "
-              << sent << "/" << targets.size() << " peer(s)" << std::endl;
+    this->log.format(LogLevel::Debug, "anti-entropy PEX tick — {} record(s) to {}/{} peer(s)", batch.size(), sent, targets.size());
 }
 
 std::chrono::seconds Network::pickRandomPexInterval() {
@@ -1935,14 +1921,14 @@ void Network::runPeerProbe() {
             if (kp.availability == AvailabilityState::Probing) kp.availability = pickedPreviousAvailability;
         });
         this->probeInFlight.store(false, std::memory_order_release);
-        std::cerr << "Network: failed to start probe worker for " << peerIdShort(pickedId) << ": " << e.what() << std::endl;
+        this->log.format(LogLevel::Critical, "cannot start probe worker for {}: {}", peerIdShort(pickedId), e.what());
         return;
     }
 
     this->probeWorkers.push_back(std::move(worker));                                 // management thread only (A1 S1)
 
-    std::cerr << "Network: launched probe for " << peerIdShort(pickedId) << " at " << pickedAddresses.size() << " address(es), first "
-              << pickedAddresses.front().address << ":" << pickedAddresses.front().port << std::endl;
+    this->log.format(LogLevel::Debug, "launched probe for {} at {} address(es)", peerIdShort(pickedId), pickedAddresses.size());
+    this->log.formatDebugDetail("probe addresses for {}: {}", peerIdShort(pickedId), describeAddresses(pickedAddresses));
 }
 
 void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self) {
@@ -1960,22 +1946,16 @@ void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses
         OutboundConnectionResult result = this->establishOutboundConnection(address, port, flags);
 
         if (result.verification != VerificationResult::Success) {
-            std::cerr << "Network: probe to " << peerIdShort(expected)
-                      << " at " << address << ":" << port
-                      << " failed during handshake, result=" << static_cast<int>(result.verification) << std::endl;
+            this->log.format(LogLevel::Info, "probe to {} at {}:{} failed during handshake: {}", peerIdShort(expected), address, port, verificationResultName(result.verification));
         } else if (result.remoteIdentity.getPeerId() != expected) {
             // Someone else on that address — don't trust the address for the expected peer.
             // We don't record anything for the actual remote: our probe flag caused it to close without
             // sending HELLO, so we have no announced addresses to outbound-match against.
-            std::cerr << "Network: probe to " << peerIdShort(expected)
-                      << " at " << address << ":" << port
-                      << " got PeerId mismatch (actual=" << peerIdShort(result.remoteIdentity.getPeerId())
-                      << "), treating as probe failure" << std::endl;
+            this->log.format(LogLevel::Info, "probe to {} at {}:{} got PeerId mismatch (actual={}), treating as probe failure", peerIdShort(expected), address, port, peerIdShort(result.remoteIdentity.getPeerId()));
         } else {
             // Identity verified, PeerId matches expected — the announced address is reachable.
             success = true;
-            std::cerr << "Network: probe to " << peerIdShort(expected)
-                      << " at " << address << ":" << port << " succeeded" << std::endl;
+            this->log.format(LogLevel::Info, "probe to {} at {}:{} succeeded", peerIdShort(expected), address, port);
         }
 
         // Always close the connection — probe is one-shot.
@@ -2034,13 +2014,10 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
     // Logging and PEX-broadcast enqueue happen outside the directory lock.
     switch (outcome) {
         case Outcome::StateChanged:
-            std::cerr << "Network: probe result for " << peerIdShort(expected)
-                      << " ignored — state changed during probe" << std::endl;
+            this->log.format(LogLevel::Info, "probe result for {} ignored — state changed during probe", peerIdShort(expected));
             break;
         case Outcome::Failed:
-            std::cerr << "Network: probe failure recorded for " << peerIdShort(expected)
-                      << " (failures=" << static_cast<int>(failureCount)
-                      << ", next probe in " << waitDuration.count() << "s)" << std::endl;
+            this->log.format(LogLevel::Info, "probe failure recorded for {} (failures={}, next probe in {}s)", peerIdShort(expected), static_cast<int>(failureCount), waitDuration.count());
             break;
         case Outcome::Success:
             // excludePeerId = self — probe doesn't have a "source" peer to exclude; we learned

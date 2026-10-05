@@ -13,6 +13,7 @@
 #include "meshlink/signed_peer_record.h"
 #include "meshlink/thread_safe_queue.h"
 #include "meshlink/connection_slots.h"
+#include "meshlink/log.h"
 #include "transport/TcpServer.h"
 
 #include <array>
@@ -132,7 +133,8 @@ namespace invilite::Mesh {
         Network(std::shared_ptr<LocalIdentity> selfIdentity,
                 std::shared_ptr<std::array<uint8_t, 64>> networkSecret,
                 std::shared_ptr<PeerDirectory> peerDirectory,
-                NetworkConfig config = {});
+                NetworkConfig config = {},
+                std::shared_ptr<Logger> logger = {});                                   // null → default Logger (stderr, Info)
         ~Network();
 
         Network(const Network&)            = delete;
@@ -145,6 +147,9 @@ namespace invilite::Mesh {
         // transport handshake, identity verification, and finally adds the peer to the active peer pool.
         // Returns immediately — actual connection attempt runs asynchronously.
         void connectToPeer(const std::string& address, uint16_t port);
+
+        // The Logger this Network writes to — the Router defaults to the same one
+        [[nodiscard]] const std::shared_ptr<Logger>& getLogger() const { return this->log.getLogger(); }
 
         // ── Event subscription ──────────────────────────────────────────────────────────────
         // Register a listener for connection lifecycle and message events. Network keeps the
@@ -353,6 +358,12 @@ namespace invilite::Mesh {
         std::shared_ptr<LocalIdentity>                  selfIdentity;
         std::shared_ptr<std::array<uint8_t, 64>>        networkSecret;
         NetworkConfig                                   config;
+        ComponentLog                                    log;
+
+        // Bound logs a remote peer can trigger (malformed frames, protocol violations); one limiter per thread, no locks
+        LogRateLimiter                                  ioThreadLogLimiter;
+        LogRateLimiter                                  managementThreadLogLimiter;
+        LogRateLimiter                                  listenerThreadLogLimiter;
 
         // ===== Self-attested record about us, signed by selfIdentity =====
         // Built in start(), sent to new peers via HELLO.
