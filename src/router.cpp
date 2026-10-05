@@ -29,6 +29,11 @@ namespace {
         return id;
     }
 
+    // The sender's first hop does not decrement; clamped because ttlInitial 255 with ttlRemaining 0 would wrap to 0
+    uint8_t hopsTraveled(const RoutedMessage& message) {
+        return static_cast<uint8_t>(std::min(message.ttlInitial - message.ttlRemaining + 1, 255));
+    }
+
     uint32_t currentUnixSeconds() {
         return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     }
@@ -57,7 +62,7 @@ public:
 Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config)
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
       inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
-      plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit) {}
+      plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
 
 Router::~Router() {
     this->stop();
@@ -72,6 +77,10 @@ void Router::start() {
     this->unknownModeReportedAt.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
     this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
+    {
+        std::lock_guard lock(this->routesMutex);
+        this->routes = RouteTable(this->config.routes);
+    }
     this->network.addListener(this->inbox);
 
     // Seed after registering, before the loop drains anything. A peer that connects or leaves around this point shows up
@@ -139,6 +148,11 @@ RouterStatistics Router::getStatistics() const {
     return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load() };
 }
 
+std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
+    std::lock_guard lock(this->routesMutex);
+    return this->routes.candidates(destination);
+}
+
 std::vector<PeerId> Router::neighborsSnapshot() const {
     std::lock_guard lock(this->neighborsMutex);
     return { this->neighbors.begin(), this->neighbors.end() };
@@ -175,6 +189,10 @@ void Router::processEvent(Event& event) {
         } else if constexpr (std::is_same_v<T, Event::NeighborDisconnected>) {
             this->unknownModeReportedAt.erase(content.peerId);
             this->broadcastCache.forgetNeighbor(content.peerId);
+            {
+                std::lock_guard lock(this->routesMutex);
+                this->routes.forgetNeighbor(content.peerId);                        // routes do not expire — they end with their neighbor
+            }
             {
                 std::lock_guard lock(this->neighborsMutex);
                 this->neighbors.erase(content.peerId);
@@ -373,6 +391,11 @@ void Router::acceptBroadcastWithKey(RoutedMessage message, const PeerId& receive
         return;
     }
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
+    {
+        // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
+        std::lock_guard lock(this->routesMutex);
+        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
+    }
     this->deliverLocally(message);
     this->spreadNewMessage(message, receivedFrom);
 }
@@ -461,8 +484,7 @@ void Router::deliverLocally(const RoutedMessage& message) {
     delivery.group        = message.group;
     delivery.subtype      = message.subtype;
     delivery.mode         = message.mode;
-    // The sender's first hop does not decrement; clamped because ttlInitial 255 with ttlRemaining 0 would wrap to 0
-    delivery.hopsTraveled = static_cast<uint8_t>(std::min(message.ttlInitial - message.ttlRemaining + 1, 255));
+    delivery.hopsTraveled = hopsTraveled(message);
     delivery.payload      = message.payload;
 
     std::vector<std::shared_ptr<RouterEventListener>> snapshot;

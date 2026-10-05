@@ -7,6 +7,7 @@
 #include "meshlink/identity.h"
 #include "meshlink/peer_directory.h"
 #include "meshlink/plumtree_state.h"
+#include "meshlink/route_table.h"
 #include "meshlink/router_events.h"
 #include "meshlink/router_wire.h"
 #include "meshlink/seen_message_cache.h"
@@ -41,6 +42,7 @@ namespace invilite::Mesh {
         PlumtreeConfig              plumtree;                                       // BROADCAST mode (docs/router.md 4.3)
         std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
         size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
+        RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -88,6 +90,9 @@ namespace invilite::Mesh {
         std::vector<PeerId> getNeighbors() const;
 
         RouterStatistics getStatistics() const;
+
+        // Routes to `destination` as learned so far, best first — diagnostics and tests
+        std::vector<RouteCandidate> getRouteCandidates(const PeerId& destination) const;
 
     private:
         class EventInbox;                                                           // NetworkEventListener → Router queue
@@ -140,6 +145,10 @@ namespace invilite::Mesh {
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
+
+        // Written by the Router thread (and by start()); read by getRouteCandidates()
+        mutable std::mutex                          routesMutex;
+        RouteTable                                  routes;
 
         // Written by the Router thread (and by start() before the thread runs); read by getNeighbors()
         mutable std::mutex                          neighborsMutex;

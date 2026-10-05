@@ -766,3 +766,27 @@ TEST(RouterTest, GraftForMessageThatEndedHereIsNotAnswered) {
     EXPECT_EQ(mesh.recorders[2]->countOf(mesh.id(0), message.msgId), 0u);
     EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 0u);
 }
+
+// ── Routes learned from traffic (R-5 a) ─────────────────────────────────────
+
+TEST(RouterTest, BroadcastTeachesRouteToItsSenderAndDisconnectEndsIt) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'r' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, msgId); }, 5s));
+
+    for (size_t i = 1; i < 4; ++i) {
+        const auto candidates = mesh.routers[i]->getRouteCandidates(mesh.id(0));
+        ASSERT_EQ(candidates.size(), 1u) << "node " << i;
+        EXPECT_EQ(candidates.front().via, mesh.id(i - 1));                                    // back the way it came
+        EXPECT_EQ(candidates.front().hops, i);
+        EXPECT_EQ(candidates.front().evidence, RouteEvidence::Broadcast);
+    }
+    EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(0)).empty());                     // no route to ourselves
+
+    mesh.routers[2]->stop();
+    mesh.nodes[2]->network->stop();
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[3]->getRouteCandidates(mesh.id(0)).empty(); }, 5s));   // its only neighbor left
+    EXPECT_EQ(mesh.routers[1]->getRouteCandidates(mesh.id(0)).size(), 1u);                    // not through node 2: unaffected
+}
