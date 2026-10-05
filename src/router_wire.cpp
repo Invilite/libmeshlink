@@ -13,17 +13,14 @@ namespace {
 
     constexpr size_t  PEER_ID_SIZE          = 32;
     constexpr size_t  ED25519_PUB_SIZE      = 32;
-    constexpr size_t  MAX_LIST_ENTRIES      = 255;                                  // 1-byte counts (source route, recorded route, ACK route)
+    constexpr size_t  MAX_LIST_ENTRIES      = 255;                                  // 1-byte count of the source route
     constexpr size_t  MAX_TLV_LENGTH        = 0xFFFF;                               // 2-byte TLV length and extensions total length
 
-    constexpr uint8_t FLAG_KIND_MASK        = 0x03;
-    constexpr uint8_t FLAG_RECORD_ROUTE     = 0x04;
-    constexpr uint8_t FLAG_ACK_REQUESTED    = 0x08;
-    constexpr uint8_t FLAG_HAS_EXTENSIONS   = 0x10;
-    constexpr uint8_t FLAG_RESERVED_MASK    = 0xE0;
+    constexpr uint8_t FLAG_ACK_REQUESTED    = 0x01;
+    constexpr uint8_t FLAG_HAS_EXTENSIONS   = 0x02;
+    constexpr uint8_t FLAG_RESERVED_MASK    = 0xFC;
 
-    constexpr uint8_t HIGHEST_MODE          = static_cast<uint8_t>(RoutingMode::Flood);
-    constexpr uint8_t HIGHEST_KIND          = static_cast<uint8_t>(RoutedMessageKind::RouteError);
+    constexpr uint8_t HIGHEST_MODE          = static_cast<uint8_t>(RoutingMode::Unicast);
 
     // Extension types this node understands. Only matters for critical types (an unknown critical type rejects the
     // message); none exists yet. Unknown non-critical extensions are kept as received.
@@ -108,9 +105,8 @@ namespace {
 
     // Flags byte as signed: HAS_EXTENSIONS is not part of it (a relay may add a per-hop extension)
     uint8_t signedFlagsByte(const RoutedMessage& message) {
-        uint8_t flags = static_cast<uint8_t>(message.kind) | static_cast<uint8_t>(message.reservedFlagBits & FLAG_RESERVED_MASK);
-        if (message.recordedRoute)  flags |= FLAG_RECORD_ROUTE;
-        if (message.ackRequested)   flags |= FLAG_ACK_REQUESTED;
+        uint8_t flags = message.reservedFlagBits & FLAG_RESERVED_MASK;
+        if (message.ackRequested) flags |= FLAG_ACK_REQUESTED;
         return flags;
     }
 
@@ -122,38 +118,46 @@ namespace {
 
     // Structural consistency of a message about to be encoded — the same rules decode enforces, plus field-size limits.
     bool isEncodable(const RoutedMessage& message) {
-        if (message.group > MAX_ROUTED_GROUP)                                       return false;
+        if (!carriesRoutingHeader(message.group, message.subtype))                  return false;
         if (static_cast<uint8_t>(message.mode) > HIGHEST_MODE)                      return false;
-        if (static_cast<uint8_t>(message.kind) > HIGHEST_KIND)                      return false;
-        if (message.mode == RoutingMode::Broadcast && message.kind != RoutedMessageKind::Data) return false;
+        if (message.group == ROUTER_PROTOCOL_GROUP && reachesEveryNode(message.mode)) return false;
         if ((message.reservedFlagBits & ~FLAG_RESERVED_MASK) != 0)                  return false;
         if (message.ttlInitial == 0 || message.ttlRemaining > message.ttlInitial)   return false;
-        if (message.destination.has_value() != (message.mode != RoutingMode::Broadcast))    return false;
-        if (message.sourceRoute.has_value() != (message.mode == RoutingMode::SourceRouted)) return false;
+        if (message.destination.has_value() == reachesEveryNode(message.mode))      return false;
+        if (message.sourceRoute.has_value() != (message.mode == RoutingMode::Routed)) return false;
         if (message.sourceRoute) {
             if (message.sourceRoute->hops.size() > MAX_LIST_ENTRIES)                return false;
             if (message.sourceRoute->nextHopIndex > message.sourceRoute->hops.size()) return false;
         }
-        if (message.recordedRoute && message.recordedRoute->size() > MAX_LIST_ENTRIES)  return false;
         for (const RoutingExtension& extension : message.extensions) {
             if (extension.value.size() > MAX_TLV_LENGTH)                            return false;
         }
         if (extensionsBlockLength(message) > MAX_TLV_LENGTH)                        return false;
-        const size_t expectedSignatureSize = requiresSignature(message.mode, message.kind) ? SIGNATURE_SIZE : 0;
+        const size_t expectedSignatureSize = requiresSignature(message.group, message.mode) ? SIGNATURE_SIZE : 0;
         return message.signature.size() == expectedSignatureSize;
     }
 
-    // Kind-specific payload shape is part of the receive validation (3.6): a malformed ACK / ROUTE_ERROR is rejected
-    // before anyone acts on it.
-    bool hasValidKindPayload(const RoutedMessage& message) {
-        if (message.kind == RoutedMessageKind::Ack)        { AckPayload ack;          return decodeAckPayload(message.payload, ack); }
-        if (message.kind == RoutedMessageKind::RouteError) { RouteErrorPayload error; return decodeRouteErrorPayload(message.payload, error); }
+    // The payload shape of a routed Router message is part of the receive validation (3.6): a malformed ACK / ROUTE_ERROR
+    // is rejected before anyone acts on it. RECORD_ROUTE / ROUTE_REPORT get their codecs in R-5; unknown subtypes pass.
+    bool hasValidRouterMessagePayload(const RoutedMessage& message) {
+        if (message.group != ROUTER_PROTOCOL_GROUP) return true;
+        if (message.subtype == SUBTYPE_ACK)         { AckPayload ack;          return decodeAckPayload(message.payload, ack); }
+        if (message.subtype == SUBTYPE_ROUTE_ERROR) { RouteErrorPayload error; return decodeRouteErrorPayload(message.payload, error); }
         return true;
     }
 }
 
-bool requiresSignature(RoutingMode mode, RoutedMessageKind kind) {
-    return mode == RoutingMode::Broadcast || kind == RoutedMessageKind::Ack || kind == RoutedMessageKind::RouteError;
+bool reachesEveryNode(RoutingMode mode) {
+    return mode == RoutingMode::Flood || mode == RoutingMode::Broadcast;
+}
+
+bool carriesRoutingHeader(uint8_t group, uint16_t subtype) {
+    if (group <= MAX_ROUTED_GROUP) return true;
+    return group == ROUTER_PROTOCOL_GROUP && subtype >= FIRST_ROUTED_ROUTER_SUBTYPE && subtype <= LAST_ROUTED_ROUTER_SUBTYPE;
+}
+
+bool requiresSignature(uint8_t group, RoutingMode mode) {
+    return reachesEveryNode(mode) || group == ROUTER_PROTOCOL_GROUP;
 }
 
 std::vector<uint8_t> encode(const RoutedMessage& message) {
@@ -182,10 +186,6 @@ std::vector<uint8_t> encode(const RoutedMessage& message) {
         out.push_back(message.sourceRoute->nextHopIndex);
         writePeerIds(out, message.sourceRoute->hops);
     }
-    if (message.recordedRoute) {
-        out.push_back(static_cast<uint8_t>(message.recordedRoute->size()));
-        writePeerIds(out, *message.recordedRoute);
-    }
     if (!message.extensions.empty()) {
         writeBE16(out, static_cast<uint16_t>(extensionsBlockLength(message)));
         for (const RoutingExtension& extension : message.extensions) writeExtension(out, extension);
@@ -198,7 +198,7 @@ std::vector<uint8_t> encode(const RoutedMessage& message) {
 RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint8_t> body, std::chrono::system_clock::time_point now,
                            RoutedMessage& out, std::chrono::seconds maxClockSkew) {
     out = RoutedMessage{};
-    if (group > MAX_ROUTED_GROUP) return RoutedMessageStatus::NotRoutedGroup;
+    if (!carriesRoutingHeader(group, subtype)) return RoutedMessageStatus::NotRoutedGroup;
     out.group   = group;
     out.subtype = subtype;
 
@@ -214,37 +214,28 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
 
     // Header semantics that need no further bytes — reject early
     if ((versionAndMode >> 4) != WIRE_VERSION)                      return RoutedMessageStatus::UnsupportedVersion;
-    if ((versionAndMode & 0x0F) > HIGHEST_MODE)                     return RoutedMessageStatus::ReservedMode;
-    if ((flags & FLAG_KIND_MASK) > HIGHEST_KIND)                    return RoutedMessageStatus::ReservedKind;
     out.mode             = static_cast<RoutingMode>(versionAndMode & 0x0F);
-    out.kind             = static_cast<RoutedMessageKind>(flags & FLAG_KIND_MASK);
     out.ackRequested     = (flags & FLAG_ACK_REQUESTED) != 0;
     out.reservedFlagBits = flags & FLAG_RESERVED_MASK;
-    if (out.mode == RoutingMode::Broadcast && out.kind != RoutedMessageKind::Data)  return RoutedMessageStatus::KindNotAllowedInMode;
+    if ((versionAndMode & 0x0F) > HIGHEST_MODE)                                     return RoutedMessageStatus::UnknownMode;
+    if (group == ROUTER_PROTOCOL_GROUP && reachesEveryNode(out.mode))               return RoutedMessageStatus::RouterMessageToEveryNode;
     if (out.ttlInitial == 0 || out.ttlRemaining > out.ttlInitial)                   return RoutedMessageStatus::InvalidTtl;
 
     const auto sentAtTime = std::chrono::system_clock::time_point(std::chrono::seconds(out.sentAtUnixSeconds));
     if (sentAtTime > now + maxClockSkew || sentAtTime < now - maxClockSkew)         return RoutedMessageStatus::TimestampOutOfWindow;
 
-    if (out.mode != RoutingMode::Broadcast) {
+    if (!reachesEveryNode(out.mode)) {
         PeerId destination{};
         if (!reader.readPeerId(destination)) return RoutedMessageStatus::MalformedEncoding;
         out.destination = destination;
     }
 
-    if (out.mode == RoutingMode::SourceRouted) {
+    if (out.mode == RoutingMode::Routed) {
         uint8_t hopCount = 0;
         SourceRoute route;
         if (!reader.readU8(hopCount) || !reader.readU8(route.nextHopIndex) || !reader.readPeerIds(hopCount, route.hops)) return RoutedMessageStatus::MalformedEncoding;
         if (route.nextHopIndex > hopCount) return RoutedMessageStatus::SourceRouteIndexOutOfRange;
         out.sourceRoute = std::move(route);
-    }
-
-    if (flags & FLAG_RECORD_ROUTE) {
-        uint8_t hopCount = 0;
-        std::vector<PeerId> recorded;
-        if (!reader.readU8(hopCount) || !reader.readPeerIds(hopCount, recorded)) return RoutedMessageStatus::MalformedEncoding;
-        out.recordedRoute = std::move(recorded);
     }
 
     if (flags & FLAG_HAS_EXTENSIONS) {
@@ -268,7 +259,7 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
         if (unknownCritical) return RoutedMessageStatus::UnknownCriticalExtension;  // after the whole block: framing errors take precedence
     }
 
-    if (requiresSignature(out.mode, out.kind)) {
+    if (requiresSignature(out.group, out.mode)) {
         std::span<const uint8_t> signature;
         if (!reader.readBytes(SIGNATURE_SIZE, signature)) return RoutedMessageStatus::MalformedEncoding;
         out.signature.assign(signature.begin(), signature.end());
@@ -278,7 +269,7 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
     reader.readBytes(reader.remaining(), payload);
     out.payload.assign(payload.begin(), payload.end());
 
-    if (!hasValidKindPayload(out)) return RoutedMessageStatus::MalformedEncoding;
+    if (!hasValidRouterMessagePayload(out)) return RoutedMessageStatus::MalformedEncoding;
     return RoutedMessageStatus::Success;
 }
 
@@ -326,19 +317,15 @@ bool verifySignature(const RoutedMessage& message, std::span<const uint8_t> send
 }
 
 std::vector<uint8_t> encodeAckPayload(const AckPayload& ack) {
-    if (ack.receivedRoute.size() > MAX_LIST_ENTRIES) return {};
     std::vector<uint8_t> out;
-    out.reserve(8 + 1 + ack.receivedRoute.size() * PEER_ID_SIZE);
+    out.reserve(8);
     writeBE64(out, ack.acknowledgedMsgId);
-    out.push_back(static_cast<uint8_t>(ack.receivedRoute.size()));
-    writePeerIds(out, ack.receivedRoute);
     return out;
 }
 
 bool decodeAckPayload(std::span<const uint8_t> payload, AckPayload& out) {
     WireReader reader(payload);
-    uint8_t hopCount = 0;
-    if (!reader.readUnsignedBE(8, out.acknowledgedMsgId) || !reader.readU8(hopCount) || !reader.readPeerIds(hopCount, out.receivedRoute)) return false;
+    if (!reader.readUnsignedBE(8, out.acknowledgedMsgId)) return false;
     return reader.remaining() == 0;
 }
 

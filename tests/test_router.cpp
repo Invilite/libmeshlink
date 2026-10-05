@@ -458,3 +458,40 @@ TEST(RouterTest, RepeatedWaitingMessageTakesOneVerificationSlot) {
     ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(relayed)), 0);
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(known.getPeerId(), relayed.msgId) == 1; }, 1500ms));
 }
+
+// ── Modes reaching every node (R-4a) ────────────────────────────────────────
+
+TEST(RouterTest, FloodModeChosenBySenderCrossesLine) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'f' }, RoutingMode::Flood).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, msgId); }, 5s));
+    for (size_t i = 1; i < 4; ++i) {
+        EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), msgId), 1u) << "node " << i;
+        EXPECT_EQ(mesh.recorders[i]->find(mesh.id(0), msgId)->mode, RoutingMode::Flood);
+    }
+}
+
+TEST(RouterTest, BroadcastRefusesPointToPointModes) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    EXPECT_FALSE(mesh.routers[0]->broadcast(0x10, 0, { 1 }, RoutingMode::Unicast).has_value());
+    EXPECT_FALSE(mesh.routers[0]->broadcast(0x10, 0, { 1 }, RoutingMode::Routed).has_value());
+}
+
+// A mode from a newer node is neither delivered nor forwarded; the connection stays usable
+TEST(RouterTest, UnknownModeIsIgnored) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    const RoutedMessage future = craftBroadcast(mesh.id(0), *mesh.nodes[0]->identity, { 'n', 'e', 'w' });
+    std::vector<uint8_t> frame = RouterWire::encode(future);
+    frame[3] = static_cast<uint8_t>(RouterWire::WIRE_VERSION << 4) | 0x4;                     // first unknown mode
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);
+
+    const uint64_t control = mesh.routers[0]->broadcast(0x10, 0, { 1 }).value();              // sent after it, same link
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, control); }, 5s));
+    for (size_t i = 1; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), future.msgId), 0u) << "node " << i;
+    EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 1u);                         // only the control message
+}

@@ -65,8 +65,10 @@ namespace invilite::Mesh {
         void stop();
 
         // Send to every node. Signed here, on the caller's thread; sent by the Router thread. Returns the message id, or
-        // nothing when the Router is not running or `group` is not a user group (0x00..0xFD). Not delivered locally.
-        std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload);
+        // nothing when the Router is not running, `group` is not a user group (0x00..0xFD) or `mode` does not reach every
+        // node. Not delivered locally. The mode is signed and applies on every hop: Flood trades traffic for no tree-repair
+        // delay (docs/router.md 4.3).
+        std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode = RoutingMode::Broadcast);
 
         void addListener(std::shared_ptr<RouterEventListener> listener);
         void removeListener(const std::shared_ptr<RouterEventListener>& listener);
@@ -89,8 +91,8 @@ namespace invilite::Mesh {
 
         void routerLoop();
         void processEvent(Event& event);
-        void handleRouterControl(const NetworkMessage& message);                   // Group 0xFE, neighbor-only
-        void handleRoutedMessage(const NetworkMessage& message);                   // Group 0x00..0xFD, routing header
+        void handleRouterControl(const NetworkMessage& message);                   // Group 0xFE neighbor-only subtypes
+        void handleRoutedMessage(const NetworkMessage& message);                   // routing header: Group 0x00..0xFD, routed Group 0xFE subtypes
         void handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom);
         void awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom);
         void retryPendingVerifications();
@@ -98,6 +100,8 @@ namespace invilite::Mesh {
         void acceptBroadcastWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
         void sendOwnBroadcast(const RoutedMessage& message);
         void forwardBroadcast(RoutedMessage message, const PeerId& receivedFrom);
+        [[nodiscard]] std::vector<PeerId> chooseFullCopyRecipients(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) const;
+        void sendFullCopies(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom);
         void deliverLocally(const RoutedMessage& message);
         [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 

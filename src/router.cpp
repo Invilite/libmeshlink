@@ -93,14 +93,13 @@ void Router::stop() {
     this->neighbors.clear();
 }
 
-std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload) {
-    if (!this->running.load() || group > RouterWire::MAX_ROUTED_GROUP || this->config.broadcastTtl == 0) return std::nullopt;
+std::optional<uint64_t> Router::broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode) {
+    if (!this->running.load() || group > RouterWire::MAX_ROUTED_GROUP || !RouterWire::reachesEveryNode(mode) || this->config.broadcastTtl == 0) return std::nullopt;
 
     RoutedMessage message;
     message.group             = group;
     message.subtype           = subtype;
-    message.mode              = RoutingMode::Broadcast;
-    message.kind              = RoutedMessageKind::Data;
+    message.mode              = mode;
     message.ttlInitial        = this->config.broadcastTtl;
     message.ttlRemaining      = this->config.broadcastTtl;
     message.msgId             = randomMessageId();
@@ -165,8 +164,8 @@ void Router::processEvent(Event& event) {
             // Until the Dispatch thread goes (C6), messages travel a different thread than disconnects: a message from a
             // neighbor may arrive after its disconnect event. It was still received from a verified neighbor, so it is
             // processed normally — only replies to that neighbor will fail.
-            if (content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP) this->handleRouterControl(content.message);
-            else                                                            this->handleRoutedMessage(content.message);
+            if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
+            else                                                                                  this->handleRouterControl(content.message);
         } else {
             this->sendOwnBroadcast(content.message);
         }
@@ -174,23 +173,28 @@ void Router::processEvent(Event& event) {
 }
 
 void Router::handleRouterControl(const NetworkMessage& message) {
-    // NEIGHBORS / IHAVE / GRAFT / PRUNE arrive with Plumtree (R-4) and the eager-set optimization (R-7)
+    // IHAVE / GRAFT / PRUNE / UNKNOWN_DELIVERY_MODE arrive with Plumtree (R-4b), NEIGHBORS with the eager-set optimization (R-7)
     std::cerr << "Router: control subtype 0x" << std::hex << message.subtype << std::dec << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
 }
 
 void Router::handleRoutedMessage(const NetworkMessage& message) {
     RoutedMessage routed;
     const RoutedMessageStatus status = RouterWire::decode(message.group, message.subtype, message.payload, std::chrono::system_clock::now(), routed, this->config.maxClockSkew);
+    if (status == RoutedMessageStatus::UnknownMode) {                              // UNKNOWN_DELIVERY_MODE reply arrives with the control codec (R-4b)
+        std::cerr << "Router: message " << std::hex << routed.msgId << " from " << shortPeerId(message.source) << " uses unknown mode 0x"
+                  << static_cast<int>(routed.mode) << std::dec << ", ignored" << std::endl;
+        return;
+    }
     if (status != RoutedMessageStatus::Success) {
         std::cerr << "Router: routed message from " << shortPeerId(message.source) << " rejected (status " << static_cast<int>(status) << ")" << std::endl;
         return;
     }
 
-    if (routed.mode == RoutingMode::Broadcast) {
+    if (RouterWire::reachesEveryNode(routed.mode)) {                               // Group 0xFE never travels to every node (decode refuses it)
         this->handleIncomingBroadcast(std::move(routed), message.source);
         return;
     }
-    // Point-to-point modes start in R-5
+    // Point-to-point modes and routed Router messages start in R-5
     std::cerr << "Router: routed message mode " << static_cast<int>(routed.mode) << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
 }
 
@@ -269,22 +273,28 @@ bool Router::isAlreadySeen(const RoutedMessage& message) const {
 
 void Router::sendOwnBroadcast(const RoutedMessage& message) {
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());   // echoes are dropped
-    const std::vector<uint8_t> frame = RouterWire::encode(message);
-    if (frame.empty()) return;
-    for (const PeerId& neighbor : this->neighborsSnapshot()) {
-        if (this->network.sendToPeer(neighbor, frame) > 0) ++this->fullMessagesSent;
-    }
+    this->sendFullCopies(message, std::nullopt);
 }
 
-// Plain flooding (R-3): every neighbor except the one it came from and the originator. Plumtree replaces this in R-4.
 void Router::forwardBroadcast(RoutedMessage message, const PeerId& receivedFrom) {
     if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
     message.ttlRemaining -= 1;
+    this->sendFullCopies(message, receivedFrom);
+}
 
+// The broadcast strategy's decision (docs/router.md 4.3). Never back to where the message came from, never to its
+// originator. For BROADCAST, Plumtree (R-4b) narrows this to the eager neighbors and announces to the rest; until then
+// both modes reaching every node are Flood.
+std::vector<PeerId> Router::chooseFullCopyRecipients(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) const {
+    std::vector<PeerId> recipients = this->neighborsSnapshot();
+    std::erase_if(recipients, [&](const PeerId& neighbor) { return neighbor == receivedFrom || neighbor == message.sender; });
+    return recipients;
+}
+
+void Router::sendFullCopies(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) {
     const std::vector<uint8_t> frame = RouterWire::encode(message);
     if (frame.empty()) return;
-    for (const PeerId& neighbor : this->neighborsSnapshot()) {
-        if (neighbor == receivedFrom || neighbor == message.sender) continue;
+    for (const PeerId& neighbor : this->chooseFullCopyRecipients(message, receivedFrom)) {
         if (this->network.sendToPeer(neighbor, frame) > 0) ++this->fullMessagesSent;
     }
 }
