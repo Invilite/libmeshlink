@@ -3,8 +3,10 @@
 #ifndef MESH_ROUTER_H
 #define MESH_ROUTER_H
 
+#include "meshlink/broadcast_cache.h"
 #include "meshlink/identity.h"
 #include "meshlink/peer_directory.h"
+#include "meshlink/plumtree_state.h"
 #include "meshlink/router_events.h"
 #include "meshlink/router_wire.h"
 #include "meshlink/seen_message_cache.h"
@@ -36,12 +38,18 @@ namespace invilite::Mesh {
         size_t                      pendingVerificationLimit = 256;                 // messages waiting for a sender's record, all senders together
         size_t                      pendingVerificationPerNeighbor = 32;            // share of one neighbor — it cannot starve the others
         std::chrono::seconds        unknownModeReportInterval = std::chrono::seconds(60);   // at most one UNKNOWN_DELIVERY_MODE per neighbor and mode
+        PlumtreeConfig              plumtree;                                       // BROADCAST mode (docs/router.md 4.3)
+        std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
+        size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
     struct RouterStatistics {
-        uint64_t    fullMessagesSent   = 0;                                         // routed frames handed to Network, own and forwarded
+        uint64_t    fullMessagesSent   = 0;                                         // routed frames handed to Network: own, forwarded, GRAFT answers
         uint64_t    duplicatesDropped  = 0;                                         // already-seen messages received again, our own included
+        uint64_t    announcementsSent  = 0;                                         // message keys announced in IHAVE
+        uint64_t    graftsSent         = 0;                                         // GRAFT frames, fast-repair ones included
+        uint64_t    prunesSent         = 0;
     };
 
     // Router (docs/router.md): delivers messages beyond direct neighbors — broadcast to every node, or to one node by
@@ -102,10 +110,17 @@ namespace invilite::Mesh {
         void retryPendingVerifications();
         [[nodiscard]] bool isAlreadySeen(const RoutedMessage& message) const;
         void acceptBroadcastWithKey(RoutedMessage message, const PeerId& receivedFrom, std::span<const uint8_t> senderEd25519Pub);
+        void reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom);
         void sendOwnBroadcast(const RoutedMessage& message);
-        void forwardBroadcast(RoutedMessage message, const PeerId& receivedFrom);
-        [[nodiscard]] std::vector<PeerId> chooseFullCopyRecipients(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) const;
-        void sendFullCopies(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom);
+        void spreadNewMessage(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom);
+        void spreadByPlumtree(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, bool forwarding);
+        void sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame);
+        void handleAnnouncement(const PeerId& from, std::span<const uint8_t> payload);
+        void handleGraft(const PeerId& from, std::span<const uint8_t> payload);
+        void sendGraft(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
+        void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
+        void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
+        [[nodiscard]] bool isWaitingForVerification(const RoutedMessageKey& key) const;
         void deliverLocally(const RoutedMessage& message);
         [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 
@@ -120,6 +135,8 @@ namespace invilite::Mesh {
 
         // Router thread only
         SeenMessageCache                            seenMessages;
+        PlumtreeState                               plumtree;
+        BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
@@ -131,6 +148,9 @@ namespace invilite::Mesh {
 
         std::atomic<uint64_t>                       fullMessagesSent{0};
         std::atomic<uint64_t>                       duplicatesDropped{0};
+        std::atomic<uint64_t>                       announcementsSent{0};
+        std::atomic<uint64_t>                       graftsSent{0};
+        std::atomic<uint64_t>                       prunesSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

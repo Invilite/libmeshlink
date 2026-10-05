@@ -56,7 +56,8 @@ public:
 
 Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, std::shared_ptr<LocalIdentity> selfIdentity, RouterConfig config)
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
-      inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity) {}
+      inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
+      plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit) {}
 
 Router::~Router() {
     this->stop();
@@ -69,6 +70,8 @@ void Router::start() {
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
     this->unknownModeReportedAt.clear();
+    this->plumtree       = PlumtreeState(this->config.plumtree);
+    this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
     this->network.addListener(this->inbox);
 
     // Seed after registering, before the loop drains anything. A peer that connects or leaves around this point shows up
@@ -76,7 +79,10 @@ void Router::start() {
     {
         std::lock_guard lock(this->neighborsMutex);
         this->neighbors.clear();
-        for (const PeerId& peerId : this->network.getConnectedPeers()) this->neighbors.insert(peerId);
+        for (const PeerId& peerId : this->network.getConnectedPeers()) {
+            this->neighbors.insert(peerId);
+            this->plumtree.addLink(peerId);
+        }
     }
 
     this->routerThread = std::thread(&Router::routerLoop, this);
@@ -130,7 +136,7 @@ std::vector<PeerId> Router::getNeighbors() const {
 }
 
 RouterStatistics Router::getStatistics() const {
-    return { this->fullMessagesSent.load(), this->duplicatesDropped.load() };
+    return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load() };
 }
 
 std::vector<PeerId> Router::neighborsSnapshot() const {
@@ -142,8 +148,15 @@ void Router::routerLoop() {
     blockSigpipeInCurrentThread();
 
     while (this->running.load()) {
-        auto event = this->inbox->events.waitPop(EVENT_WAIT);
+        // Wake for the next Plumtree deadline (IHAVE batch, GRAFT) — not only for events
+        auto wait = EVENT_WAIT;
+        if (const auto deadline = this->plumtree.nextDeadline()) {
+            const auto untilDeadline = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now());
+            wait = std::clamp(untilDeadline, std::chrono::milliseconds(0), EVENT_WAIT);
+        }
+        auto event = this->inbox->events.waitPop(wait);
         if (event) this->processEvent(*event);
+        this->runPlumtreeTimers(std::chrono::steady_clock::now());
         // On a timer, not after every event: the scan costs a directory lookup per parked message
         if (!this->pendingVerifications.empty() && std::chrono::steady_clock::now() >= this->nextPendingRetryAt) {
             this->retryPendingVerifications();
@@ -156,12 +169,18 @@ void Router::processEvent(Event& event) {
     std::visit([this](auto& content) {
         using T = std::decay_t<decltype(content)>;
         if constexpr (std::is_same_v<T, Event::NeighborConnected>) {
+            this->plumtree.addLink(content.peerId);
             std::lock_guard lock(this->neighborsMutex);
             this->neighbors.insert(content.peerId);
         } else if constexpr (std::is_same_v<T, Event::NeighborDisconnected>) {
             this->unknownModeReportedAt.erase(content.peerId);
-            std::lock_guard lock(this->neighborsMutex);
-            this->neighbors.erase(content.peerId);
+            this->broadcastCache.forgetNeighbor(content.peerId);
+            {
+                std::lock_guard lock(this->neighborsMutex);
+                this->neighbors.erase(content.peerId);
+            }
+            // Fast repair (docs/router.md 4.3): an eager link is gone, ask every lazy one for full copies again
+            for (const PeerId& lazyLink : this->plumtree.removeLink(content.peerId)) this->sendGraft(lazyLink, {});
         } else if constexpr (std::is_same_v<T, Event::FrameReceived>) {
             // Until the Dispatch thread goes (C6), messages travel a different thread than disconnects: a message from a
             // neighbor may arrive after its disconnect event. It was still received from a verified neighbor, so it is
@@ -175,19 +194,84 @@ void Router::processEvent(Event& event) {
 }
 
 void Router::handleRouterControl(const NetworkMessage& message) {
-    if (message.subtype == RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE) {
-        UnknownDeliveryModeReport report;
-        if (!RouterWire::decodeUnknownDeliveryMode(message.payload, report)) {
-            std::cerr << "Router: malformed UNKNOWN_DELIVERY_MODE from " << shortPeerId(message.source) << std::endl;
+    switch (message.subtype) {
+        case RouterWire::SUBTYPE_IHAVE: this->handleAnnouncement(message.source, message.payload); return;
+        case RouterWire::SUBTYPE_GRAFT: this->handleGraft(message.source, message.payload); return;
+        case RouterWire::SUBTYPE_PRUNE:
+            if (RouterWire::decodePrune(message.payload)) this->plumtree.onPrune(message.source);
+            else std::cerr << "Router: malformed PRUNE from " << shortPeerId(message.source) << std::endl;
+            return;
+        case RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE: {
+            UnknownDeliveryModeReport report;
+            if (!RouterWire::decodeUnknownDeliveryMode(message.payload, report)) {
+                std::cerr << "Router: malformed UNKNOWN_DELIVERY_MODE from " << shortPeerId(message.source) << std::endl;
+                return;
+            }
+            // Informational: the mode is signed, so the message cannot be resent in another one (docs/router.md 3.4)
+            std::cerr << "Router: " << shortPeerId(message.source) << " does not know mode 0x" << std::hex << static_cast<int>(report.mode)
+                      << " of message " << report.message.msgId << std::dec << " from " << shortPeerId(report.message.sender) << std::endl;
             return;
         }
-        // Informational: the mode is signed, so the message cannot be resent in another one (docs/router.md 3.4)
-        std::cerr << "Router: " << shortPeerId(message.source) << " does not know mode 0x" << std::hex << static_cast<int>(report.mode)
-                  << " of message " << report.message.msgId << std::dec << " from " << shortPeerId(report.message.sender) << std::endl;
+        default:
+            // NEIGHBORS arrives with the eager-set optimization (R-7)
+            std::cerr << "Router: control subtype 0x" << std::hex << message.subtype << std::dec << " from " << shortPeerId(message.source) << " not handled" << std::endl;
+    }
+}
+
+// IHAVE: keys we have neither seen nor parked for verification are missing — Plumtree GRAFTs them if they do not arrive
+void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> payload) {
+    std::vector<RoutedMessageKey> keys;
+    if (!RouterWire::decodeIhave(payload, keys)) {
+        std::cerr << "Router: malformed IHAVE from " << shortPeerId(from) << std::endl;
         return;
     }
-    // IHAVE / GRAFT / PRUNE arrive with Plumtree (R-4b), NEIGHBORS with the eager-set optimization (R-7)
-    std::cerr << "Router: control subtype 0x" << std::hex << message.subtype << std::dec << " from " << shortPeerId(message.source) << " not handled yet" << std::endl;
+    std::erase_if(keys, [this](const RoutedMessageKey& key) {
+        return key.sender == this->selfIdentity->getPeerId() || this->seenMessages.contains(key) || this->isWaitingForVerification(key);
+    });
+    this->plumtree.onAnnouncement(from, keys, std::chrono::steady_clock::now());
+}
+
+// GRAFT: the neighbor is eager from now on and gets the asked messages we hold — each at most once (BroadcastCache)
+void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
+    std::vector<RoutedMessageKey> keys;
+    if (!RouterWire::decodeGraft(payload, keys)) {
+        std::cerr << "Router: malformed GRAFT from " << shortPeerId(from) << std::endl;
+        return;
+    }
+    this->plumtree.onGraft(from);
+    for (const RoutedMessageKey& key : keys) {
+        const RoutedMessage* held = this->broadcastCache.find(key);
+        if (!held || !this->broadcastCache.markSentTo(key, from)) continue;
+        this->sendFullCopy(from, RouterWire::encode(*held));
+    }
+}
+
+void Router::sendGraft(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys) {
+    // Empty GRAFT is one frame; longer lists go in frames of at most 255 keys
+    size_t offset = 0;
+    do {
+        const size_t count = std::min(keys.size() - offset, RouterWire::MAX_KEYS_PER_CONTROL_MESSAGE);
+        if (this->network.sendToPeer(neighbor, RouterWire::encodeGraft(std::span(keys).subspan(offset, count))) > 0) ++this->graftsSent;
+        offset += count;
+    } while (offset < keys.size());
+}
+
+void Router::sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys) {
+    for (size_t offset = 0; offset < keys.size(); offset += RouterWire::MAX_KEYS_PER_CONTROL_MESSAGE) {
+        const size_t count = std::min(keys.size() - offset, RouterWire::MAX_KEYS_PER_CONTROL_MESSAGE);
+        if (this->network.sendToPeer(neighbor, RouterWire::encodeIhave(std::span(keys).subspan(offset, count))) > 0) this->announcementsSent += count;
+    }
+}
+
+void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
+    for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now))         this->sendGraft(neighbor, keys);
+    for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
+    this->broadcastCache.dropExpired(now);
+}
+
+bool Router::isWaitingForVerification(const RoutedMessageKey& key) const {
+    return std::any_of(this->pendingVerifications.begin(), this->pendingVerifications.end(),
+                       [&](const PendingVerification& p) { return p.message.sender == key.sender && p.message.msgId == key.msgId; });
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -229,8 +313,9 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
 void Router::handleIncomingBroadcast(RoutedMessage message, const PeerId& receivedFrom) {
     // Our own message coming back is a duplicate too — also after a restart emptied the memory (no record of ourselves
     // to verify against, so without this it would only waste a PEX_REQUEST and a verification slot)
-    if (message.sender == this->selfIdentity->getPeerId() || this->isAlreadySeen(message)) {   // Plumtree reacts here in R-4
+    if (message.sender == this->selfIdentity->getPeerId() || this->isAlreadySeen(message)) {
         ++this->duplicatesDropped;
+        if (message.mode == RoutingMode::Broadcast) this->reactToBroadcastDuplicate(message, receivedFrom);
         return;
     }
 
@@ -290,7 +375,26 @@ void Router::acceptBroadcastWithKey(RoutedMessage message, const PeerId& receive
     }
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());
     this->deliverLocally(message);
-    this->forwardBroadcast(std::move(message), receivedFrom);
+    this->spreadNewMessage(message, receivedFrom);
+}
+
+// A BROADCAST copy we already have: the link it came by is redundant (PRUNE) — unless the copy has a higher TTL than ours.
+// That is a better path; and when ours could not be forwarded at all (TTL ran out here, e.g. a relay set it to 1 to win
+// the race), the better TTL goes on now. The content comes from our verified copy — only the unsigned TTL is taken
+// from the duplicate, so an unverified copy cannot smuggle anything in.
+void Router::reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom) {
+    const RoutedMessageKey key{ message.sender, message.msgId };
+    const RoutedMessage* held = this->broadcastCache.find(key);
+    const bool higherTtl = held && message.ttlRemaining > 0 && message.ttlRemaining - 1 > held->ttlRemaining;
+    if (this->plumtree.onDuplicate(receivedFrom, higherTtl)) {
+        if (this->network.sendToPeer(receivedFrom, RouterWire::encodePrune()) > 0) ++this->prunesSent;
+    }
+    if (!higherTtl || held->ttlRemaining > 0) return;
+
+    RoutedMessage better = *held;
+    better.ttlRemaining = static_cast<uint8_t>(message.ttlRemaining - 1);
+    this->broadcastCache.replace(better, std::chrono::steady_clock::now());
+    this->spreadByPlumtree(better, receivedFrom, true);
 }
 
 // Remembered, or possibly forgotten early because the duplicate memory overflowed — either way it must not count as new
@@ -300,30 +404,50 @@ bool Router::isAlreadySeen(const RoutedMessage& message) const {
 
 void Router::sendOwnBroadcast(const RoutedMessage& message) {
     this->seenMessages.remember({ message.sender, message.msgId }, message.sentAtUnixSeconds, std::chrono::steady_clock::now());   // echoes are dropped
-    this->sendFullCopies(message, std::nullopt);
+    this->spreadNewMessage(message, std::nullopt);
 }
 
-void Router::forwardBroadcast(RoutedMessage message, const PeerId& receivedFrom) {
-    if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
-    message.ttlRemaining -= 1;
-    this->sendFullCopies(message, receivedFrom);
-}
+// A verified message seen for the first time — ours (`receivedFrom` empty, sent as built) or a neighbor's (TTL − 1).
+// docs/router.md 4.3: never back to where it came from, never to its originator; TTL ending here means no copies and
+// no announcements.
+void Router::spreadNewMessage(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) {
+    RoutedMessage outgoing = message;
+    const bool forwarding = !receivedFrom || message.ttlRemaining > 1;              // the next hop would receive TTL 0
+    if (receivedFrom && message.ttlRemaining > 0) outgoing.ttlRemaining -= 1;
 
-// The broadcast strategy's decision (docs/router.md 4.3). Never back to where the message came from, never to its
-// originator. For BROADCAST, Plumtree (R-4b) narrows this to the eager neighbors and announces to the rest; until then
-// both modes reaching every node are Flood.
-std::vector<PeerId> Router::chooseFullCopyRecipients(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) const {
-    std::vector<PeerId> recipients = this->neighborsSnapshot();
-    std::erase_if(recipients, [&](const PeerId& neighbor) { return neighbor == receivedFrom || neighbor == message.sender; });
-    return recipients;
-}
-
-void Router::sendFullCopies(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom) {
-    const std::vector<uint8_t> frame = RouterWire::encode(message);
-    if (frame.empty()) return;
-    for (const PeerId& neighbor : this->chooseFullCopyRecipients(message, receivedFrom)) {
-        if (this->network.sendToPeer(neighbor, frame) > 0) ++this->fullMessagesSent;
+    if (message.mode == RoutingMode::Broadcast) {
+        this->broadcastCache.store(outgoing, std::chrono::steady_clock::now());   // also when not forwarded: a better TTL may still come (4.3)
+        this->spreadByPlumtree(outgoing, receivedFrom, forwarding);
+        return;
     }
+
+    // FLOOD: a full copy to every other neighbor
+    if (!forwarding) return;
+    const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
+    if (frame.empty()) return;
+    for (const PeerId& neighbor : this->neighborsSnapshot()) {
+        if (neighbor == receivedFrom || neighbor == message.sender) continue;
+        this->sendFullCopy(neighbor, frame);
+    }
+}
+
+void Router::spreadByPlumtree(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, bool forwarding) {
+    const RoutedMessageKey key{ outgoing.sender, outgoing.msgId };
+    const PlumtreeNewMessageDecision decision = this->plumtree.onNewMessage(key, receivedFrom, forwarding, std::chrono::steady_clock::now());
+    if (decision.graftTo) this->sendGraft(*decision.graftTo, {});
+    if (decision.pruneTo && this->network.sendToPeer(*decision.pruneTo, RouterWire::encodePrune()) > 0) ++this->prunesSent;
+    if (decision.fullCopyTo.empty()) return;
+
+    const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
+    if (frame.empty()) return;
+    for (const PeerId& neighbor : decision.fullCopyTo) {
+        this->broadcastCache.markSentTo(key, neighbor);                              // a later GRAFT from it gets nothing twice
+        this->sendFullCopy(neighbor, frame);
+    }
+}
+
+void Router::sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame) {
+    if (this->network.sendToPeer(neighbor, frame) > 0) ++this->fullMessagesSent;
 }
 
 void Router::deliverLocally(const RoutedMessage& message) {

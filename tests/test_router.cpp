@@ -568,3 +568,137 @@ TEST(RouterTest, UnknownModeIsReportedAgainAfterInterval) {
     EXPECT_TRUE(waitUntil([&] { return recorder->unknownModeReports().size() == 2; }, 5s));
     mesh.nodes[0]->network->removeListener(recorder);
 }
+
+// ── Plumtree (R-4b) ─────────────────────────────────────────────────────────
+
+namespace {
+
+// Ring of 8 with four chords: every node has degree 3, so flooding sends far more than N − 1 copies
+std::vector<Edge> ringWithChords() {
+    std::vector<Edge> edges;
+    for (size_t i = 0; i < 8; ++i) edges.push_back({ i, (i + 1) % 8 });
+    for (size_t i = 0; i < 4; ++i) edges.push_back({ i, i + 4 });
+    return edges;
+}
+
+uint64_t totalFullMessagesSent(const RouterMesh& mesh) {
+    uint64_t total = 0;
+    for (const auto& router : mesh.routers) total += router->getStatistics().fullMessagesSent;
+    return total;
+}
+
+// Broadcast from `sender`, wait until everyone else has it and copies have settled; returns full copies sent network-wide
+uint64_t fullCopiesForOneBroadcast(RouterMesh& mesh, size_t sender, RoutingMode mode = RoutingMode::Broadcast) {
+    const uint64_t before = totalFullMessagesSent(mesh);
+    const uint64_t msgId = mesh.routers[sender]->broadcast(0x10, 0, { 'p' }, mode).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(sender, msgId); }, 5s));
+    std::this_thread::sleep_for(300ms);                                                       // late duplicates and PRUNEs land
+    return totalFullMessagesSent(mesh) - before;
+}
+
+void warmUp(RouterMesh& mesh, size_t sender) {
+    for (int i = 0; i < 5; ++i) fullCopiesForOneBroadcast(mesh, sender);
+}
+
+} // namespace
+
+TEST(RouterTest, PlumtreeSettlesToOneFullCopyPerNode) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+
+    const uint64_t firstBroadcast = fullCopiesForOneBroadcast(mesh, 0);                       // every link eager: a flood
+    EXPECT_GT(firstBroadcast, 7u);
+    warmUp(mesh, 0);
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(fullCopiesForOneBroadcast(mesh, 0), 7u) << "broadcast " << i;   // N − 1: a spanning tree
+
+    uint64_t announced = 0;
+    for (const auto& router : mesh.routers) announced += router->getStatistics().announcementsSent;
+    EXPECT_GT(announced, 0u);                                                                 // the rest of the links carry IHAVE
+    EXPECT_GT(fullCopiesForOneBroadcast(mesh, 0, RoutingMode::Flood), 2 * 7u);               // FLOOD ignores the tree
+}
+
+// A node of the tree leaves: its neighbors' eager link is gone and fast repair (empty GRAFT to lazy links) restores
+// delivery within a round trip — well before the GRAFT timeout would
+TEST(RouterTest, PlumtreeRepairsQuicklyWhenTreeNodeLeaves) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+    warmUp(mesh, 0);
+
+    // The node that forwarded most in the last broadcast is an inner node of the tree
+    std::vector<uint64_t> before;
+    for (const auto& router : mesh.routers) before.push_back(router->getStatistics().fullMessagesSent);
+    ASSERT_EQ(fullCopiesForOneBroadcast(mesh, 0), 7u);
+    size_t inner = 1;
+    for (size_t i = 1; i < 8; ++i) {
+        if (mesh.routers[i]->getStatistics().fullMessagesSent - before[i] > mesh.routers[inner]->getStatistics().fullMessagesSent - before[inner]) inner = i;
+    }
+    ASSERT_GT(mesh.routers[inner]->getStatistics().fullMessagesSent - before[inner], 0u);
+
+    mesh.routers[inner]->stop();
+    mesh.nodes[inner]->network->stop();
+    std::this_thread::sleep_for(300ms);                                                       // disconnects seen, fast repair sent
+
+    const auto sentAt = std::chrono::steady_clock::now();
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'r' }).value();
+    auto othersDelivered = [&] {
+        for (size_t i = 1; i < 8; ++i) if (i != inner && mesh.recorders[i]->countOf(mesh.id(0), msgId) == 0) return false;
+        return true;
+    };
+    ASSERT_TRUE(waitUntil(othersDelivered, 5s));
+    EXPECT_LT(std::chrono::steady_clock::now() - sentAt, 400ms);                              // no GRAFT wait (500 ms)
+}
+
+// Link 1→2 made lazy by hand (PRUNE from node 2): node 2 only hears IHAVE and must GRAFT the message
+TEST(RouterTest, AnnouncedMessageIsFetchedByGraftOnce) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(1), RouterWire::encodePrune()), 0);
+    std::this_thread::sleep_for(200ms);
+
+    const auto sentAt = std::chrono::steady_clock::now();
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'g' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    EXPECT_GE(std::chrono::steady_clock::now() - sentAt, 450ms);                              // came by GRAFT, not by push
+    EXPECT_EQ(mesh.routers[2]->getStatistics().graftsSent, 1u);
+    EXPECT_GE(mesh.routers[1]->getStatistics().announcementsSent, 1u);
+
+    // GRAFT made the link eager again: the next message is pushed at once
+    const uint64_t pushed = mesh.routers[0]->broadcast(0x10, 0, { 'h' }).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), pushed) == 1; }, 300ms));
+
+    // A repeated GRAFT for the same message is not answered again
+    const uint64_t sentByRelay = mesh.routers[1]->getStatistics().fullMessagesSent;
+    const std::vector<RoutedMessageKey> again{ { mesh.id(0), msgId } };
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(1), RouterWire::encodeGraft(again)), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, sentByRelay);
+}
+
+TEST(RouterTest, FloodModeIgnoresPrunedLinks) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(1), RouterWire::encodePrune()), 0);
+    std::this_thread::sleep_for(200ms);
+
+    const uint64_t msgId = mesh.routers[0]->broadcast(0x10, 0, { 'u' }, RoutingMode::Flood).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 300ms));
+    EXPECT_EQ(mesh.routers[2]->getStatistics().graftsSent, 0u);
+}
+
+// A relay that sets TTL 1 to win the race must not cut off the rest: the later genuine copy goes on
+TEST(RouterTest, LowTtlFirstCopyDoesNotCutOffRestOfNetwork) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    RoutedMessage message = craftBroadcastFrom(*mesh.nodes[0]->identity, { 't', 't', 'l' });
+    message.ttlRemaining = 1;                                                                 // unsigned: any relay can do this
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(message)), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(mesh.id(0), message.msgId) == 1; }, 5s));
+    EXPECT_EQ(mesh.recorders[2]->countOf(mesh.id(0), message.msgId), 0u);                    // TTL ended at node 1
+
+    message.ttlRemaining = 16;
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(message)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), message.msgId) == 1; }, 5s));
+    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), message.msgId), 1u);                    // still delivered once
+    EXPECT_EQ(mesh.routers[1]->getStatistics().prunesSent, 0u);                               // the better path is not pruned
+}

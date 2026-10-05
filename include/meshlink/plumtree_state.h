@@ -85,7 +85,7 @@ namespace invilite::Mesh {
             bool                                    graftSent = false;
         };
 
-        const PlumtreeConfig                                                    config;
+        PlumtreeConfig                                                          config;
         std::unordered_map<PeerId, bool, PeerIDHash>                            eagerByLink;
         std::unordered_map<RoutedMessageKey, MissingMessage, RoutedMessageKeyHash> missing;
         std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash>   queuedAnnouncements;
