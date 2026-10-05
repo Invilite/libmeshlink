@@ -74,10 +74,23 @@ struct DeliveryRecorder : RouterEventListener {
         return matching;
     }
 
+    void onRouteFailed(const RouteFailure& failure) override {
+        std::lock_guard lock(this->mutex);
+        this->routeFailures.push_back(failure);
+    }
+
+    std::vector<RouteFailure> failuresFor(uint64_t msgId) const {
+        std::lock_guard lock(this->mutex);
+        std::vector<RouteFailure> matching;
+        for (const auto& failure : this->routeFailures) if (failure.msgId == msgId) matching.push_back(failure);
+        return matching;
+    }
+
     mutable std::mutex           mutex;
     std::vector<RoutedDelivery>  deliveries;
     std::vector<AckReceipt>      acks;
     std::vector<RouteReport>     routeReports;
+    std::vector<RouteFailure>    routeFailures;
 };
 
 using Edge = std::pair<size_t, size_t>;                                                       // (dialer, listener)
@@ -1183,4 +1196,127 @@ TEST(RouterTest, UnicastAcksPerNeighborAreLimited) {
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->total() == 20; }, 3s));
     std::this_thread::sleep_for(200ms);
     EXPECT_EQ(mesh.routers[0]->getStatistics().acksSent, 5u);
+}
+
+// ── R-6: ROUTED and ROUTE_ERROR (docs/router.md 4.2) ─────────────────────────────────────────────────────────────────
+
+uint32_t testUnixNow() { return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()); }
+
+// Unsigned ROUTED data message as a neighbor could craft it
+std::vector<uint8_t> craftRoutedFrame(const PeerId& sender, const PeerId& destination, std::vector<PeerId> hops, uint8_t nextHopIndex) {
+    RoutedMessage routed;
+    routed.group = 0x10;
+    routed.mode = RoutingMode::Routed;
+    routed.ttlInitial = routed.ttlRemaining = 16;
+    routed.msgId = randomTestMsgId();
+    routed.sentAtUnixSeconds = testUnixNow();
+    routed.sender = sender;
+    routed.destination = destination;
+    routed.sourceRoute = SourceRoute{ nextHopIndex, std::move(hops) };
+    routed.payload = { 'c' };
+    return RouterWire::encode(routed);
+}
+
+TEST(RouterTest, RoutedMessageFollowsTheGivenRoute) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t presence = mesh.routers[0]->broadcast(0x10, 0, { 'p' }).value();          // node 3 learns the way back for the ACK
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[3]->countOf(mesh.id(0), presence) == 1; }, 5s));
+
+    const uint64_t msgId = mesh.routers[0]->sendAlongRoute(mesh.id(3), { mesh.id(1), mesh.id(2) }, 0x10, 7, { 'r' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[3]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    const RoutedDelivery delivery = *mesh.recorders[3]->find(mesh.id(0), msgId);
+    EXPECT_EQ(delivery.mode, RoutingMode::Routed);
+    EXPECT_EQ(delivery.subtype, 7);
+    EXPECT_EQ(delivery.hopsTraveled, 3);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
+    for (size_t relay = 1; relay <= 2; ++relay) {
+        EXPECT_EQ(mesh.recorders[relay]->countOf(mesh.id(0), msgId), 0u) << "relay " << relay << " is not an addressee";
+        EXPECT_EQ(mesh.routers[relay]->getStatistics().routedForwarded, 1u) << "relay " << relay;
+    }
+}
+
+TEST(RouterTest, SendAlongRouteRefusesInvalidRoutes) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    Router& router = *mesh.routers[0];
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), { mesh.id(1), mesh.id(0) }, 0x10, 0, { 'x' }).has_value());   // through ourselves
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), { mesh.id(1), mesh.id(2) }, 0x10, 0, { 'x' }).has_value());   // destination as relay
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), { mesh.id(1), mesh.id(1) }, 0x10, 0, { 'x' }).has_value());   // a relay twice
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), { mesh.id(2) }, 0x10, 0, { 'x' }).has_value());               // destination as relay
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), {}, 0x10, 0, { 'x' }).has_value());                           // node 2 is no neighbor
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(0), {}, 0x10, 0, { 'x' }).has_value());                           // to ourselves
+    EXPECT_FALSE(router.sendAlongRoute(mesh.id(2), { mesh.id(1) }, 0xFE, 0, { 'x' }).has_value());               // not a user group
+    EXPECT_TRUE(router.sendAlongRoute(mesh.id(2), { mesh.id(1) }, 0x10, 0, { 'x' }).has_value());
+    EXPECT_TRUE(router.sendAlongRoute(mesh.id(1), {}, 0x10, 0, { 'x' }).has_value());                            // a neighbor directly
+}
+
+// A hop that cannot go on reports ROUTE_ERROR to the sender: the sender hears which hop failed, and drops the route it
+// had learned through that first hop
+TEST(RouterTest, BrokenRouteReportsRouteError) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t fromThree = mesh.routers[3]->broadcast(0x10, 0, { 'b' }).value();         // node 0 learns "3 via 1"
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(3), fromThree) == 1; }, 5s));
+    ASSERT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(3)).size(), 1u);
+
+    const PeerId stranger = RouterMesh::peerIdOf(0x99);
+    const uint64_t msgId = mesh.routers[0]->sendAlongRoute(mesh.id(3), { mesh.id(1), stranger }, 0x10, 0, { 'z' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(msgId).size() == 1; }, 5s));
+    const RouteFailure failure = mesh.recorders[0]->failuresFor(msgId).front();
+    EXPECT_EQ(failure.destination, mesh.id(3));
+    EXPECT_EQ(failure.reportedBy, mesh.id(1));
+    EXPECT_EQ(failure.unreachableHop, stranger);
+    EXPECT_EQ(failure.reason, RouteErrorReason::NextHopNotNeighbor);
+    EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(3)).empty());
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routeErrorsSent, 1u);
+    EXPECT_EQ(mesh.recorders[3]->countOf(mesh.id(0), msgId), 0u);
+}
+
+// The route index names the node that receives the message; a message that names someone else is dropped
+TEST(RouterTest, RoutedMessageForAnotherHopIsDropped) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), craftRoutedFrame(mesh.id(0), mesh.id(2), { RouterMesh::peerIdOf(0x42) }, 0)), 0);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), craftRoutedFrame(mesh.id(0), mesh.id(2), {}, 0)), 0);   // destination named, not node 1
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routedForwarded, 0u);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routeErrorsSent, 0u);
+    EXPECT_EQ(mesh.recorders[1]->total(), 0u);
+    EXPECT_EQ(mesh.recorders[2]->total(), 0u);
+}
+
+// ROUTE_ERROR answers unsigned data whose sender is not authenticated: one neighbor gets at most one per interval
+TEST(RouterTest, RouteErrorsPerNeighborAreLimited) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    for (int i = 0; i < 10; ++i) {
+        ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftRoutedFrame(mesh.id(1), RouterMesh::peerIdOf(0x77), { mesh.id(0), RouterMesh::peerIdOf(0x99) }, 0)), 0);
+    }
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().routeErrorsSent, 1u);
+}
+
+// Only a relay of the route can report it broken
+TEST(RouterTest, RouteErrorFromNodeOffTheRouteIsIgnored) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t msgId = mesh.routers[0]->sendAlongRoute(mesh.id(2), { mesh.id(1) }, 0x10, 0, { 'k' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+
+    RoutedMessage error = testRouterMessage(mesh.id(2), mesh.id(0), RouterWire::SUBTYPE_ROUTE_ERROR, RouterWire::encodeRouteErrorPayload({ msgId, mesh.id(1), RouteErrorReason::NextHopNotNeighbor }));
+    error.signature = mesh.nodes[2]->identity->sign(RouterWire::bytesToSign(error));
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(error)), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->failuresFor(msgId).empty());
+}
+
+// The probe's destination answers along the reversed recorded route, which proves the route both ways
+TEST(RouterTest, RouteReportReturnsAlongReversedRoute) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t probeId = mesh.routers[0]->recordRoute(mesh.id(3)).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probeId).size() == 1; }, 5s));
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routedForwarded, 1u);
+    EXPECT_EQ(mesh.routers[2]->getStatistics().routedForwarded, 1u);
 }

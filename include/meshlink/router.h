@@ -50,6 +50,7 @@ namespace invilite::Mesh {
         std::chrono::seconds        replyWaitWindow         = std::chrono::seconds(60);   // how long our messages wait for ACKs / route reports
         size_t                      maxAwaitedReplies       = 4096;                 // messages waiting at once; the oldest is given up first
         size_t                      unicastAcksPerNeighborPerSecond = 32;           // ACKs we sign for unsigned UNICASTs one neighbor handed us (review R-5 I4)
+        std::chrono::milliseconds   routeErrorInterval      = std::chrono::seconds(1);    // at most one ROUTE_ERROR per neighbor whose messages got stuck here
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -61,6 +62,8 @@ namespace invilite::Mesh {
         uint64_t    prunesSent         = 0;
         uint64_t    localFloods        = 0;                                         // UNICASTs sent to every neighbor for lack of a route
         uint64_t    acksSent           = 0;
+        uint64_t    routedForwarded    = 0;                                         // ROUTED messages relayed along their source route
+        uint64_t    routeErrorsSent    = 0;
     };
 
     struct SendOptions {
@@ -102,6 +105,13 @@ namespace invilite::Mesh {
         // when nothing is known. Not signed (D12). Returns the message id, or nothing when the Router is not running,
         // `group` is not a user group or `destination` is this node.
         std::optional<uint64_t> send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options = {});
+
+        // Send to one node along a source route (ROUTED): `relays` in order, without this node and the destination — e.g.
+        // RouteReport::hops of recordRoute(). Every relay checks that it is the named hop; one that cannot hand the message
+        // on reports ROUTE_ERROR (onRouteFailed). Not signed (D12). Returns the message id, or nothing when the Router is
+        // not running, `group` is not a user group, `destination` is this node, the route names this node or the
+        // destination, repeats a relay, is longer than 254 relays, or its first hop is not a neighbor.
+        std::optional<uint64_t> sendAlongRoute(const PeerId& destination, std::vector<PeerId> relays, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options = {});
 
         // Diagnostics: a probe to `destination` that records every relay and its time; the answer arrives as
         // onRouteReported. Travels as UNICAST, so it shows the path messages to that node take now.
@@ -146,11 +156,17 @@ namespace invilite::Mesh {
         void receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom);
         [[nodiscard]] bool mayAcknowledgeUnsigned(const PeerId& sender, const PeerId& receivedFrom);
         void sendAck(const RoutedMessage& acknowledged);
-        void sendRouteReport(const RoutedMessage& probe);
-        [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const;
+        void sendRouteReport(const RoutedMessage& probe, const PeerId& receivedFrom);
+        void receiveRouteErrorForUs(const RoutedMessage& error);
+        void concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, const PeerId& unreachableHop, RouteErrorReason reason);
+        void sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFrom, const PeerId& unreachableHop, RouteErrorReason reason);
+        [[nodiscard]] bool knowsWayTo(const PeerId& node) const;
+        // UNICAST, or ROUTED along `relays` when given
+        [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload, std::optional<std::vector<PeerId>> relays = std::nullopt) const;
         void sendOwnRouterMessage(const RoutedMessage& message);
         void learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt = std::nullopt);
-        void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee);   // nullopt: every node answers (broadcast)
+        // addressee nullopt: every node answers (broadcast); routeRelays: a ROUTED message, which may get a ROUTE_ERROR
+        void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, bool acceptsAnswers, std::optional<std::vector<PeerId>> routeRelays = std::nullopt);
         [[nodiscard]] std::optional<std::chrono::milliseconds> acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer);
         void dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now);
         void notifyListeners(const std::function<void(RouterEventListener&)>& call, const char* event);
@@ -166,6 +182,9 @@ namespace invilite::Mesh {
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
         void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
+        void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
+        void relayRouted(RoutedMessage message, const PeerId& receivedFrom);
+        void forwardRouted(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void deliverLocally(const RoutedMessage& message, bool senderAuthenticated);
         [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 
@@ -191,6 +210,8 @@ namespace invilite::Mesh {
         struct AwaitedReply {
             std::chrono::steady_clock::time_point   sentAt;
             std::optional<PeerId>                   addressee;                      // the only node that may answer; nullopt = every node (broadcast)
+            bool                                    acceptsAnswers = true;          // false: a ROUTED message without ACK_REQUESTED, kept for ROUTE_ERROR
+            std::optional<std::vector<PeerId>>      routeRelays;                    // ROUTED: its relays, the only nodes that may report it broken
             std::unordered_set<PeerId, PeerIDHash>  answeredBy;                     // each answers once; bounded by the verified records we hold
         };
         std::unordered_map<uint64_t, AwaitedReply>  awaitedReplies;
@@ -199,6 +220,8 @@ namespace invilite::Mesh {
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
         // ACKs signed this second for unsigned UNICASTs, per neighbor that handed them over: (window start, count)
         std::unordered_map<PeerId, std::pair<std::chrono::steady_clock::time_point, size_t>, PeerIDHash> unicastAcksByNeighbor;
+        // Last ROUTE_ERROR caused by each neighbor's messages
+        std::unordered_map<PeerId, std::optional<std::chrono::steady_clock::time_point>, PeerIDHash> routeErrorReportedAt;
 
         // Written by the Router thread (and by start()); read by getRouteCandidates()
         mutable std::mutex                          routesMutex;
@@ -215,6 +238,8 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       prunesSent{0};
         std::atomic<uint64_t>                       localFloods{0};
         std::atomic<uint64_t>                       acksSent{0};
+        std::atomic<uint64_t>                       routedForwarded{0};
+        std::atomic<uint64_t>                       routeErrorsSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

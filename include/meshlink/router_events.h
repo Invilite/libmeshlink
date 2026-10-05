@@ -45,6 +45,17 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   rtt{0};                                         // probe out + report back, our clock only
     };
 
+    // A message we sent along a source route (Router::sendAlongRoute) did not get through: a relay of the route reported
+    // that it could not hand it on (ROUTE_ERROR, signed by that relay). The route we had learned through its first hop is
+    // dropped as well.
+    struct RouteFailure {
+        PeerId              destination{};
+        uint64_t            msgId = 0;
+        PeerId              reportedBy{};                                           // the relay that could not go on (this node if the first hop failed)
+        PeerId              unreachableHop{};                                       // the next hop it could not reach
+        RouteErrorReason    reason = RouteErrorReason::NextHopNotNeighbor;
+    };
+
     // Observer for Router deliveries. Callbacks fire on the Router thread, which serves every peer: listeners MUST be
     // fast and non-blocking (enqueue and return), and MUST NOT call Router::stop() (it joins the very thread running the
     // callback). Exceptions are caught per listener. Default implementations are empty.
@@ -55,6 +66,7 @@ namespace invilite::Mesh {
         virtual void onMessageDelivered(const RoutedDelivery& delivery) { (void)delivery; }
         virtual void onAckReceived(const AckReceipt& receipt) { (void)receipt; }
         virtual void onRouteReported(const RouteReport& report) { (void)report; }
+        virtual void onRouteFailed(const RouteFailure& failure) { (void)failure; }
     };
 
 } // namespace invilite::Mesh
