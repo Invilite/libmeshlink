@@ -86,7 +86,7 @@ void Router::start() {
     this->inbox->events.reopen();
     this->pendingVerifications.clear();
     this->unknownModeReportedAt.clear();
-    this->awaitedReplySentAt.clear();
+    this->awaitedReplies.clear();
     this->awaitedReplyOrder.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
     this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
@@ -250,11 +250,11 @@ void Router::processEvent(Event& event) {
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
         } else if (RouterWire::reachesEveryNode(content.message.mode)) {
-            if (content.message.ackRequested) this->awaitReply(content.message.msgId);
+            if (content.message.ackRequested) this->awaitReply(content.message.msgId, std::nullopt);   // every node answers
             this->sendOwnBroadcast(content.message);
         } else {
             const bool isProbe = content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP && content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE;
-            if (content.message.ackRequested || isProbe) this->awaitReply(content.message.msgId);
+            if (content.message.ackRequested || isProbe) this->awaitReply(content.message.msgId, content.message.destination);
             this->seenMessages.remember({ content.message.sender, content.message.msgId }, content.message.sentAtUnixSeconds, std::chrono::steady_clock::now());
             this->forwardUnicast(content.message, std::nullopt);
         }
@@ -471,8 +471,10 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
         return;                                                                     // ROUTE_ERROR (R-6), unknown: nothing yet
     }
     if (isAnswer) {
+        // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee
+        // over us — broadcast-grade evidence, or a relay replaying ACKs would look confirmed (review R-5 I2, D5)
         std::lock_guard lock(this->routesMutex);
-        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Ack, std::chrono::steady_clock::now());
+        this->routes.learn(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast, std::chrono::steady_clock::now());
     }
     if (message.ttlRemaining <= 1) return;
     message.ttlRemaining -= 1;
@@ -491,12 +493,13 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
     AckPayload payload;
     RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
     const auto now = std::chrono::steady_clock::now();
-    const auto rtt = this->roundTripOf(payload.acknowledgedMsgId);
+    const auto rtt = this->acceptAnswer(payload.acknowledgedMsgId, ack.sender);
     {
+        // A round trip we asked for confirms the route; an unsolicited ACK teaches it like a broadcast
         std::lock_guard lock(this->routesMutex);
-        this->routes.learn(ack.sender, receivedFrom, hopsTraveled(ack), RouteEvidence::Ack, now, rtt);
+        this->routes.learn(ack.sender, receivedFrom, hopsTraveled(ack), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, now, rtt);
     }
-    if (!rtt) return;                                                               // not asked for (or too late): teaches the route, nothing to report
+    if (!rtt) return;                                                               // not asked for, not from the addressee, a repeat or too late
 
     const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
@@ -505,12 +508,12 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
 void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom) {
     RouteReportPayload payload;
     RouterWire::decodeRouteReportPayload(report.payload, payload);                 // shape checked by decode
-    const auto rtt = this->roundTripOf(payload.probeMsgId);
+    const auto rtt = this->acceptAnswer(payload.probeMsgId, report.sender);
     {
         std::lock_guard lock(this->routesMutex);                                    // a round trip that worked, like an ACK
-        this->routes.learn(report.sender, receivedFrom, hopsTraveled(report), RouteEvidence::Ack, std::chrono::steady_clock::now(), rtt);
+        this->routes.learn(report.sender, receivedFrom, hopsTraveled(report), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, std::chrono::steady_clock::now(), rtt);
     }
-    if (!rtt) return;                                                               // not our probe (or too late)
+    if (!rtt) return;                                                               // not our probe, not from the probed node, a repeat or too late
     const RouteReport event{ report.sender, payload.probeMsgId, std::move(payload.hops), payload.receivedOffsetMs, *rtt };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteReported(event); }, "onRouteReported");
 }
@@ -551,28 +554,32 @@ void Router::sendOwnRouterMessage(const RoutedMessage& message) {
     this->forwardUnicast(message, std::nullopt);
 }
 
-void Router::awaitReply(uint64_t msgId) {
+void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee) {
     const auto now = std::chrono::steady_clock::now();
     this->dropExpiredAwaitedReplies(now);
     if (this->awaitedReplyOrder.size() >= this->config.maxAwaitedReplies && !this->awaitedReplyOrder.empty()) {
-        this->awaitedReplySentAt.erase(this->awaitedReplyOrder.front().second);
+        this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
-    this->awaitedReplySentAt[msgId] = now;
+    this->awaitedReplies[msgId] = AwaitedReply{ now, addressee, {} };
     this->awaitedReplyOrder.emplace_back(now, msgId);
 }
 
-// Time since we sent `awaitedMsgId`; nothing when we did not ask (or the wait window is over). Kept until the window
-// ends: a broadcast collects one ACK from every node.
-std::optional<std::chrono::milliseconds> Router::roundTripOf(uint64_t awaitedMsgId) const {
-    const auto awaited = this->awaitedReplySentAt.find(awaitedMsgId);
-    if (awaited == this->awaitedReplySentAt.end()) return std::nullopt;
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - awaited->second);
+// Time since we sent `awaitedMsgId` when `answerer` may answer it: we asked, the wait window is open, the answerer is
+// the addressee (anyone for a broadcast — every node is one) and has not answered yet. Kept until the window ends: a
+// broadcast collects one ACK from every node. Answers are signed by the answerer, so a relay cannot answer for another.
+std::optional<std::chrono::milliseconds> Router::acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer) {
+    const auto awaited = this->awaitedReplies.find(awaitedMsgId);
+    if (awaited == this->awaitedReplies.end()) return std::nullopt;
+    AwaitedReply& reply = awaited->second;
+    if (reply.addressee && *reply.addressee != answerer) return std::nullopt;
+    if (!reply.answeredBy.insert(answerer).second) return std::nullopt;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - reply.sentAt);
 }
 
 void Router::dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now) {
     while (!this->awaitedReplyOrder.empty() && now - this->awaitedReplyOrder.front().first >= this->config.replyWaitWindow) {
-        this->awaitedReplySentAt.erase(this->awaitedReplyOrder.front().second);
+        this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
 }

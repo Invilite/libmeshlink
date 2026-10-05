@@ -146,8 +146,8 @@ namespace invilite::Mesh {
         void sendRouteReport(const RoutedMessage& probe);
         [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const;
         void sendOwnRouterMessage(const RoutedMessage& message);
-        void awaitReply(uint64_t msgId);
-        [[nodiscard]] std::optional<std::chrono::milliseconds> roundTripOf(uint64_t awaitedMsgId) const;
+        void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee);   // nullopt: every node answers (broadcast)
+        [[nodiscard]] std::optional<std::chrono::milliseconds> acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer);
         void dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now);
         void notifyListeners(const std::function<void(RouterEventListener&)>& call, const char* event);
         void reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom);
@@ -182,8 +182,13 @@ namespace invilite::Mesh {
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
-        // Our messages waiting for answers (ACK_REQUESTED, route probes): send time by msgId, and in send order for expiry
-        std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> awaitedReplySentAt;
+        // Our messages waiting for answers (ACK_REQUESTED, route probes): by msgId, and in send order for expiry
+        struct AwaitedReply {
+            std::chrono::steady_clock::time_point   sentAt;
+            std::optional<PeerId>                   addressee;                      // the only node that may answer; nullopt = every node (broadcast)
+            std::unordered_set<PeerId, PeerIDHash>  answeredBy;                     // each answers once; bounded by the verified records we hold
+        };
+        std::unordered_map<uint64_t, AwaitedReply>  awaitedReplies;
         std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedReplyOrder;
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;

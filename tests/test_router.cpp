@@ -151,6 +151,29 @@ std::vector<Edge> lineEdges(size_t count) {
     return edges;
 }
 
+uint64_t randomTestMsgId();
+
+// Unsigned shell of a routed Router message (UNICAST) — the caller signs it
+RoutedMessage testRouterMessage(const PeerId& sender, const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) {
+    RoutedMessage message;
+    message.group = RouterWire::ROUTER_PROTOCOL_GROUP;
+    message.subtype = subtype;
+    message.mode = RoutingMode::Unicast;
+    message.ttlInitial = message.ttlRemaining = 16;
+    message.msgId = randomTestMsgId();
+    message.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    message.sender = sender;
+    message.destination = destination;
+    message.payload = std::move(payload);
+    return message;
+}
+
+std::vector<uint8_t> craftAckFrame(const LocalIdentity& signer, const PeerId& claimedSender, const PeerId& destination, uint64_t acknowledged) {
+    RoutedMessage ack = testRouterMessage(claimedSender, destination, RouterWire::SUBTYPE_ACK, RouterWire::encodeAckPayload({ acknowledged }));
+    ack.signature = signer.sign(RouterWire::bytesToSign(ack));
+    return RouterWire::encode(ack);
+}
+
 // Router control frames (Group 0xFE neighbor-only subtypes) seen by one node's Network
 struct ControlFrameRecorder : NetworkEventListener {
     void onMessageReceived(const NetworkMessage& message) override {
@@ -931,7 +954,8 @@ TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     EXPECT_EQ(receipt.hopsTraveled, 3);
     EXPECT_LT(receipt.rtt, 2s);
 
-    // The signed ACK taught the way to node 3 on every hop it crossed, our own end with an RTT
+    // The signed ACK taught the way to node 3 on every hop it crossed, our own end with an RTT. Only the addressee measured a
+    // round trip: relays learn it like a broadcast (review R-5 I2 — a relay replaying ACKs must not look confirmed)
     const auto atSender = mesh.routers[0]->getRouteCandidates(mesh.id(3));
     ASSERT_EQ(atSender.size(), 1u);
     EXPECT_EQ(atSender.front().evidence, RouteEvidence::Ack);
@@ -940,7 +964,7 @@ TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     for (size_t i = 1; i < 3; ++i) {
         const auto atRelay = mesh.routers[i]->getRouteCandidates(mesh.id(3));
         ASSERT_EQ(atRelay.size(), 1u) << "node " << i;
-        EXPECT_EQ(atRelay.front().evidence, RouteEvidence::Ack);
+        EXPECT_EQ(atRelay.front().evidence, RouteEvidence::Broadcast);
         EXPECT_EQ(atRelay.front().hops, 3 - i);
     }
     EXPECT_EQ(mesh.routers[3]->getStatistics().acksSent, 1u);
@@ -970,49 +994,43 @@ TEST(RouterTest, NoAckWithoutRequest) {
     EXPECT_TRUE(mesh.recorders[0]->acksFor(msgId).empty());
 }
 
-// An ACK claiming to be node 1's but signed by someone else is dropped; the genuine one counts
+// An ACK must be signed by the node it names, and come from the message's addressee: a relay that drops a message and
+// acknowledges it itself is ignored (review R-5 I3)
 TEST(RouterTest, ForgedAckIsDropped) {
     RouterMesh mesh(2, lineEdges(2));
     ASSERT_TRUE(mesh.ready);
     const uint64_t awaited = mesh.routers[0]->send(mesh.peerIdOf(0x77), 0x10, 0, { 'w' }, { .ackRequested = true }).value();   // nobody: no real ACK
 
-    auto craftAck = [&](const LocalIdentity& signer) {
-        RoutedMessage ack;
-        ack.group = RouterWire::ROUTER_PROTOCOL_GROUP;
-        ack.subtype = RouterWire::SUBTYPE_ACK;
-        ack.mode = RoutingMode::Unicast;
-        ack.ttlInitial = ack.ttlRemaining = 16;
-        ack.msgId = randomTestMsgId();
-        ack.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-        ack.sender = mesh.id(1);
-        ack.destination = mesh.id(0);
-        ack.payload = RouterWire::encodeAckPayload({ awaited });
-        ack.signature = signer.sign(RouterWire::bytesToSign(ack));
-        return RouterWire::encode(ack);
-    };
     const auto stranger = LocalIdentity::generate();
-    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAck(stranger)), 0);
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAckFrame(stranger, mesh.id(1), mesh.id(0), awaited)), 0);
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAckFrame(*mesh.nodes[1]->identity, mesh.id(1), mesh.id(0), awaited)), 0);   // relay, not the addressee
     std::this_thread::sleep_for(300ms);
     EXPECT_TRUE(mesh.recorders[0]->acksFor(awaited).empty());
+}
 
-    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAck(*mesh.nodes[1]->identity)), 0);
-    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(awaited).size() == 1; }, 5s));
+// One answer per addressee: further ACKs from the same node (fresh msgIds, so not duplicates) are ignored
+TEST(RouterTest, AddresseeAcknowledgesOnce) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(1), 0x10, 0, { 'o' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
 
-    // Genuine, but for nothing we asked about: teaches the route, reports nothing
-    const uint64_t neverSent = awaited ^ 0xFFFF;
-    auto unsolicited = RouterWire::encode([&] {
-        RoutedMessage ack;
-        RoutedMessageStatus status = RouterWire::decode(RouterWire::ROUTER_PROTOCOL_GROUP, RouterWire::SUBTYPE_ACK,
-                                                        std::span<const uint8_t>(craftAck(*mesh.nodes[1]->identity)).subspan(3), std::chrono::system_clock::now(), ack);
-        EXPECT_EQ(status, RoutedMessageStatus::Success);
-        ack.msgId   = randomTestMsgId();
-        ack.payload = RouterWire::encodeAckPayload({ neverSent });
-        ack.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(ack));
-        return ack;
-    }());
-    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), unsolicited), 0);
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), craftAckFrame(*mesh.nodes[1]->identity, mesh.id(1), mesh.id(0), msgId)), 0);
     std::this_thread::sleep_for(300ms);
-    EXPECT_TRUE(mesh.recorders[0]->acksFor(neverSent).empty());
+    EXPECT_EQ(mesh.recorders[0]->acksFor(msgId).size(), 1u);
+}
+
+// A route report counts only from the probed node
+TEST(RouterTest, RouteReportFromAnotherNodeIsIgnored) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t probeId = mesh.routers[0]->recordRoute(mesh.peerIdOf(0x77)).value();
+
+    RoutedMessage report = testRouterMessage(mesh.id(1), mesh.id(0), RouterWire::SUBTYPE_ROUTE_REPORT, RouterWire::encodeRouteReportPayload({ probeId, 0, 5, {} }));
+    report.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(report));
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(report)), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->reportsFor(probeId).empty());
 }
 
 
