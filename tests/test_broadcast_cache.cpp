@@ -76,7 +76,9 @@ TEST(BroadcastCacheTest, EachNeighborGetsTheFullCopyOnce) {
     BroadcastCache cache(30s, 1 << 20);
     const RoutedMessage m = broadcast(1, 7, 10);
     cache.store(m, T0);
+    EXPECT_FALSE(cache.wasSentTo(keyOf(m), peerId(0xA)));
     EXPECT_TRUE(cache.markSentTo(keyOf(m), peerId(0xA)));
+    EXPECT_TRUE(cache.wasSentTo(keyOf(m), peerId(0xA)));
     EXPECT_FALSE(cache.markSentTo(keyOf(m), peerId(0xA)));                                     // a repeated GRAFT gets nothing more
     EXPECT_TRUE(cache.markSentTo(keyOf(m), peerId(0xB)));
     EXPECT_FALSE(cache.markSentTo({ peerId(1), 8 }, peerId(0xA)));                             // not held

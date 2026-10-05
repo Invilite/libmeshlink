@@ -39,6 +39,11 @@ bool BroadcastCache::markSentTo(const RoutedMessageKey& key, const PeerId& neigh
     return found->second->sentTo.insert(neighbor).second;
 }
 
+bool BroadcastCache::wasSentTo(const RoutedMessageKey& key, const PeerId& neighbor) const {
+    const auto found = this->byKey.find(key);
+    return found != this->byKey.end() && found->second->sentTo.contains(neighbor);
+}
+
 void BroadcastCache::forgetNeighbor(const PeerId& neighbor) {
     for (Entry& entry : this->byAge) entry.sentTo.erase(neighbor);
 }

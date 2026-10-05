@@ -220,3 +220,28 @@ TEST(PlumtreeStateTest, AnnouncementFromUnknownLinkIsIgnored) {
     state.onAnnouncement(B, { key(1) }, T0);
     EXPECT_EQ(state.missingCount(), 0u);
 }
+
+// One neighbor announcing fake keys cannot use up the room other links need to repair
+TEST(PlumtreeStateTest, OneLinkCannotFillMissingMessages) {
+    PlumtreeConfig config;
+    config.maxMissingPerLink = 2;
+    PlumtreeState state = withLinks({ A, B }, config);
+    state.onAnnouncement(A, { key(1), key(2), key(3) }, T0);
+    EXPECT_EQ(state.missingCount(), 2u);
+    state.onAnnouncement(B, { key(4) }, T0);                                                  // B's own share is untouched
+    EXPECT_EQ(state.missingCount(), 3u);
+
+    state.onNewMessage(key(1), B, true, T0 + 10ms);                                           // arrival returns A's share
+    state.onAnnouncement(A, { key(5) }, T0 + 20ms);
+    EXPECT_EQ(state.missingCount(), 3u);
+}
+
+TEST(PlumtreeStateTest, DeadlinesComeOutInOrderAcrossManyMessages) {
+    PlumtreeState state = withLinks({ A });
+    state.onPrune(A);
+    for (uint64_t id = 1; id <= 100; ++id) state.onAnnouncement(A, { key(id) }, T0 + std::chrono::milliseconds(id));
+    EXPECT_EQ(state.nextDeadline(), T0 + 501ms);
+    const auto grafts = state.takeDueGrafts(T0 + 550ms);
+    EXPECT_EQ(grafts.at(A).size(), 50u);                                                      // only what is due
+    EXPECT_EQ(state.nextDeadline(), T0 + 551ms);
+}

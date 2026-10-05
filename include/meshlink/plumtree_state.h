@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -20,6 +21,7 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   graftTimeout              = std::chrono::milliseconds(500);  // announced, not arrived → GRAFT
         std::chrono::milliseconds   treeOptimizationThreshold = std::chrono::milliseconds(50);   // announcement earlier than the full copy by more → swap links
         size_t                      maxMissingMessages        = 4096;              // announced-but-missing messages tracked at once
+        size_t                      maxMissingPerLink         = 512;               // share one link's announcements may open — fake keys from one neighbor cannot block repair for the rest
         size_t                      maxAnnouncersPerMessage   = 8;                 // neighbors remembered per missing message, GRAFT tries them in order
     };
 
@@ -77,17 +79,25 @@ namespace invilite::Mesh {
         [[nodiscard]] size_t missingCount() const { return this->missing.size(); }
 
     private:
+        using GraftDeadlines = std::multimap<std::chrono::steady_clock::time_point, RoutedMessageKey>;
+
         struct MissingMessage {
             std::chrono::steady_clock::time_point   firstAnnouncedAt;
-            std::chrono::steady_clock::time_point   graftAt;
+            GraftDeadlines::iterator                graftAt;                        // this message's entry in graftDeadlines
+            PeerId                                  openedBy{};                     // the link whose announcement opened it — its share is charged
             std::deque<PeerId>                      announcers;                     // not yet asked, in announcement order
             std::vector<PeerId>                     asked;                          // announcers already sent a GRAFT — they hold it too
             bool                                    graftSent = false;
         };
+        using MissingMessages = std::unordered_map<RoutedMessageKey, MissingMessage, RoutedMessageKeyHash>;
+
+        MissingMessages::iterator eraseMissing(MissingMessages::iterator entry);
 
         PlumtreeConfig                                                          config;
         std::unordered_map<PeerId, bool, PeerIDHash>                            eagerByLink;
-        std::unordered_map<RoutedMessageKey, MissingMessage, RoutedMessageKeyHash> missing;
+        MissingMessages                                                         missing;
+        GraftDeadlines                                                          graftDeadlines;     // earliest first: nextDeadline and takeDueGrafts never scan
+        std::unordered_map<PeerId, size_t, PeerIDHash>                          missingOpenedByLink;
         std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash>   queuedAnnouncements;
         std::optional<std::chrono::steady_clock::time_point>                    announcementsDueAt;     // set when the first key is queued
     };

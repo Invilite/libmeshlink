@@ -218,7 +218,8 @@ void Router::handleRouterControl(const NetworkMessage& message) {
     }
 }
 
-// IHAVE: keys we have neither seen nor parked for verification are missing — Plumtree GRAFTs them if they do not arrive
+// IHAVE: keys we have not seen are missing — Plumtree GRAFTs them if they do not arrive. A key parked for verification
+// counts as missing too: the parked copy may be a forgery that only took the slot first.
 void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> payload) {
     std::vector<RoutedMessageKey> keys;
     if (!RouterWire::decodeIhave(payload, keys)) {
@@ -226,7 +227,7 @@ void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> pay
         return;
     }
     std::erase_if(keys, [this](const RoutedMessageKey& key) {
-        return key.sender == this->selfIdentity->getPeerId() || this->seenMessages.contains(key) || this->isWaitingForVerification(key);
+        return key.sender == this->selfIdentity->getPeerId() || this->seenMessages.contains(key);
     });
     this->plumtree.onAnnouncement(from, keys, std::chrono::steady_clock::now());
 }
@@ -240,9 +241,10 @@ void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
     }
     this->plumtree.onGraft(from);
     for (const RoutedMessageKey& key : keys) {
+        // TTL 0: it ended here and was never announced — serving it would carry it a hop past its TTL
         const RoutedMessage* held = this->broadcastCache.find(key);
-        if (!held || !this->broadcastCache.markSentTo(key, from)) continue;
-        this->sendFullCopy(from, RouterWire::encode(*held));
+        if (!held || held->ttlRemaining == 0 || this->broadcastCache.wasSentTo(key, from)) continue;
+        if (this->sendFullCopy(from, RouterWire::encode(*held))) this->broadcastCache.markSentTo(key, from);
     }
 }
 
@@ -267,11 +269,6 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now))         this->sendGraft(neighbor, keys);
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
-}
-
-bool Router::isWaitingForVerification(const RoutedMessageKey& key) const {
-    return std::any_of(this->pendingVerifications.begin(), this->pendingVerifications.end(),
-                       [&](const PendingVerification& p) { return p.message.sender == key.sender && p.message.msgId == key.msgId; });
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -332,7 +329,9 @@ void Router::handleIncomingBroadcast(RoutedMessage message, const PeerId& receiv
 void Router::awaitSenderRecord(RoutedMessage message, const PeerId& receivedFrom) {
     size_t fromThisNeighbor = 0;
     for (const PendingVerification& pending : this->pendingVerifications) {
-        if (pending.message.sender == message.sender && pending.message.msgId == message.msgId) return;   // same message already waits
+        // The same message from the same neighbor already waits. From another neighbor it waits separately: the copy
+        // parked first may be a forgery, and only the honest neighbor holds the record to verify the genuine one.
+        if (pending.message.sender == message.sender && pending.message.msgId == message.msgId && pending.receivedFrom == receivedFrom) return;
         if (pending.receivedFrom == receivedFrom) ++fromThisNeighbor;
     }
     if (this->pendingVerifications.size() >= this->config.pendingVerificationLimit || fromThisNeighbor >= this->config.pendingVerificationPerNeighbor) {
@@ -385,15 +384,18 @@ void Router::acceptBroadcastWithKey(RoutedMessage message, const PeerId& receive
 void Router::reactToBroadcastDuplicate(const RoutedMessage& message, const PeerId& receivedFrom) {
     const RoutedMessageKey key{ message.sender, message.msgId };
     const RoutedMessage* held = this->broadcastCache.find(key);
-    const bool higherTtl = held && message.ttlRemaining > 0 && message.ttlRemaining - 1 > held->ttlRemaining;
+    // The duplicate is unverified, its ttlInitial included: a TTL above what an honest neighbor can send (our copy's
+    // ttlInitial, so ttlInitial − 1 after our hop) is capped, or a forged frame could leave us a copy nobody can encode
+    const int offeredTtl = held ? std::min(message.ttlRemaining - 1, held->ttlInitial - 1) : -1;
+    const bool higherTtl = held && offeredTtl > held->ttlRemaining;
     if (this->plumtree.onDuplicate(receivedFrom, higherTtl)) {
         if (this->network.sendToPeer(receivedFrom, RouterWire::encodePrune()) > 0) ++this->prunesSent;
     }
     if (!higherTtl || held->ttlRemaining > 0) return;
 
     RoutedMessage better = *held;
-    better.ttlRemaining = static_cast<uint8_t>(message.ttlRemaining - 1);
-    this->broadcastCache.replace(better, std::chrono::steady_clock::now());
+    better.ttlRemaining = static_cast<uint8_t>(offeredTtl);
+    if (this->broadcastCache.replace(better, std::chrono::steady_clock::now())) this->broadcastCache.markSentTo(key, receivedFrom);
     this->spreadByPlumtree(better, receivedFrom, true);
 }
 
@@ -416,7 +418,8 @@ void Router::spreadNewMessage(const RoutedMessage& message, const std::optional<
     if (receivedFrom && message.ttlRemaining > 0) outgoing.ttlRemaining -= 1;
 
     if (message.mode == RoutingMode::Broadcast) {
-        this->broadcastCache.store(outgoing, std::chrono::steady_clock::now());   // also when not forwarded: a better TTL may still come (4.3)
+        // Also when not forwarded: a better TTL may still come (4.3). The neighbor it came from has it.
+        if (this->broadcastCache.store(outgoing, std::chrono::steady_clock::now()) && receivedFrom) this->broadcastCache.markSentTo({ outgoing.sender, outgoing.msgId }, *receivedFrom);
         this->spreadByPlumtree(outgoing, receivedFrom, forwarding);
         return;
     }
@@ -441,13 +444,14 @@ void Router::spreadByPlumtree(const RoutedMessage& outgoing, const std::optional
     const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
     if (frame.empty()) return;
     for (const PeerId& neighbor : decision.fullCopyTo) {
-        this->broadcastCache.markSentTo(key, neighbor);                              // a later GRAFT from it gets nothing twice
-        this->sendFullCopy(neighbor, frame);
+        if (this->sendFullCopy(neighbor, frame)) this->broadcastCache.markSentTo(key, neighbor);   // a later GRAFT from it gets nothing twice
     }
 }
 
-void Router::sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame) {
-    if (this->network.sendToPeer(neighbor, frame) > 0) ++this->fullMessagesSent;
+bool Router::sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame) {
+    if (this->network.sendToPeer(neighbor, frame) <= 0) return false;
+    ++this->fullMessagesSent;
+    return true;
 }
 
 void Router::deliverLocally(const RoutedMessage& message) {

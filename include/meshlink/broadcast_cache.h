@@ -33,8 +33,11 @@ namespace invilite::Mesh {
 
         [[nodiscard]] const RoutedMessage* find(const RoutedMessageKey& key) const;
 
-        // Record that `neighbor` gets the full copy now; false when it already got it from us (or the message is not held)
+        // Record that `neighbor` has the full copy — after a send that succeeded, or because the copy came from it. False
+        // when it was already recorded (or the message is not held). Recording before the send would turn a refused send
+        // (full queue) into a neighbor that is never served, not even on GRAFT.
         bool markSentTo(const RoutedMessageKey& key, const PeerId& neighbor);
+        [[nodiscard]] bool wasSentTo(const RoutedMessageKey& key, const PeerId& neighbor) const;
 
         // A neighbor that left may not have received what was queued to it: it can be sent everything again
         void forgetNeighbor(const PeerId& neighbor);

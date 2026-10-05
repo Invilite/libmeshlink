@@ -702,3 +702,67 @@ TEST(RouterTest, LowTtlFirstCopyDoesNotCutOffRestOfNetwork) {
     EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), message.msgId), 1u);                    // still delivered once
     EXPECT_EQ(mesh.routers[1]->getStatistics().prunesSent, 0u);                               // the better path is not pruned
 }
+
+// ── Review findings (R-4) ───────────────────────────────────────────────────
+
+// An unverified duplicate claiming TTL 255 must not leave the relay with a copy nobody can encode: the genuine message
+// still reaches the rest of the network
+TEST(RouterTest, ForgedHighTtlDuplicateDoesNotStrandMessage) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    RoutedMessage genuine = craftBroadcastFrom(*mesh.nodes[0]->identity, { 'o', 'k' });
+    genuine.ttlRemaining = 1;                                                                 // TTL ends at node 1
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(genuine)), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(mesh.id(0), genuine.msgId) == 1; }, 5s));
+
+    RoutedMessage forged = genuine;
+    forged.ttlInitial   = 255;                                                                // signed field, but duplicates are not verified
+    forged.ttlRemaining = 255;
+    forged.payload      = { 'x', 'x' };
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(forged)), 0);
+
+    const auto delivered = [&] { return mesh.recorders[2]->find(mesh.id(0), genuine.msgId); };
+    ASSERT_TRUE(waitUntil([&] { return delivered().has_value(); }, 5s));
+    EXPECT_EQ(delivered()->payload, genuine.payload);                                         // our verified content, not the forger's
+    EXPECT_EQ(delivered()->hopsTraveled, 2);
+}
+
+// The sender is unknown to node 2. A forgery parked first must not make node 2 drop the genuine copy from the neighbor
+// that holds the sender's record.
+TEST(RouterTest, ForgedCopyOfUnknownSenderDoesNotBlockGenuineOne) {
+    RouterMesh mesh(3, { { 0, 2 }, { 1, 2 } });
+    ASSERT_TRUE(mesh.ready);
+
+    const auto sender   = LocalIdentity::generate();
+    const auto stranger = LocalIdentity::generate();
+    mesh.nodes[1]->directory->upsertPeer(sender.getPeerId(), [&](KnownPeer& kp, bool) { kp.record = makeSignedRecord(sender, { ipv4("192.0.2.9", 7000) }, std::chrono::system_clock::now()); });
+
+    const RoutedMessage forged  = craftBroadcast(sender.getPeerId(), stranger, { 'b', 'a', 'd' });     // same msgId, wrong signer
+    const RoutedMessage genuine = craftBroadcast(sender.getPeerId(), sender, { 'g', 'o', 'd' });
+    ASSERT_EQ(forged.msgId, genuine.msgId);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(2), RouterWire::encode(forged)), 0);
+    std::this_thread::sleep_for(100ms);                                                       // parked first
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(2), RouterWire::encode(genuine)), 0);
+
+    const auto delivered = [&] { return mesh.recorders[2]->find(sender.getPeerId(), genuine.msgId); };
+    ASSERT_TRUE(waitUntil([&] { return delivered().has_value(); }, 5s));
+    EXPECT_EQ(delivered()->payload, genuine.payload);
+}
+
+// A message whose TTL ended here was never announced; a GRAFT for it must not carry it one hop further
+TEST(RouterTest, GraftForMessageThatEndedHereIsNotAnswered) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+
+    RoutedMessage message = craftBroadcastFrom(*mesh.nodes[0]->identity, { 'e', 'n', 'd' });
+    message.ttlRemaining = 1;
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(message)), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[1]->countOf(mesh.id(0), message.msgId) == 1; }, 5s));
+
+    const std::vector<RoutedMessageKey> keys{ { mesh.id(0), message.msgId } };
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(1), RouterWire::encodeGraft(keys)), 0);
+    std::this_thread::sleep_for(400ms);
+    EXPECT_EQ(mesh.recorders[2]->countOf(mesh.id(0), message.msgId), 0u);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 0u);
+}

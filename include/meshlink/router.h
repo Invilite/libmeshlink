@@ -114,13 +114,12 @@ namespace invilite::Mesh {
         void sendOwnBroadcast(const RoutedMessage& message);
         void spreadNewMessage(const RoutedMessage& message, const std::optional<PeerId>& receivedFrom);
         void spreadByPlumtree(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, bool forwarding);
-        void sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame);
+        bool sendFullCopy(const PeerId& neighbor, const std::vector<uint8_t>& frame);
         void handleAnnouncement(const PeerId& from, std::span<const uint8_t> payload);
         void handleGraft(const PeerId& from, std::span<const uint8_t> payload);
         void sendGraft(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
-        [[nodiscard]] bool isWaitingForVerification(const RoutedMessageKey& key) const;
         void deliverLocally(const RoutedMessage& message);
         [[nodiscard]] std::vector<PeerId> neighborsSnapshot() const;
 

@@ -41,7 +41,7 @@ PlumtreeNewMessageDecision PlumtreeState::onNewMessage(const RoutedMessageKey& k
     // is the faster path — swap them, so the tree follows changing delays. Not once we asked by GRAFT: then the copy
     // answers us and the GRAFT already made the announcer eager.
     std::vector<PeerId> holders;                                                    // links that announced it to us: they have it
-    if (const auto found = this->missing.find(key); found != this->missing.end()) {
+    if (auto found = this->missing.find(key); found != this->missing.end()) {
         const MissingMessage& entry = found->second;
         holders.assign(entry.announcers.begin(), entry.announcers.end());
         holders.insert(holders.end(), entry.asked.begin(), entry.asked.end());
@@ -53,7 +53,7 @@ PlumtreeNewMessageDecision PlumtreeState::onNewMessage(const RoutedMessageKey& k
             decision.graftTo = fasterLink;
             decision.pruneTo = *receivedFrom;
         }
-        this->missing.erase(found);
+        this->eraseMissing(found);
     }
     if (!forwarding) return decision;
 
@@ -89,8 +89,11 @@ void PlumtreeState::onAnnouncement(const PeerId& from, const std::vector<RoutedM
     for (const RoutedMessageKey& key : unseenKeys) {
         auto found = this->missing.find(key);
         if (found == this->missing.end()) {
-            if (this->missing.size() >= this->config.maxMissingMessages) continue;  // bounded: announcements of nothing cannot grow memory
-            found = this->missing.emplace(key, MissingMessage{ now, now + this->config.graftTimeout, {}, {}, false }).first;
+            // Bounded overall and per link: announcements of nothing cannot grow memory, nor crowd out other links' repairs
+            size_t& openedByThisLink = this->missingOpenedByLink[from];
+            if (this->missing.size() >= this->config.maxMissingMessages || openedByThisLink >= this->config.maxMissingPerLink) continue;
+            ++openedByThisLink;
+            found = this->missing.emplace(key, MissingMessage{ now, this->graftDeadlines.emplace(now + this->config.graftTimeout, key), from, {}, {}, false }).first;
         }
         auto& announcers = found->second.announcers;
         if (announcers.size() < this->config.maxAnnouncersPerMessage && std::find(announcers.begin(), announcers.end(), from) == announcers.end()) {
@@ -101,19 +104,19 @@ void PlumtreeState::onAnnouncement(const PeerId& from, const std::vector<RoutedM
 
 std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> PlumtreeState::takeDueGrafts(std::chrono::steady_clock::time_point now) {
     std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> grafts;
-    for (auto it = this->missing.begin(); it != this->missing.end();) {
-        MissingMessage& entry = it->second;
-        if (entry.graftAt > now) { ++it; continue; }
-        if (entry.announcers.empty()) { it = this->missing.erase(it); continue; }  // nobody left to ask: given up
+    while (!this->graftDeadlines.empty() && this->graftDeadlines.begin()->first <= now) {
+        const auto entryIt = this->missing.find(this->graftDeadlines.begin()->second);
+        MissingMessage& entry = entryIt->second;
+        if (entry.announcers.empty()) { this->eraseMissing(entryIt); continue; }    // nobody left to ask: given up
 
         const PeerId announcer = entry.announcers.front();
         entry.announcers.pop_front();
         entry.asked.push_back(announcer);
         this->eagerByLink[announcer] = true;
-        grafts[announcer].push_back(it->first);
+        grafts[announcer].push_back(entryIt->first);
         entry.graftSent = true;
-        entry.graftAt   = now + this->config.graftTimeout;                          // not answered in time → the next announcer
-        ++it;
+        this->graftDeadlines.erase(entry.graftAt);                                  // not answered in time → the next announcer
+        entry.graftAt = this->graftDeadlines.emplace(now + this->config.graftTimeout, entryIt->first);
     }
     return grafts;
 }
@@ -126,10 +129,16 @@ std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> PlumtreeSt
 
 std::optional<std::chrono::steady_clock::time_point> PlumtreeState::nextDeadline() const {
     std::optional<std::chrono::steady_clock::time_point> earliest = this->announcementsDueAt;
-    for (const auto& [key, entry] : this->missing) {
-        if (!earliest || entry.graftAt < *earliest) earliest = entry.graftAt;
-    }
+    if (!this->graftDeadlines.empty() && (!earliest || this->graftDeadlines.begin()->first < *earliest)) earliest = this->graftDeadlines.begin()->first;
     return earliest;
+}
+
+PlumtreeState::MissingMessages::iterator PlumtreeState::eraseMissing(MissingMessages::iterator entry) {
+    if (const auto opener = this->missingOpenedByLink.find(entry->second.openedBy); opener != this->missingOpenedByLink.end() && --opener->second == 0) {
+        this->missingOpenedByLink.erase(opener);
+    }
+    this->graftDeadlines.erase(entry->second.graftAt);
+    return this->missing.erase(entry);
 }
 
 bool PlumtreeState::isEager(const PeerId& peer) const {
