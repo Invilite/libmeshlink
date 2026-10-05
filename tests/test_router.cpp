@@ -946,6 +946,9 @@ TEST(RouterTest, SendRefusesOwnNodeAndNonUserGroups) {
 TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     RouterMesh mesh(4, lineEdges(4));
     ASSERT_TRUE(mesh.ready);
+    // Node 3 acknowledges an unsigned UNICAST only over a route it knows (review R-5 I4): node 0's broadcast teaches it
+    const uint64_t presence = mesh.routers[0]->broadcast(0x10, 0, { 'p' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[3]->countOf(mesh.id(0), presence) == 1; }, 5s));
 
     const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'a' }, { .ackRequested = true }).value();
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
@@ -1148,4 +1151,36 @@ TEST(RouterTest, UnsignedFloodDoesNotSilenceRoutedTraffic) {
     std::this_thread::sleep_for(1100ms);                                             // the flood is over: the next second is new
     const uint64_t unicastId = mesh.routers[1]->send(mesh.id(0), 0x10, 0, { 'u' }).value();
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(1), unicastId) == 1; }, 3s));
+}
+
+// Review R-5 I4: the sender of an unsigned UNICAST is not authenticated. Acknowledging a forged one would make us sign and
+// flood an ACK toward anyone — so an ACK goes only to a neighbor or over a known route
+TEST(RouterTest, UnicastFromUnknownSenderIsNotAcknowledged) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    RoutedMessage forged;
+    forged.group = 0x10;
+    forged.mode = RoutingMode::Unicast;
+    forged.ackRequested = true;
+    forged.ttlInitial = forged.ttlRemaining = 16;
+    forged.msgId = randomTestMsgId();
+    forged.sentAtUnixSeconds = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    forged.sender = RouterMesh::peerIdOf(0x55);                                     // nobody we know a way to
+    forged.destination = mesh.id(0);
+    forged.payload = { 'x' };
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), RouterWire::encode(forged)), 0);
+
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(forged.sender, forged.msgId) == 1; }, 3s));   // still delivered
+    std::this_thread::sleep_for(200ms);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().acksSent, 0u);
+}
+
+// One neighbor cannot make us sign ACKs without bound: at most unicastAcksPerNeighborPerSecond for what it hands us
+TEST(RouterTest, UnicastAcksPerNeighborAreLimited) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& config) { config.unicastAcksPerNeighborPerSecond = 5; });
+    ASSERT_TRUE(mesh.ready);
+    for (int i = 0; i < 20; ++i) ASSERT_TRUE(mesh.routers[1]->send(mesh.id(0), 0x10, 0, { 'r' }, { .ackRequested = true }).has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->total() == 20; }, 3s));
+    std::this_thread::sleep_for(200ms);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().acksSent, 5u);
 }

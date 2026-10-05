@@ -49,6 +49,7 @@ namespace invilite::Mesh {
         RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
         std::chrono::seconds        replyWaitWindow         = std::chrono::seconds(60);   // how long our messages wait for ACKs / route reports
         size_t                      maxAwaitedReplies       = 4096;                 // messages waiting at once; the oldest is given up first
+        size_t                      unicastAcksPerNeighborPerSecond = 32;           // ACKs we sign for unsigned UNICASTs one neighbor handed us (review R-5 I4)
     };
 
     // Counters for tests and measurements (docs/router.md 6: full sends per broadcast). Monotonic since construction.
@@ -143,6 +144,7 @@ namespace invilite::Mesh {
         void acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom);
         void receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom);
         void receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom);
+        [[nodiscard]] bool mayAcknowledgeUnsigned(const PeerId& sender, const PeerId& receivedFrom);
         void sendAck(const RoutedMessage& acknowledged);
         void sendRouteReport(const RoutedMessage& probe);
         [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) const;
@@ -195,6 +197,8 @@ namespace invilite::Mesh {
         std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedReplyOrder;
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
+        // ACKs signed this second for unsigned UNICASTs, per neighbor that handed them over: (window start, count)
+        std::unordered_map<PeerId, std::pair<std::chrono::steady_clock::time_point, size_t>, PeerIDHash> unicastAcksByNeighbor;
 
         // Written by the Router thread (and by start()); read by getRouteCandidates()
         mutable std::mutex                          routesMutex;

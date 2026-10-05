@@ -232,6 +232,7 @@ void Router::processEvent(Event& event) {
             this->neighbors.insert(content.peerId);
         } else if constexpr (std::is_same_v<T, Event::NeighborDisconnected>) {
             this->unknownModeReportedAt.erase(content.peerId);
+            this->unicastAcksByNeighbor.erase(content.peerId);
             this->broadcastCache.forgetNeighbor(content.peerId);
             {
                 std::lock_guard lock(this->routesMutex);
@@ -505,6 +506,29 @@ void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& 
     this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteReported(event); }, "onRouteReported");
 }
 
+// The sender of an unsigned UNICAST is not authenticated (until C2): a forged one must not make us sign an ACK and flood
+// it toward anyone (review R-5 I4). So an ACK goes only to a neighbor or over a route we learned from the sender's own
+// signed messages — never by local flooding — and one neighbor gets at most unicastAcksPerNeighborPerSecond of them.
+bool Router::mayAcknowledgeUnsigned(const PeerId& sender, const PeerId& receivedFrom) {
+    bool reachable;
+    {
+        std::lock_guard lock(this->neighborsMutex);
+        reachable = this->neighbors.contains(sender);
+    }
+    if (!reachable) {
+        std::lock_guard lock(this->routesMutex);
+        reachable = !this->routes.nextHops(sender).empty();
+    }
+    if (!reachable) return false;
+
+    const auto now = std::chrono::steady_clock::now();
+    auto& [windowStart, acknowledged] = this->unicastAcksByNeighbor[receivedFrom];
+    if (now - windowStart >= std::chrono::seconds(1)) { windowStart = now; acknowledged = 0; }
+    if (acknowledged >= this->config.unicastAcksPerNeighborPerSecond) return false;
+    ++acknowledged;
+    return true;
+}
+
 // An addressee answers ACK_REQUESTED: a signed UNICAST back to the sender (docs/router.md 3.3)
 void Router::sendAck(const RoutedMessage& acknowledged) {
     ++this->acksSent;
@@ -681,7 +705,7 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
 
     if (message.destination == this->selfIdentity->getPeerId()) {
         this->deliverLocally(message, message.sender == receivedFrom);               // the link proves only a direct neighbor
-        if (message.ackRequested) this->sendAck(message);
+        if (message.ackRequested && this->mayAcknowledgeUnsigned(message.sender, receivedFrom)) this->sendAck(message);
         return;
     }
     if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
