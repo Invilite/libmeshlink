@@ -104,6 +104,9 @@ namespace invilite::Mesh {
         // Fact supplied by the connection layer: the remote IP we dialed when this connection is outbound, empty when
         // the peer dialed us. Discovery uses it as reachability evidence without reaching into Peer/Connection (A1 M2).
         std::string             dialedAddress;
+        // The same for the other direction: the remote IP the peer connected to us from when it dialed us, empty when
+        // we dialed it. Discovery uses it to tell a peer behind NAT (public source, private announced addresses).
+        std::string             connectedFromAddress;
     };
 
 // Reason codes sent in a GOODBYE frame before closing a connection.
@@ -283,7 +286,9 @@ namespace invilite::Mesh {
         // anything is allocated for the connection.
         void onIncomingConnection(int fd, const sockaddr_storage* addr);
         void runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlots::Slot slot, HandshakeWorker* self);
-        void runOutgoingHandshake(std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self);
+        // Dials the addresses in order until one answers with a verified identity (F4)
+        void dialAddresses(std::vector<PeerAddress> addresses);
+        void runOutgoingHandshake(std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self);
         void joinFinishedHandshakeWorkers();
         void joinFinishedProbeWorkers();                                                // discovery's own workers (A1 S1)
 
@@ -320,7 +325,7 @@ namespace invilite::Mesh {
         // Probe worker body. Establishes an outbound connection with the probe flag set,
         // verifies that the remote PeerId matches `expected`, and commits the result to
         // peerDirectory. Always closes the connection before returning.
-        void runProbeWorker(PeerId expected, std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self);
+        void runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self);
 
         // Commit a probe's result. Only updates state if still Probing — guards against races
         // where a newer record arrived during the probe and reset the state.

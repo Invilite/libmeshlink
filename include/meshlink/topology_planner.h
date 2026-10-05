@@ -22,11 +22,11 @@ namespace invilite::Mesh {
         bool    isOutbound;
     };
 
-// Peer chosen to dial: who (so the caller can track the attempt per peer) and where.
+// Peer chosen to dial: who (so the caller can track the attempt per peer) and where — every dialable address, tried in
+// order until one answers (F4).
     struct DialTarget {
-        PeerId          peerId;
-        std::string     address;
-        uint16_t        port = 0;
+        PeerId                      peerId;
+        std::vector<PeerAddress>    addresses;
     };
 
 // Decision returned by TopologyPlanner::evaluate() for one management tick.

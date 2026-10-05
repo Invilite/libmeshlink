@@ -247,6 +247,57 @@ TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
     node.network->stop();
 }
 
+// F4: a dead first address must not hide a working second one — the probe tries them all, in order
+TEST(NetworkIntegrationTest, ProbeTriesEveryAddressUntilOneAnswers) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "prober");
+    TestNode target(secret, "target");
+    const auto record = makeSignedRecord(*target.identity, { ipv4("127.0.0.1", pickUnusedPort()), ipv4("127.0.0.1", target.port) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; });
+    target.network->start();
+    node.network->start();
+
+    EXPECT_TRUE(waitUntil([&] { const auto e = node.directory->findPeer(record.peerId); return e && e->availability == AvailabilityState::Available; }, 5s));
+    EXPECT_EQ(node.directory->findPeer(record.peerId)->consecutiveProbeFailures, 0);
+
+    node.network->stop();
+    target.network->stop();
+}
+
+// A peer behind NAT relative to us with only private addresses is not probed at all — it could never succeed
+TEST(NetworkIntegrationTest, PeerBehindNatWithOnlyPrivateAddressesIsNotProbed) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "public");
+    const auto natted = LocalIdentity::generate();
+    const auto record = makeSignedRecord(natted, { ipv4("172.16.1.10", 8420) }, std::chrono::system_clock::now());
+    node.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; entry.reachedUsOverPublicInternet = true; });
+    node.network->start();
+
+    std::this_thread::sleep_for(1500ms);                                                      // several probe ticks
+    const auto entry = node.directory->findPeer(record.peerId);
+    EXPECT_EQ(entry->availability, AvailabilityState::Unknown);
+    EXPECT_EQ(entry->consecutiveProbeFailures, 0);
+    node.network->stop();
+}
+
+// The HELLO records where we met: a peer once seen from a public address that now dials us over a private one (it came
+// into our LAN, or onto our VPN) gets its private addresses back
+TEST(NetworkIntegrationTest, HelloOverPrivateAddressClearsBehindNatEvidence) {
+    const auto secret = makeSecret();
+    TestNode alpha(secret, "alpha");
+    TestNode beta(secret, "beta");
+    const auto record = makeSignedRecord(*alpha.identity, { ipv4("127.0.0.1", alpha.port) }, std::chrono::system_clock::now() - 1h);
+    beta.directory->upsertPeer(record.peerId, [&](KnownPeer& entry, bool) { entry.record = record; entry.reachedUsOverPublicInternet = true; });
+    alpha.network->start();
+    beta.network->start();
+
+    alpha.network->connectToPeer("127.0.0.1", beta.port);                                    // inbound at beta, from loopback
+    EXPECT_TRUE(waitUntil([&] { const auto e = beta.knownPeer(alpha); return e && !e->reachedUsOverPublicInternet; }, 5s));
+
+    alpha.network->stop();
+    beta.network->stop();
+}
+
 // R9: while a dial is still in progress, Topology (ticking every 3 s) must not pick the same peer again.
 // The target listens with a full accept queue, so the kernel drops our SYNs and connect() hangs for the whole
 // 5 s connect timeout — longer than one Topology tick. One dial → one failure; a redial would add a second.

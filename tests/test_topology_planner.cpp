@@ -44,8 +44,7 @@ TEST(TopologyPlannerTest, DialsCandidateWhenBelowOutboundTarget) {
 
     ASSERT_TRUE(decision.connectTo.has_value());
     EXPECT_EQ(decision.connectTo->peerId, candidate.peerId);                                 // the caller tracks the attempt per peer (R9)
-    EXPECT_EQ(decision.connectTo->address, "192.0.2.10");
-    EXPECT_EQ(decision.connectTo->port, 5000);
+    EXPECT_EQ(decision.connectTo->addresses, candidate.addresses);                         // all of them, tried in order (F4)
     EXPECT_EQ(decision.nextTick, 3s);
 }
 

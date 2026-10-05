@@ -57,6 +57,11 @@ namespace invilite::Mesh {
         // Current reachability — see AvailabilityState. Independent from hasEverConnected.
         AvailabilityState                           availability          = AvailabilityState::Unknown;
 
+        // Discovery's evidence of the path between us: this peer last connected to us from a public address, so it is
+        // behind NAT (or elsewhere) relative to us and its private addresses are not dialed or probed (dialableAddresses).
+        // Cleared when it reaches us from a private address or we reach it at one.
+        bool                                        reachedUsOverPublicInternet = false;
+
         // ── Connection attempt backoff (TopologyPlanner domain) ──
         uint8_t                                     consecutiveConnectionFailures = 0;
         std::chrono::steady_clock::time_point       nextConnectionAttemptAt{};

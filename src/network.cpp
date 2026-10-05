@@ -1,4 +1,5 @@
 #include "meshlink/network.h"
+#include "meshlink/peer_reachability.h"
 #include "meshlink/known_peer_eviction.h"
 #include "meshlink/identity.h"
 #include "meshlink/thread_signals.h"
@@ -294,7 +295,13 @@ void Network::stop() {
 // ============================================================
 
 void Network::connectToPeer(const std::string& address, uint16_t port) {
-    if (!this->running.load() || this->stopping.load()) return;
+    this->dialAddresses({ PeerAddress{ PeerAddress::Type::IPv4, address, port } });   // type is not used for dialing
+}
+
+void Network::dialAddresses(std::vector<PeerAddress> addresses) {
+    if (!this->running.load() || this->stopping.load() || addresses.empty()) return;
+    const std::string& address = addresses.front().address;
+    const uint16_t     port    = addresses.front().port;
 
     // Outbound hard limit (R10) — counts established outbound peers, dials and probes in progress alike
     auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
@@ -309,8 +316,8 @@ void Network::connectToPeer(const std::string& address, uint16_t port) {
     std::lock_guard lock(this->handshakeWorkersMutex);                              // started and registered atomically w.r.t. stop()
     if (!this->acceptingHandshakeWorkers) return;
     try {
-        worker->thread = std::thread([this, address, port, slot = std::move(*slot), workerPtr]() mutable {
-            this->runOutgoingHandshake(address, port, std::move(slot), workerPtr);
+        worker->thread = std::thread([this, addresses = std::move(addresses), slot = std::move(*slot), workerPtr]() mutable {
+            this->runOutgoingHandshake(std::move(addresses), std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
         std::cerr << "Network: cannot start dial worker: " << e.what() << std::endl;   // slot returns with the lambda
@@ -646,17 +653,21 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     return result;
 }
 
-void Network::runOutgoingHandshake(std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self) {
+void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
-    // Normal connect — no probe, no special flags
-    OutboundConnectionResult result = this->establishOutboundConnection(address, port, IdentityFlags{});
+    // Normal connect — no probe, no special flags. The addresses in order, until one answers (F4).
+    OutboundConnectionResult result;
+    for (const PeerAddress& address : addresses) {
+        result = this->establishOutboundConnection(address.address, address.port, IdentityFlags{});
+        if (result.verification == VerificationResult::Success) break;
+    }
 
     if (result.verification != VerificationResult::Success) {
-        // Notify the per-peer backoff tracker so TopologyPlanner won't redial this address immediately.
+        // Notify the per-peer backoff tracker so TopologyPlanner won't redial this peer immediately.
         // Address-based lookup — we may not know the peerId if establishOutboundConnection failed
-        // before identity verification.
-        this->recordConnectionAttemptFailure(address, port);
+        // before identity verification (every address belongs to the same record, so the first one finds it).
+        this->recordConnectionAttemptFailure(addresses.front().address, addresses.front().port);
         self->done.store(true, std::memory_order_release);
         return;
     }
@@ -1094,7 +1105,8 @@ void Network::parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vect
         pm.peer    = peer;
         pm.subtype = subtype;
         pm.payload = std::move(payload);
-        if (peer->isOutbound()) pm.dialedAddress = peer->getConnection()->getRemoteClientAddress();
+        if (peer->isOutbound()) pm.dialedAddress        = peer->getConnection()->getRemoteClientAddress();
+        else                    pm.connectedFromAddress = peer->getConnection()->getRemoteClientAddress();
         this->messageProtocolQueue.push(std::move(pm));
     } else {
         NetworkMessage nm;
@@ -1263,8 +1275,10 @@ std::chrono::milliseconds Network::tickTopology() {
             const PeerId& id = entry.record.peerId;
             if (id == selfId) continue;
             if (std::find(registered.begin(), registered.end(), id) != registered.end()) continue;
-            if (entry.record.addresses.empty()) continue;
-            candidates.push_back(entry.record);
+            SignedPeerRecord candidate = entry.record;
+            candidate.addresses = dialableAddresses(entry);                         // the planner sees only what we could reach
+            if (candidate.addresses.empty()) continue;
+            candidates.push_back(std::move(candidate));
         }
     }
 
@@ -1274,12 +1288,15 @@ std::chrono::milliseconds Network::tickTopology() {
         // Take the peer out of the candidate list for as long as the attempt can last (R9) — otherwise the next ticks
         // (every 3 s) pick it again while the first handshake is still running. A failure overwrites this with the
         // backoff; a success makes it connected (excluded anyway) and its HELLO clears the field.
-        this->peerDirectory->mutatePeer(decision.connectTo->peerId, [](KnownPeer& entry) {
-            entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + OUTBOUND_ATTEMPT_MAX_DURATION);
+        // One worker tries every address in turn, so the attempt can last that many times longer (F4)
+        const auto attemptDuration = OUTBOUND_ATTEMPT_MAX_DURATION * static_cast<int>(decision.connectTo->addresses.size());
+        this->peerDirectory->mutatePeer(decision.connectTo->peerId, [&](KnownPeer& entry) {
+            entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + attemptDuration);
         });
 
-        std::cerr << "Network: topology — dialing " << decision.connectTo->address << ":" << decision.connectTo->port << std::endl;
-        this->connectToPeer(decision.connectTo->address, decision.connectTo->port);
+        std::cerr << "Network: topology — dialing " << peerIdShort(decision.connectTo->peerId) << " at " << decision.connectTo->addresses.size()
+                  << " address(es), first " << decision.connectTo->addresses.front().address << ":" << decision.connectTo->addresses.front().port << std::endl;
+        this->dialAddresses(decision.connectTo->addresses);
     }
 
     return decision.nextTick;
@@ -1348,6 +1365,12 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
 
     const PeerId peerId          = record.peerId;                                   // save before move
     const bool   shouldBroadcast = this->upsertKnownPeer(std::move(record), outboundMatch);
+
+    // Where we meet this peer decides which of its addresses we may dial (dialableAddresses): from a public address it
+    // is behind NAT relative to us; over a private one — in its dialing direction or ours — its private addresses work
+    if (const auto overPublic = observedReachedUsOverPublicInternet(msg.connectedFromAddress, msg.dialedAddress, outboundMatch)) {
+        this->peerDirectory->mutatePeer(peerId, [&](KnownPeer& entry) { entry.reachedUsOverPublicInternet = *overPublic; });
+    }
 
     if (shouldBroadcast) {
         this->enqueuePexBroadcast(peerId, msg.peer->getPeerId());
@@ -1802,7 +1825,7 @@ void Network::runPeerProbe() {
     const auto allPeers = this->peerDirectory->listPeers();
 
     PeerId            pickedId{};
-    PeerAddress       pickedAddr;
+    std::vector<PeerAddress> pickedAddresses;
     AvailabilityState pickedPreviousAvailability = AvailabilityState::Unknown;    // restored if the worker cannot be started
     bool              picked = false;
 
@@ -1810,7 +1833,7 @@ void Network::runPeerProbe() {
         if (entry.availability == AvailabilityState::Probing)   continue;
         if (entry.availability == AvailabilityState::Available) continue;
         if (now < entry.nextProbeAllowedAt)                     continue;
-        if (entry.record.addresses.empty())                     continue;
+        if (dialableAddresses(entry).empty())                   continue;          // nothing we could reach (e.g. only private addresses behind NAT)
         if (entry.record.peerId == selfId)                      continue;
 
         // Re-validate under exclusive lock and atomically transition to Probing.
@@ -1822,7 +1845,8 @@ void Network::runPeerProbe() {
             if (kp.availability == AvailabilityState::Probing)   return;
             if (kp.availability == AvailabilityState::Available) return;
             if (now < kp.nextProbeAllowedAt)                     return;
-            if (kp.record.addresses.empty())                     return;
+            pickedAddresses = dialableAddresses(kp);
+            if (pickedAddresses.empty())                         return;
             pickedPreviousAvailability = kp.availability;
             kp.availability = AvailabilityState::Probing;
             transitioned    = true;
@@ -1830,7 +1854,6 @@ void Network::runPeerProbe() {
 
         if (transitioned) {
             pickedId   = entry.record.peerId;
-            pickedAddr = entry.record.addresses.front();                             // first address; future: try others on failure
             picked     = true;
             break;
         }
@@ -1851,16 +1874,14 @@ void Network::runPeerProbe() {
     auto  worker    = std::make_unique<HandshakeWorker>();
     auto* workerPtr = worker.get();
 
-    const std::string address = pickedAddr.address;
-    const uint16_t    port    = pickedAddr.port;
 
     // Raise the in-flight flag BEFORE the worker exists: the worker clears it when done, and a fast-failing
     // probe (e.g. connection refused) could otherwise clear it before we set it, leaving it stuck at true forever.
     this->probeInFlight.store(true, std::memory_order_release);
 
     try {
-        worker->thread = std::thread([this, pickedId, address, port, slot = std::move(*slot), workerPtr]() mutable {
-            this->runProbeWorker(pickedId, address, port, std::move(slot), workerPtr);
+        worker->thread = std::thread([this, pickedId, addresses = pickedAddresses, slot = std::move(*slot), workerPtr]() mutable {
+            this->runProbeWorker(pickedId, std::move(addresses), std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
         // Thread creation failed (resource exhaustion) — undo the Probing transition so the peer stays eligible.
@@ -1874,42 +1895,47 @@ void Network::runPeerProbe() {
 
     this->probeWorkers.push_back(std::move(worker));                                 // management thread only (A1 S1)
 
-    std::cerr << "Network: launched probe for " << peerIdShort(pickedId)
-              << " at " << address << ":" << port << std::endl;
+    std::cerr << "Network: launched probe for " << peerIdShort(pickedId) << " at " << pickedAddresses.size() << " address(es), first "
+              << pickedAddresses.front().address << ":" << pickedAddresses.front().port << std::endl;
 }
 
-void Network::runProbeWorker(PeerId expected, std::string address, uint16_t port, ConnectionSlots::Slot slot, HandshakeWorker* self) {
+void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
-    // Establish outbound connection with probe flag set — remote will close after verification.
+    // Establish outbound connection with probe flag set — remote will close after verification. Every dialable address
+    // in order (F4): one that answers with the expected identity is enough.
     IdentityFlags flags;
     flags.setProbe(true);
 
-    OutboundConnectionResult result = this->establishOutboundConnection(address, port, flags);
-
     bool success = false;
+    for (const PeerAddress& target : addresses) {
+        const std::string& address = target.address;
+        const uint16_t     port    = target.port;
+        OutboundConnectionResult result = this->establishOutboundConnection(address, port, flags);
 
-    if (result.verification != VerificationResult::Success) {
-        std::cerr << "Network: probe to " << peerIdShort(expected)
-                  << " at " << address << ":" << port
-                  << " failed during handshake, result=" << static_cast<int>(result.verification) << std::endl;
-    } else if (result.remoteIdentity.getPeerId() != expected) {
-        // Someone else on that address — don't trust the address for the expected peer.
-        // We don't record anything for the actual remote: our probe flag caused it to close without
-        // sending HELLO, so we have no announced addresses to outbound-match against.
-        std::cerr << "Network: probe to " << peerIdShort(expected)
-                  << " at " << address << ":" << port
-                  << " got PeerId mismatch (actual=" << peerIdShort(result.remoteIdentity.getPeerId())
-                  << "), treating as probe failure" << std::endl;
-    } else {
-        // Identity verified, PeerId matches expected — the announced address is reachable.
-        success = true;
-        std::cerr << "Network: probe to " << peerIdShort(expected)
-                  << " at " << address << ":" << port << " succeeded" << std::endl;
+        if (result.verification != VerificationResult::Success) {
+            std::cerr << "Network: probe to " << peerIdShort(expected)
+                      << " at " << address << ":" << port
+                      << " failed during handshake, result=" << static_cast<int>(result.verification) << std::endl;
+        } else if (result.remoteIdentity.getPeerId() != expected) {
+            // Someone else on that address — don't trust the address for the expected peer.
+            // We don't record anything for the actual remote: our probe flag caused it to close without
+            // sending HELLO, so we have no announced addresses to outbound-match against.
+            std::cerr << "Network: probe to " << peerIdShort(expected)
+                      << " at " << address << ":" << port
+                      << " got PeerId mismatch (actual=" << peerIdShort(result.remoteIdentity.getPeerId())
+                      << "), treating as probe failure" << std::endl;
+        } else {
+            // Identity verified, PeerId matches expected — the announced address is reachable.
+            success = true;
+            std::cerr << "Network: probe to " << peerIdShort(expected)
+                      << " at " << address << ":" << port << " succeeded" << std::endl;
+        }
+
+        // Always close the connection — probe is one-shot.
+        if (result.connection) result.connection->close();
+        if (success) break;
     }
-
-    // Always close the connection — probe is one-shot.
-    if (result.connection) result.connection->close();
     { auto released = std::move(slot); }                                            // the probe connection is gone — free its outbound slot now
 
     // Commit result to peerDirectory — this also updates the per-peer cooldown.
