@@ -5,6 +5,8 @@
 #include "meshlink/thread_signals.h"
 #include "transport/TcpClient.h"
 
+#include <botan/system_rng.h>
+
 #include <poll.h>
 #include <unistd.h>
 
@@ -182,6 +184,11 @@ void Network::start() {
     // Queues and the worker list are closed by stop(); open them again so a restarted Network does not spin on them
     this->messageProtocolQueue.reopen();
     this->peerLifecycleEvents.reopen();
+    this->holePunchRequests.reopen();
+    this->holePunchOutcomes.reopen();
+    this->holePunchCoordinator.emplace();
+    this->holePunchParticipant.emplace(this->selfIdentity->getPeerId());
+    this->holePunchCoordinatorsLeft.clear();
     {
         std::lock_guard lock(this->handshakeWorkersMutex);
         this->acceptingHandshakeWorkers = true;
@@ -279,6 +286,10 @@ void Network::stop() {
         if (worker->thread.joinable()) worker->thread.join();
     }
     this->probeWorkers.clear();
+    for (auto& worker : this->holePunchWorkers) {                                   // the same for punch workers
+        if (worker->thread.joinable()) worker->thread.join();
+    }
+    this->holePunchWorkers.clear();
 
     // Collect the workers under the lock and refuse new ones, so no worker can be added after this join (it would never
     // be joined and its std::thread would terminate the process); join outside the lock.
@@ -307,6 +318,11 @@ void Network::stop() {
 // ============================================================
 // Public API
 // ============================================================
+
+void Network::requestHolePunch(const PeerId& target) {
+    if (!this->running.load() || this->stopping.load()) return;
+    this->holePunchRequests.push(target);                                           // the management thread owns the punch state
+}
 
 void Network::connectToPeer(const std::string& address, uint16_t port) {
     this->dialAddresses({ PeerAddress{ PeerAddress::Type::IPv4, address, port } });   // type is not used for dialing
@@ -530,10 +546,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
     blockSigpipeInCurrentThread();
 
     // Hard deadline from accept (R1): a client trickling bytes cannot keep this worker alive past it
-    const auto deadline      = std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE;
-    const auto timeRemaining = [deadline] {
-        return std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
-    };
+    const auto deadline = std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE;
 
     std::shared_ptr<Connection> conn;
     try {
@@ -546,27 +559,15 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
         return;
     }
 
-    const int hs = conn->waitForHandshake(timeRemaining());
-    if (hs < 0) {
-        this->log.format(LogLevel::Info, "incoming transport handshake failed, code={}", hs);           // usually a scanner without the network secret
-        conn->close();
+    HandshakeResult result = this->completeHandshakeAsResponder(conn, deadline);
+    if (result.verification != VerificationResult::Success) {
+        // A failed transport handshake is usually a scanner without the network secret — not worth a warning
+        this->log.format(result.transportFailed ? LogLevel::Info : LogLevel::Warning, "incoming {}", result.failure);
         self->done.store(true, std::memory_order_release);
         return;
     }
-
-    PeerIdentity remoteIdentity;
-    IdentityFlags remoteFlags;                                                          // 6.1: receive peer intent (probe vs normal)
-    const VerificationOutcome verification = IdentityVerification::runAsResponder(
-            *conn, *this->selfIdentity, this->config.nodeName, remoteIdentity, remoteFlags,
-            std::min(IDENTITY_STEP_TIMEOUT, timeRemaining())
-    );
-
-    if (verification.result != VerificationResult::Success) {
-        this->log.format(LogLevel::Warning, "incoming identity verification failed: {} at {}", verificationResultName(verification.result), verificationStepName(verification.failedAt));
-        conn->close();
-        self->done.store(true, std::memory_order_release);
-        return;
-    }
+    PeerIdentity  remoteIdentity = std::move(result.remoteIdentity);
+    IdentityFlags remoteFlags    = result.remoteFlags;
 
     // If the initiator declared this is a probe, they want to validate our reachability
     // without joining our peer pool. We respond by closing — they've already verified us
@@ -594,8 +595,8 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 // Outbound connection establishment — shared by normal connect and probe
 // ============================================================
 
-Network::OutboundConnectionResult Network::establishOutboundConnection(const std::string& address, const uint16_t port, const IdentityFlags flagsSelf) const {
-    OutboundConnectionResult result;
+Network::HandshakeResult Network::establishOutboundConnection(const std::string& address, const uint16_t port, const IdentityFlags flagsSelf) const {
+    HandshakeResult result;
 
     // ── TCP connect ───────────────────────────────────────────────────────────
     Transport::TcpClient client;
@@ -628,15 +629,24 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
         return result;
     }
 
+    return this->completeHandshakeAsInitiator(connection, flagsSelf);
+}
+
+Network::HandshakeResult Network::completeHandshakeAsInitiator(const std::shared_ptr<Connection>& connection, const IdentityFlags flagsSelf) const {
+    HandshakeResult result;
+
+    // ── Transport handshake ───────────────────────────────────────────────────
     if (connection->initHandshake() != 0) {
-        result.failure = "transport handshake could not start";
+        result.failure         = "transport handshake could not start";
+        result.transportFailed = true;
         connection->close();
         return result;
     }
 
     const int handshakeResult = connection->waitForHandshake();
     if (handshakeResult < 0) {
-        result.failure = std::format("transport handshake failed, code={}", handshakeResult);
+        result.failure         = std::format("transport handshake failed, code={}", handshakeResult);
+        result.transportFailed = true;
         connection->close();
         return result;
     }
@@ -658,7 +668,42 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
 
     // ── Success — populate result ─────────────────────────────────────────────
     result.verification   = VerificationResult::Success;
-    result.connection     = std::move(connection);
+    result.connection     = connection;
+    result.remoteIdentity = std::move(remoteIdentity);
+    result.remoteFlags    = remoteFlags;
+    return result;
+}
+
+Network::HandshakeResult Network::completeHandshakeAsResponder(const std::shared_ptr<Connection>& connection, const std::chrono::steady_clock::time_point deadline) const {
+    const auto timeRemaining = [deadline] {
+        return std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
+    };
+    HandshakeResult result;
+
+    const int hs = connection->waitForHandshake(timeRemaining());
+    if (hs < 0) {
+        result.failure         = std::format("transport handshake failed, code={}", hs);
+        result.transportFailed = true;
+        connection->close();
+        return result;
+    }
+
+    PeerIdentity  remoteIdentity;
+    IdentityFlags remoteFlags;                                                          // 6.1: receive peer intent (probe vs normal)
+    const VerificationOutcome verification = IdentityVerification::runAsResponder(
+            *connection, *this->selfIdentity, this->config.nodeName, remoteIdentity, remoteFlags,
+            std::min(IDENTITY_STEP_TIMEOUT, timeRemaining())
+    );
+
+    if (verification.result != VerificationResult::Success) {
+        result.failure      = std::format("identity verification failed: {} at {}", verificationResultName(verification.result), verificationStepName(verification.failedAt));
+        result.verification = verification.result;
+        connection->close();
+        return result;
+    }
+
+    result.verification   = VerificationResult::Success;
+    result.connection     = connection;
     result.remoteIdentity = std::move(remoteIdentity);
     result.remoteFlags    = remoteFlags;
     return result;
@@ -668,7 +713,7 @@ void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, Connectio
     blockSigpipeInCurrentThread();
 
     // Normal connect — no probe, no special flags. The addresses in order, until one answers (F4).
-    OutboundConnectionResult result;
+    HandshakeResult result;
     for (const PeerAddress& address : addresses) {
         result = this->establishOutboundConnection(address.address, address.port, IdentityFlags{});
         if (result.verification == VerificationResult::Success) break;
@@ -952,7 +997,7 @@ void Network::handleWakeup() {
                         // farewell (HELLO + PEX + GOODBYE(NoSlots)) sent by the management thread.
                         const size_t activeInbound = static_cast<size_t>(std::count_if(this->peersById.begin(), this->peersById.end(),
                                 [](const auto& entry) { return !entry.second->isOutbound() && entry.second->isActive(); }));
-                        const bool overInboundSoft = !cmd.peer->isOutbound() && activeInbound >= this->config.connectionLimits.inbound.soft;
+                        const bool overInboundSoft = !cmd.peer->isOutbound() && !cmd.holePunched && activeInbound >= this->config.connectionLimits.inbound.soft;
 
                         this->peersById[cmd.peer->getPeerId()] = cmd.peer;
                         this->peersBySocket[fd]                = cmd.peer;
@@ -1148,6 +1193,7 @@ void Network::cleanClosedPeers() {
         peer->closeConnection();
         this->peerSlots.erase(peer.get());                                          // the connection's limit slot returns now
         this->log.format(LogLevel::Notice, "peer {} disconnected", peerIdShort(peer->getPeerId()));
+        this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Closed, peer, GoodbyeReason::Shutdown, std::string() });
     }
 
     // Fire disconnect events outside the peersMutex. Skip while stopping — Network::stop()
@@ -1187,12 +1233,26 @@ void Network::managementLoop() {
         PeerLifecycleEvent event;
         while (this->peerLifecycleEvents.tryPop(event)) {
             if (!event.peer) continue;
-            if (event.type == PeerLifecycleEvent::Type::Activated) {
-                if (event.peer->isActive()) this->greetActivatedPeer(event.peer, event.connectedFromAddress);   // skip if it closed or is already leaving
-            } else {
-                this->sendFarewellAndDepart(event.peer, event.reason);
+            switch (event.type) {
+                case PeerLifecycleEvent::Type::Activated:
+                    if (event.peer->isActive()) this->greetActivatedPeer(event.peer, event.connectedFromAddress);   // skip if it closed or is already leaving
+                    break;
+                case PeerLifecycleEvent::Type::Dismissed:
+                    this->sendFarewellAndDepart(event.peer, event.reason);
+                    break;
+                case PeerLifecycleEvent::Type::Closed:
+                    this->onNeighborClosed(event.peer->getPeerId());
+                    break;
             }
         }
+
+        // Hole punching (F7): asked punches, finished workers
+        PeerId punchTarget;
+        while (this->holePunchRequests.tryPop(punchTarget)) {
+            if (!this->stopping.load()) this->beginHolePunch(punchTarget);
+        }
+        this->collectHolePunchOutcomes();
+        this->joinFinishedHolePunchWorkers();
 
         if (now >= topologyNextTick && !this->stopping.load()) {
             this->forgetNoSlotsRejectionsOfSettledPeers();
@@ -1202,6 +1262,8 @@ void Network::managementLoop() {
         // Periodic PEX broadcast — one announcement per second max, to spread load over time
         if (now - lastBroadcastTick >= BROADCAST_TICK_INTERVAL) {
             this->sendPendingPexBroadcasts();
+            this->holePunchCoordinator->expire(now);
+            for (const HolePunchFailure& failure : this->holePunchParticipant->expire(now)) this->onHolePunchFailure(failure);
             lastBroadcastTick = now;
         }
         if (now >= periodicPexNextTick) {
@@ -1227,6 +1289,11 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
     // even when the I/O thread has already seen EOF and marked it for close. Records are signed, so they are
     // trustworthy whatever the connection state; replies to a closed peer simply fail.
     if (!msg.peer) return;
+
+    if (HolePunchCodec::isHolePunchSubtype(msg.subtype)) {
+        this->processHolePunchMessage(msg);
+        return;
+    }
 
     switch (msg.subtype) {
         case SUBTYPE_HELLO:
@@ -1992,7 +2059,7 @@ void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses
     for (const PeerAddress& target : addresses) {
         const std::string& address = target.address;
         const uint16_t     port    = target.port;
-        OutboundConnectionResult result = this->establishOutboundConnection(address, port, flags);
+        HandshakeResult result = this->establishOutboundConnection(address, port, flags);
 
         if (result.verification != VerificationResult::Success) {
             this->log.format(LogLevel::Info, "probe to {} at {}:{} failed: {}", peerIdShort(expected), address, port, result.failure.empty() ? verificationResultName(result.verification) : result.failure);
@@ -2079,6 +2146,266 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
 // ============================================================
 // Helpers
 // ============================================================
+
+// ============================================================
+// NAT hole punching (F7, docs/nat-traversal.md) — coordination over 0xFF, one hop through a common neighbor
+// ============================================================
+
+void Network::processHolePunchMessage(const ProtocolMessage& msg) {
+    const PeerId& from = msg.peer->getPeerId();
+    const auto    body = HolePunchCodec::decode(msg.subtype, msg.payload);
+    if (!body) {
+        this->log.formatRateLimited(this->managementThreadLogLimiter, "malformed PUNCH:" + peerIdShort(from), LogLevel::Warning, "malformed hole punch message 0x{:04x} from {} ({} B)", msg.subtype, peerIdShort(from), msg.payload.size());
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+
+    if (const auto* request = std::get_if<HolePunchRequest>(&*body)) {
+        // Role R: both endpoints come from our own connections — what each NAT shows us, never what anyone declares
+        const auto target         = this->stopping.load() ? nullptr : this->findActivePeer(request->target);
+        const auto targetEndpoint = target ? this->observedEndpointOf(*target) : std::nullopt;
+        const auto messages       = this->holePunchCoordinator->onRequest(from, this->observedEndpointOf(*msg.peer), *request, targetEndpoint, now);
+        this->log.format(LogLevel::Debug, "hole punch request from {} to {}: {}", peerIdShort(from), peerIdShort(request->target),
+                         !messages.empty() && std::holds_alternative<HolePunchOffer>(messages.front().body) ? "offered" : "declined");
+        this->sendHolePunchMessages(messages);
+    } else if (const auto* offer = std::get_if<HolePunchOffer>(&*body)) {
+        // Role B. Our side of the connection with R must be one we dialed: its port is the NAT mapping R saw.
+        std::optional<HolePunchDeclineReason> obstacle;
+        if (!msg.peer->isOutbound())                                    obstacle = HolePunchDeclineReason::NotAllowed;
+        else if (this->stopping.load())                                 obstacle = HolePunchDeclineReason::NoSlot;
+        else if (this->findActivePeer(offer->initiator))                obstacle = HolePunchDeclineReason::AlreadyConnected;
+        else if (this->connectionSlots.outboundInUse() >= this->config.connectionLimits.outbound.effectiveHard()) obstacle = HolePunchDeclineReason::NoSlot;
+        if (const auto answer = this->holePunchParticipant->onOffer(from, *offer, obstacle, now)) {
+            this->log.format(LogLevel::Debug, "hole punch offer from {} via {}: {}", peerIdShort(offer->initiator), peerIdShort(from),
+                             std::holds_alternative<HolePunchAccept>(answer->body) ? "accepted" : holePunchDeclineReasonName(std::get<HolePunchDecline>(answer->body).reason));
+            this->sendHolePunchMessages({ *answer });
+        }
+    } else if (const auto* accept = std::get_if<HolePunchAccept>(&*body)) {
+        this->sendHolePunchMessages(this->holePunchCoordinator->onAccept(from, *accept, now));
+    } else if (const auto* decline = std::get_if<HolePunchDecline>(&*body)) {
+        // Either B's answer to us as R (forwarded to A), or R's word to us as A or B — the nonce tells which
+        const auto forwarded = this->holePunchCoordinator->onDecline(from, *decline, now);
+        if (!forwarded.empty()) this->sendHolePunchMessages(forwarded);
+        else if (const auto failure = this->holePunchParticipant->onDecline(from, *decline, now)) this->onHolePunchFailure(*failure);
+    } else if (const auto* start = std::get_if<HolePunchNow>(&*body)) {
+        if (const auto punch = this->holePunchParticipant->onNow(from, *start, now)) this->startHolePunchWorker(*punch);
+    }
+}
+
+void Network::sendHolePunchMessages(const std::vector<HolePunchMessage>& messages) {
+    for (const HolePunchMessage& message : messages) {
+        const auto peer = this->findActivePeer(message.peer);
+        if (!peer) continue;                                                        // left meanwhile — the other side's deadline covers it
+        const auto encoded = HolePunchCodec::encode(message.body);
+        if (encoded.payload.empty()) continue;                                      // an endpoint that is not an IP — nothing sensible to send
+        this->sendFrameTo(peer, buildFrame(GROUP_INTERNAL, encoded.subtype, encoded.payload));
+    }
+}
+
+std::optional<HolePunchEndpoint> Network::observedEndpointOf(const Peer& neighbor) const {
+    if (neighbor.isOutbound()) return std::nullopt;                                 // we dialed it: its port is its listening port, not a NAT mapping
+    const auto connection = neighbor.getConnection();
+    if (!connection) return std::nullopt;
+    return HolePunchEndpoint{ connection->getRemoteClientAddress(), connection->getRemoteClientPort() };
+}
+
+void Network::beginHolePunch(const PeerId& target) {
+    const PeerId& self = this->selfIdentity->getPeerId();
+    const auto    now  = std::chrono::steady_clock::now();
+    if (target == self || this->findActivePeer(target)) return;
+    if (!holePunchInitiatesHandshake(self, target)) {
+        this->log.format(LogLevel::Debug, "no hole punch to {}: the smaller PeerId asks", peerIdShort(target));
+        return;
+    }
+    if (this->holePunchParticipant->isExchangingWith(target) || this->holePunchParticipant->isResting(target, now)) return;
+
+    // Coordinator candidates: neighbors we dialed (they see our NAT mapping). Which of them also has the target is not
+    // known yet (F7-e "reachable via") — ask them in random order until one coordinates.
+    std::vector<PeerId> coordinators;
+    for (const auto& peer : this->activePeersSnapshot()) {
+        if (peer->isOutbound() && peer->getPeerId() != target) coordinators.push_back(peer->getPeerId());
+    }
+    static thread_local std::mt19937 rng(std::random_device{}());
+    std::shuffle(coordinators.begin(), coordinators.end(), rng);
+    this->holePunchCoordinatorsLeft[target] = std::move(coordinators);
+    this->askNextHolePunchCoordinator(target);
+}
+
+void Network::askNextHolePunchCoordinator(const PeerId& target) {
+    const auto it = this->holePunchCoordinatorsLeft.find(target);
+    if (it == this->holePunchCoordinatorsLeft.end()) return;
+    const auto now = std::chrono::steady_clock::now();
+
+    while (!it->second.empty()) {
+        const PeerId via = it->second.back();
+        it->second.pop_back();
+        if (!this->findActivePeer(via)) continue;
+
+        HolePunchNonce nonce;
+        Botan::system_rng().randomize(nonce.data(), nonce.size());
+        const auto request = this->holePunchParticipant->request(target, via, nonce, now);
+        if (!request) {                                                             // exchange running or pair resting
+            this->holePunchCoordinatorsLeft.erase(it);
+            return;
+        }
+        this->log.format(LogLevel::Debug, "asking {} to coordinate a hole punch to {}", peerIdShort(via), peerIdShort(target));
+        this->sendHolePunchMessages({ *request });
+        return;                                                                     // the entry stays until the exchange ends
+    }
+
+    this->holePunchCoordinatorsLeft.erase(it);
+    this->holePunchParticipant->recordFailedAttempt(target, now);
+    this->log.format(LogLevel::Info, "no neighbor coordinates a hole punch to {}", peerIdShort(target));
+}
+
+void Network::onHolePunchFailure(const HolePunchFailure& failure) {
+    this->log.format(LogLevel::Info, "hole punch with {} via {} ended: {}", peerIdShort(failure.peer), peerIdShort(failure.via),
+                     failure.reason ? holePunchDeclineReasonName(*failure.reason) : std::string_view("no answer in time"));
+    if (!holePunchInitiatesHandshake(this->selfIdentity->getPeerId(), failure.peer)) return;   // B: nothing to retry
+
+    // A: the coordinator could not help (not the target's neighbor, busy with us, someone left) — ask the next one
+    using Reason = HolePunchDeclineReason;
+    if (failure.reason == Reason::NotNeighbor || failure.reason == Reason::RateLimited || failure.reason == Reason::PeerLeft) {
+        this->askNextHolePunchCoordinator(failure.peer);
+        return;
+    }
+    this->holePunchCoordinatorsLeft.erase(failure.peer);
+    if (failure.reason == Reason::AlreadyConnected || failure.reason == Reason::Busy) return;  // says nothing about the pair's NATs
+    this->holePunchParticipant->recordFailedAttempt(failure.peer, std::chrono::steady_clock::now());
+}
+
+void Network::startHolePunchWorker(const HolePunchStart& start) {
+    const auto now = std::chrono::steady_clock::now();
+    if (this->stopping.load()) return;                                              // the exchange expires; nothing runs after stop
+    if (this->findActivePeer(start.peer)) {
+        this->holePunchParticipant->finishPunch(start.peer, true, now);
+        return;
+    }
+
+    // From the port of our connection with the coordinator: the NAT mapping it saw and told the other side about
+    const auto     via       = this->findActivePeer(start.via);
+    const uint16_t localPort = via && via->getConnection() ? via->getConnection()->getLocalPort() : 0;
+    if (localPort == 0) {
+        this->log.format(LogLevel::Info, "hole punch with {}: connection with {} is gone", peerIdShort(start.peer), peerIdShort(start.via));
+        this->holePunchParticipant->finishPunch(start.peer, false, now);
+        return;
+    }
+
+    // A punched connection is one we chose — an outbound slot on both sides (R10)
+    auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
+    if (!slot) {
+        this->log.format(LogLevel::Info, "hole punch with {}: outbound hard limit reached", peerIdShort(start.peer));
+        this->holePunchParticipant->finishPunch(start.peer, false, now);
+        return;
+    }
+
+    auto  worker    = std::make_unique<HandshakeWorker>();
+    auto* workerPtr = worker.get();
+    try {
+        worker->thread = std::thread([this, start, localPort, slot = std::move(*slot), workerPtr]() mutable {
+            this->runHolePunchWorker(start, localPort, std::move(slot), workerPtr);
+        });
+    } catch (const std::system_error& e) {
+        this->log.format(LogLevel::Critical, "cannot start hole punch worker: {}", e.what());   // slot returns with the lambda
+        this->holePunchParticipant->finishPunch(start.peer, false, now);
+        return;
+    }
+    this->holePunchWorkers.push_back(std::move(worker));
+    this->log.format(LogLevel::Info, "hole punching to {} at {}:{} from port {} ({})", peerIdShort(start.peer), start.remoteEndpoint.address, start.remoteEndpoint.port, localPort,
+                     start.initiatesHandshake ? "initiator" : "responder");
+}
+
+void Network::runHolePunchWorker(HolePunchStart start, const uint16_t localPort, ConnectionSlots::Slot slot, HandshakeWorker* self) {
+    blockSigpipeInCurrentThread();
+
+    HolePunchOutcome outcome{ start.peer, false, {} };
+    const auto report = [&] {
+        this->holePunchOutcomes.push(std::move(outcome));
+        self->done.store(true, std::memory_order_release);
+    };
+
+    // ── Simultaneous open: the other side dials us at the same time; the kernel retransmits a SYN the NAT dropped ──
+    Transport::TcpClient client;
+    sockaddr_storage     remoteAddr{};
+    client.onConnect([&remoteAddr](int /*socket*/, const sockaddr_storage* addr) { if (addr) remoteAddr = *addr; });
+    const auto window = std::max(std::chrono::milliseconds(0), std::chrono::duration_cast<std::chrono::milliseconds>(start.deadline - std::chrono::steady_clock::now()));
+    const Transport::ConnectError connectResult = client.connectSimultaneous(localPort, start.remoteEndpoint.address, start.remoteEndpoint.port, window);
+    if (connectResult != Transport::ConnectError::None) {
+        outcome.failure = std::format("simultaneous connect failed: {}", Transport::connectErrorName(connectResult));
+        report();
+        return;
+    }
+    const int fd = client.release();
+
+    std::shared_ptr<Connection> connection;
+    try {
+        this->prepareConnectionSocket(fd);
+        connection = std::make_shared<Connection>(fd, &remoteAddr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
+    } catch (const std::exception& e) {
+        ::close(fd);
+        outcome.failure = std::format("connection construction failed: {}", e.what());
+        report();
+        return;
+    }
+
+    // ── Roles follow the PeerIds, not the socket: both sides called connect ──
+    HandshakeResult result = start.initiatesHandshake ? this->completeHandshakeAsInitiator(connection, IdentityFlags{})
+                                                      : this->completeHandshakeAsResponder(connection, std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE);
+    if (result.verification != VerificationResult::Success) {
+        outcome.failure = result.failure;
+        report();
+        return;
+    }
+    if (result.remoteIdentity.getPeerId() != start.peer || result.remoteFlags.probe()) {
+        result.connection->close();
+        outcome.failure = std::format("unexpected identity {}", peerIdShort(result.remoteIdentity.getPeerId()));
+        report();
+        return;
+    }
+
+    // Registered like any other connection; a duplicate is settled by the tie-break (B4), whose winning direction —
+    // the smaller PeerId's outbound — is exactly the punch's initiator
+    auto peer = std::make_shared<Peer>(std::move(result.connection), std::move(result.remoteIdentity), start.initiatesHandshake);
+    Command cmd;
+    cmd.type        = Command::Type::AddPeer;
+    cmd.peer        = std::move(peer);
+    cmd.slot        = std::move(slot);
+    cmd.holePunched = true;
+    this->commandQueue.push(std::move(cmd));
+    this->wakeupIoThread();
+
+    outcome.connected = true;
+    report();
+}
+
+void Network::collectHolePunchOutcomes() {
+    HolePunchOutcome outcome;
+    while (this->holePunchOutcomes.tryPop(outcome)) {
+        this->holePunchParticipant->finishPunch(outcome.peer, outcome.connected, std::chrono::steady_clock::now());
+        this->holePunchCoordinatorsLeft.erase(outcome.peer);
+        if (outcome.connected) this->log.format(LogLevel::Notice, "hole punched to {}", peerIdShort(outcome.peer));
+        else                   this->log.format(LogLevel::Info, "hole punch to {} failed: {}", peerIdShort(outcome.peer), outcome.failure);
+    }
+}
+
+void Network::onNeighborClosed(const PeerId& neighbor) {
+    this->sendHolePunchMessages(this->holePunchCoordinator->onNeighborLost(neighbor));
+    for (const HolePunchFailure& failure : this->holePunchParticipant->onNeighborLost(neighbor)) this->onHolePunchFailure(failure);
+}
+
+void Network::joinFinishedHolePunchWorkers() {
+    std::erase_if(this->holePunchWorkers, [](std::unique_ptr<HandshakeWorker>& worker) {
+        if (!worker->done.load(std::memory_order_acquire)) return false;
+        if (worker->thread.joinable()) worker->thread.join();
+        return true;
+    });
+}
+
+std::shared_ptr<Peer> Network::findActivePeer(const PeerId& peerId) const {
+    std::shared_lock lock(this->peersMutex);
+    const auto it = this->peersById.find(peerId);
+    return it != this->peersById.end() && it->second->isActive() ? it->second : nullptr;
+}
 
 ssize_t Network::sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vector<uint8_t>& frame) const {
     const ssize_t result = peer->send(frame);

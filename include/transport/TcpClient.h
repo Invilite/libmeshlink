@@ -18,7 +18,7 @@ namespace invilite::Transport {
         SocketCreation,
         NonBlocking,
         PortReuse,                                                                      // SO_REUSEADDR / SO_REUSEPORT refused
-        BindFailed,                                                                     // local port of connectSimultaneous unavailable
+        BindFailed,                                                                     // no local port (connectSimultaneous: its port is held without reuse)
         KeepAlive,                                                                      // setsockopt SO_KEEPALIVE failed
         ConnectFailed,                                                                  // connect attempt failed
         PollFailed,

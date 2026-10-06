@@ -33,7 +33,7 @@ std::string_view connectErrorName(ConnectError error) {
 namespace {
 
 // One TCP connect attempt — the code shared by connect() and connectSimultaneous(): a socket that allows local port
-// reuse, optionally bound to `localEndpoint`, a non-blocking connect and a wait of at most `timeout`. On success
+// reuse, bound to `localEndpoint` (any port when null), a non-blocking connect and a wait of at most `timeout`. On success
 // `connectedSocket` holds the socket; on failure it is closed and -1.
 ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const sockaddr* localEndpoint, socklen_t localLength, std::chrono::milliseconds timeout, int& connectedSocket) {
     connectedSocket = -1;
@@ -45,7 +45,17 @@ ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const s
     // Every outgoing socket allows reuse of its local port from the start: which connection will later carry a NAT
     // hole punch (F7) is not known in advance, and the kernel lets a second socket bind only if all of them opted in
     if (!Platform::allowLocalPortReuse(sock)) return fail(ConnectError::PortReuse);
-    if (localEndpoint != nullptr && ::bind(sock, localEndpoint, localLength) < 0) return fail(ConnectError::BindFailed);
+
+    // Always an explicit bind — to the given endpoint, otherwise to any port. A port picked by connect() alone may be
+    // shared with other programs' connected sockets (Linux shares it whenever the four-tuples differ), and one of them
+    // without SO_REUSEADDR would make a later punch from that port fail to bind. bind() reserves the port for us.
+    sockaddr_storage anyPort{};
+    if (localEndpoint == nullptr) {
+        anyPort.ss_family = remote->sa_family;                                      // wildcard address, port 0
+        localEndpoint     = reinterpret_cast<const sockaddr*>(&anyPort);
+        localLength       = remote->sa_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in);
+    }
+    if (::bind(sock, localEndpoint, localLength) < 0) return fail(ConnectError::BindFailed);
 
     // Non-blocking for timeout-based connect
     if (!Platform::setNonBlocking(sock)) return fail(ConnectError::NonBlocking);

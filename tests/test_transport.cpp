@@ -18,6 +18,7 @@
 
 using namespace invilite::Transport;
 using invilite::Mesh::TestHelpers::pickUnusedPort;
+using invilite::Mesh::TestHelpers::SynBlackhole;
 using namespace std::chrono_literals;
 
 namespace {
@@ -68,26 +69,6 @@ uint16_t localPortOf(int socket) {
     ::getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length);
     return ntohs(reinterpret_cast<sockaddr_in*>(&address)->sin_port);
 }
-
-// Stands in for a NAT that silently drops an unsolicited SYN. On loopback a SYN that arrives before the other side has
-// opened its socket would be answered with RST; a listener on the same port whose only accept-queue slot is taken makes
-// the kernel drop it instead, and leaves the port to SYN_SENT sockets bound next to it (SO_REUSEPORT).
-struct SynBlackhole {
-    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
-    int filler   = ::socket(AF_INET, SOCK_STREAM, 0);
-
-    explicit SynBlackhole(uint16_t port) {
-        Platform::allowLocalPortReuse(listener);
-        sockaddr_in addr{};
-        addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port        = htons(port);
-        ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-        ::listen(listener, 0);
-        ::connect(filler, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
-    }
-    ~SynBlackhole() { ::close(filler); ::close(listener); }
-};
 
 // Sends `text` on one socket and reads it back from the other (blocking sockets)
 bool carries(int from, int to, const std::string& text) {

@@ -71,6 +71,8 @@ public:
 
     std::string getRemoteClientAddress() const;
     uint16_t getRemoteClientPort() const;
+    // Our side's port of this connection; 0 when the socket is gone. NAT hole punching (F7) dials from it again.
+    uint16_t getLocalPort() const;
 	uint64_t getBytesSent() const;
 	uint64_t getBytesReceived() const;
 	uint64_t getBytesSentRaw() const;

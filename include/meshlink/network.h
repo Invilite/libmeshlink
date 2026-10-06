@@ -13,6 +13,8 @@
 #include "meshlink/signed_peer_record.h"
 #include "meshlink/thread_safe_queue.h"
 #include "meshlink/connection_slots.h"
+#include "meshlink/hole_punch_coordinator.h"
+#include "meshlink/hole_punch_participant.h"
 #include "meshlink/log.h"
 #include "transport/TcpServer.h"
 
@@ -214,6 +216,14 @@ namespace invilite::Mesh {
         // How peers we dialed see us (OBSERVED_ADDRESS), newest last, at most 8 distinct addresses. A public one we do
         // not announce means this node is behind NAT — reachable from outside only with port forwarding.
         std::vector<ObservedSelfAddress> getObservedSelfAddresses() const;
+
+        // NAT hole punching (F7, docs/nat-traversal.md): try a direct connection to `target`, a known peer nobody can dial,
+        // through a neighbor we dialed that also has `target` as a neighbor (each such neighbor in turn until one
+        // coordinates). Asynchronous; a success shows as an ordinary onPeerConnected. Network's own policy (F7-d) decides
+        // when to punch — this is the entry point for it, diagnostics and tests. Ignored when already connected, when a
+        // punch with `target` is running or the pair rests after failed punches, and from the node with the larger PeerId
+        // (only the smaller one asks).
+        void requestHolePunch(const PeerId& target);
         size_t                          getConnectedPeerCount() const;
         NetworkDiagnostics              getDiagnostics() const;
         // This node's SignedPeerRecord as sent in HELLO (serialized); built by start(), empty before it
@@ -240,12 +250,15 @@ namespace invilite::Mesh {
             Type                                    type = Type::AddPeer;
             std::shared_ptr<Peer>                   peer;
             std::optional<ConnectionSlots::Slot>    slot;                               // resources the connection holds — kept until it closes (R10)
+            // Agreed in a hole punch (F7): holds an outbound slot on both sides, so the inbound soft limit does not dismiss
+            // it on the side that is the handshake responder
+            bool                                    holePunched = false;
         };
 
         // Connection-layer fact handed to the management thread (I/O → Management). Replaces the old "send HELLO"
         // queue (A1 S3): the I/O thread reports what happened, the management thread decides what to send.
         struct PeerLifecycleEvent {
-            enum class Type { Activated, Dismissed };
+            enum class Type { Activated, Dismissed, Closed };                          // Closed: the peer was reaped (any state)
             Type                    type = Type::Activated;
             std::shared_ptr<Peer>   peer;
             GoodbyeReason           reason = GoodbyeReason::Shutdown;                   // Dismissed only
@@ -263,21 +276,33 @@ namespace invilite::Mesh {
             std::atomic<bool>       done{false};
         };
 
-        // Result of an outbound connection attempt up to and including identity verification.
+        // Result of a connection attempt up to and including identity verification — dialed, accepted or punched.
         // On Success, `connection` and `remoteIdentity` are populated; on any other result only
         // `verification` is meaningful and the caller should not touch the other fields.
-        struct OutboundConnectionResult {
+        struct HandshakeResult {
             VerificationResult           verification = VerificationResult::ConnectionError;
             std::shared_ptr<Connection>  connection;
             PeerIdentity                 remoteIdentity;
             IdentityFlags                remoteFlags;
             std::string                  failure;                                       // why the attempt failed; logged by the caller at its own level (dial: Warning, probe: Info)
+            bool                         transportFailed = false;                       // failed before identity verification (wrong network secret, scanner)
+        };
+
+        // A finished punch worker's report (worker → Management)
+        struct HolePunchOutcome {
+            PeerId          peer{};
+            bool            connected = false;
+            std::string     failure;
         };
 
         // Perform TCP connect + transport handshake + identity verification as initiator.
         // Shared between connectToPeer (flagsSelf={}) and probePeer (flagsSelf.probe=true).
         // On any failure step the partially-constructed Connection is closed before returning.
-        OutboundConnectionResult establishOutboundConnection(const std::string& address, uint16_t port, IdentityFlags flagsSelf) const;
+        HandshakeResult establishOutboundConnection(const std::string& address, uint16_t port, IdentityFlags flagsSelf) const;
+        // Transport handshake + identity verification on a connected socket, in either role; the connection is closed on
+        // failure. Shared by dialing, accepting and hole punching (whose role follows the PeerIds, not the socket).
+        HandshakeResult completeHandshakeAsInitiator(const std::shared_ptr<Connection>& connection, IdentityFlags flagsSelf) const;
+        HandshakeResult completeHandshakeAsResponder(const std::shared_ptr<Connection>& connection, std::chrono::steady_clock::time_point deadline) const;
 
         // ===== Thread loops =====
         void ioLoop();
@@ -356,6 +381,23 @@ namespace invilite::Mesh {
         void runOutgoingHandshake(std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self);
         void joinFinishedHandshakeWorkers();
         void joinFinishedProbeWorkers();                                                // discovery's own workers (A1 S1)
+
+        // ===== NAT hole punching (F7) — management thread, except the worker =====
+        void processHolePunchMessage(const ProtocolMessage& msg);                      // subtypes 0x0060–0x0064
+        void sendHolePunchMessages(const std::vector<HolePunchMessage>& messages);
+        // Where a neighbor's NAT maps its connection with us: only for a neighbor that dialed us (its source port)
+        [[nodiscard]] std::optional<HolePunchEndpoint> observedEndpointOf(const Peer& neighbor) const;
+        // A: starts asking our dialed neighbors, in random order, to coordinate a punch to `target`
+        void beginHolePunch(const PeerId& target);
+        // Next neighbor we dialed to ask for coordinating `target`; when none is left the attempt failed
+        void askNextHolePunchCoordinator(const PeerId& target);
+        void onHolePunchFailure(const HolePunchFailure& failure);
+        void startHolePunchWorker(const HolePunchStart& start);
+        void runHolePunchWorker(HolePunchStart start, uint16_t localPort, ConnectionSlots::Slot slot, HandshakeWorker* self);
+        void collectHolePunchOutcomes();
+        void onNeighborClosed(const PeerId& neighbor);
+        void joinFinishedHolePunchWorkers();
+        [[nodiscard]] std::shared_ptr<Peer> findActivePeer(const PeerId& peerId) const;
 
         // ===== Helpers =====
         void wakeupIoThread() const;
@@ -480,6 +522,15 @@ namespace invilite::Mesh {
         // Single probe in flight at a time — prevents flooding when many peers need probing.
         // Per-peer cooldowns live in KnownPeer::nextProbeAllowedAt.
         std::atomic<bool>                         probeInFlight{false};
+
+        // ===== NAT hole punching (F7) — management thread only, except the two queues =====
+        // Fresh on every start(): exchanges of an earlier run mean nothing
+        std::optional<HolePunchCoordinator>                             holePunchCoordinator;           // our role as R
+        std::optional<HolePunchParticipant>                             holePunchParticipant;           // our role as A or B
+        std::unordered_map<PeerId, std::vector<PeerId>, PeerIDHash>     holePunchCoordinatorsLeft;      // A: neighbors still to ask, per target
+        std::vector<std::unique_ptr<HandshakeWorker>>                   holePunchWorkers;
+        ThreadSafeQueue<PeerId>                                         holePunchRequests;              // requestHolePunch (any thread) → Management
+        ThreadSafeQueue<HolePunchOutcome>                               holePunchOutcomes;              // punch workers → Management
 
         TopologyPlanner topologyPlanner;
     };

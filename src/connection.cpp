@@ -989,6 +989,16 @@ uint16_t invilite::Mesh::Connection::getRemoteClientPort() const {
     return remoteClientPort;
 }
 
+uint16_t invilite::Mesh::Connection::getLocalPort() const {
+    sockaddr_storage local{};
+    socklen_t        length = sizeof(local);
+    const int        socket = this->clientSocket.load();
+    if (socket < 0 || ::getsockname(socket, reinterpret_cast<sockaddr*>(&local), &length) != 0) return 0;
+    if (local.ss_family == AF_INET)  return ntohs(reinterpret_cast<const sockaddr_in&>(local).sin_port);
+    if (local.ss_family == AF_INET6) return ntohs(reinterpret_cast<const sockaddr_in6&>(local).sin6_port);
+    return 0;
+}
+
 invilite::Mesh::Connection::~Connection() {
     this->close();
 }
