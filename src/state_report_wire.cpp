@@ -102,7 +102,7 @@ namespace {
         if (!readBE(reader, count) || count > reader.remaining() / ENTRY_SIZE) return false;
         out.resize(count);
         for (NeighborState& neighbor : out) {
-            uint8_t flags;
+            uint8_t flags = 0;
             reader.readPeerId(neighbor.peerId);
             reader.readU8(flags);
             neighbor.inbound = (flags & NEIGHBOR_INBOUND) != 0;
@@ -140,7 +140,7 @@ namespace {
         if (count > reader.remaining() / ENTRY_SIZE) return false;
         out.routes.resize(count);
         for (RouteState& route : out.routes) {
-            uint32_t rtt;
+            uint32_t rtt = 0;
             reader.readPeerId(route.destination);
             reader.readPeerId(route.via);
             reader.readU8(route.hops);
