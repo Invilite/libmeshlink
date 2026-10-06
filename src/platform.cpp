@@ -31,6 +31,16 @@ bool invilite::Transport::Platform::enableKeepalive(const int socket, const int 
         && ::setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) == 0;
 }
 
+bool invilite::Transport::Platform::allowLocalPortReuse(const int socket) {
+    const int enabled = 1;
+    if (::setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0) return false;
+#if defined(SO_REUSEPORT)
+    return ::setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) == 0;
+#else
+    return true;                                                                        // Windows: no SO_REUSEPORT, other SO_REUSEADDR semantics (F8)
+#endif
+}
+
 int invilite::Transport::Platform::waitForSockets(pollfd* sockets, const size_t count, const int timeoutMs) {
     return ::poll(sockets, static_cast<nfds_t>(count), timeoutMs);
 }

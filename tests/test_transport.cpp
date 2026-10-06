@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -60,6 +61,48 @@ struct HighDescriptorFloor {
     }
     ~HighDescriptorFloor() { for (const int fd : held) ::close(fd); }
 };
+
+uint16_t localPortOf(int socket) {
+    sockaddr_storage address{};
+    socklen_t length = sizeof(address);
+    ::getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length);
+    return ntohs(reinterpret_cast<sockaddr_in*>(&address)->sin_port);
+}
+
+// Stands in for a NAT that silently drops an unsolicited SYN. On loopback a SYN that arrives before the other side has
+// opened its socket would be answered with RST; a listener on the same port whose only accept-queue slot is taken makes
+// the kernel drop it instead, and leaves the port to SYN_SENT sockets bound next to it (SO_REUSEPORT).
+struct SynBlackhole {
+    int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    int filler   = ::socket(AF_INET, SOCK_STREAM, 0);
+
+    explicit SynBlackhole(uint16_t port) {
+        Platform::allowLocalPortReuse(listener);
+        sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port        = htons(port);
+        ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        ::listen(listener, 0);
+        ::connect(filler, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    }
+    ~SynBlackhole() { ::close(filler); ::close(listener); }
+};
+
+// Sends `text` on one socket and reads it back from the other (blocking sockets)
+bool carries(int from, int to, const std::string& text) {
+    if (::send(from, text.data(), text.size(), 0) != static_cast<ssize_t>(text.size())) return false;
+    std::string received(text.size(), '\0');
+    size_t got = 0;
+    while (got < text.size()) {
+        const ssize_t n = ::recv(to, received.data() + got, text.size() - got, 0);
+        if (n <= 0) return false;
+        got += static_cast<size_t>(n);
+    }
+    return received == text;
+}
+
+void makeBlocking(int socket) { ::fcntl(socket, F_SETFL, ::fcntl(socket, F_GETFL, 0) & ~O_NONBLOCK); }
 
 } // namespace
 
@@ -178,6 +221,69 @@ TEST(TcpClientTest, ExceptionFromConnectCallbackReachesCaller) {
     TcpClient client;
     client.onConnect([](int, const sockaddr_storage*) { throw std::runtime_error("callback failed"); });
     EXPECT_THROW(client.connect("127.0.0.1", port, 2s), std::runtime_error);
+}
+
+// F7-a: hole punching dials from the local port of an existing connection (to the coordinating neighbor). A and B open
+// towards each other at once; both get one connection between the same two ports, and A's existing connection keeps
+// working (different four-tuple).
+TEST(TcpClientTest, SimultaneousOpenFromPortOfExistingConnection) {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in serverAddress{};
+    serverAddress.sin_family      = AF_INET;
+    serverAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)), 0);
+    ASSERT_EQ(::listen(listener, 4), 0);
+
+    TcpClient existing;                                                                 // A's connection to the neighbor
+    ASSERT_EQ(existing.connect("127.0.0.1", localPortOf(listener), 2s), ConnectError::None);
+    const int existingSocket = existing.release();
+    const int neighborSide   = ::accept(listener, nullptr, nullptr);
+    ASSERT_GE(neighborSide, 0);
+    makeBlocking(existingSocket);
+
+    const uint16_t portA = localPortOf(existingSocket);
+    const uint16_t portB = pickUnusedPort();
+    SynBlackhole natA(portA), natB(portB);                                              // whichever SYN comes first is dropped
+
+    TcpClient a, b;
+    ConnectError resultA = ConnectError::None;
+    std::thread sideA([&] { resultA = a.connectSimultaneous(portA, "127.0.0.1", portB, 3s); });
+    const ConnectError resultB = b.connectSimultaneous(portB, "127.0.0.1", portA, 3s);
+    sideA.join();
+    ASSERT_EQ(resultA, ConnectError::None);
+    ASSERT_EQ(resultB, ConnectError::None);
+
+    const int socketA = a.release(), socketB = b.release();
+    makeBlocking(socketA);
+    makeBlocking(socketB);
+    EXPECT_EQ(localPortOf(socketA), portA);
+    EXPECT_EQ(localPortOf(socketB), portB);
+    EXPECT_TRUE(carries(socketA, socketB, "punched"));
+    EXPECT_TRUE(carries(socketB, socketA, "both ways"));
+    EXPECT_TRUE(carries(existingSocket, neighborSide, "still alive"));
+    EXPECT_TRUE(carries(neighborSide, existingSocket, "and back"));
+
+    for (const int fd : { socketA, socketB, existingSocket, neighborSide, listener }) ::close(fd);
+}
+
+// A port held by a socket that did not opt into reuse cannot be borrowed — reported, not hidden
+TEST(TcpClientTest, SimultaneousOpenFromPortWithoutReuseReportsBind) {
+    const int holder = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address{};
+    address.sin_family      = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(holder, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+    TcpClient client;
+    const ConnectError error = client.connectSimultaneous(localPortOf(holder), "127.0.0.1", pickUnusedPort(), 1s);
+    EXPECT_EQ(error, ConnectError::BindFailed);
+    EXPECT_EQ(connectErrorName(error), "local port bind failed");
+    ::close(holder);
+}
+
+TEST(TcpClientTest, SimultaneousOpenRejectsHostName) {
+    TcpClient client;
+    EXPECT_EQ(client.connectSimultaneous(pickUnusedPort(), "localhost", 1, 1s), ConnectError::ResolveFailed);
 }
 
 // F7: keepalive is set on a real TCP socket as asked — the kernel then keeps NAT mappings of idle links alive

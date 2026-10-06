@@ -17,6 +17,8 @@ namespace invilite::Transport {
         ResolveFailed,                                                                  // getaddrinfo failed
         SocketCreation,
         NonBlocking,
+        PortReuse,                                                                      // SO_REUSEADDR / SO_REUSEPORT refused
+        BindFailed,                                                                     // local port of connectSimultaneous unavailable
         KeepAlive,                                                                      // setsockopt SO_KEEPALIVE failed
         ConnectFailed,                                                                  // connect attempt failed
         PollFailed,
@@ -38,6 +40,14 @@ namespace invilite::Transport {
         // An exception thrown by the onConnect callback propagates to the caller.
         ConnectError connect(const std::string& address, int port, std::chrono::seconds timeout = std::chrono::seconds(5));
 
+        // TCP simultaneous open for NAT hole punching (F7): connects from `localPort` — the local port of an existing
+        // outgoing connection, whose NAT mapping the other side was told about — to a numeric `remoteAddress` (no DNS).
+        // The other side does the same towards us at about the same time; whichever SYN gets through first, both ends
+        // end up with one connection. A SYN dropped by the remote NAT is retransmitted by the kernel within `timeout`.
+        // The existing connection on `localPort` keeps working: the four-tuple differs. A remote host that answers
+        // with RST before its side opened yields Refused — no retry here, the caller decides.
+        ConnectError connectSimultaneous(uint16_t localPort, const std::string& remoteAddress, int remotePort, std::chrono::milliseconds timeout);
+
         // Close and release the socket. Also called automatically from destructor.
         void disconnect();
 
@@ -52,6 +62,9 @@ namespace invilite::Transport {
         void onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> cb);
 
     private:
+        // Takes a freshly connected socket: keepalive, then the onConnect callback.
+        ConnectError adoptConnectedSocket(int connectedSocket, const sockaddr_storage& remoteAddress);
+
         int                                                                    clientSocket;
         std::function<void(int clientSocket, const sockaddr_storage*)>         onConnect_;
     };

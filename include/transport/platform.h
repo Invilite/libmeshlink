@@ -25,6 +25,12 @@ namespace invilite::Transport::Platform {
     // TCP mapping after minutes) and finds dead peers without our own ping. False when an option is refused.
     bool enableKeepalive(int socket, int idleSeconds, int intervalSeconds, int probes);
 
+    // Lets another socket bind to this socket's local port while it is in use (SO_REUSEADDR + SO_REUSEPORT). Set on every
+    // outgoing socket before connect: NAT hole punching (F7) later dials from the local port of an existing connection,
+    // and the kernel allows that only when every socket on the port opted in. Changes nothing for the connection itself;
+    // the TCP four-tuple still has to be unique. False when an option is refused.
+    bool allowLocalPortReuse(int socket);
+
     // Waits for readiness on several sockets — poll() on POSIX (WSAPoll() on Windows). Same contract as poll().
     int waitForSockets(pollfd* sockets, size_t count, int timeoutMs);
 
