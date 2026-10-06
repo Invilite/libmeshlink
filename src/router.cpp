@@ -1,4 +1,5 @@
 #include "meshlink/router.h"
+#include "meshlink/signed_peer_record.h"
 #include "meshlink/network.h"
 #include "meshlink/thread_safe_queue.h"
 #include "meshlink/thread_signals.h"
@@ -425,7 +426,9 @@ void Router::sendDuePresenceReplies(std::chrono::steady_clock::time_point now) {
         ++this->presenceRepliesInWindow;
         this->rememberPresenceReply(sender, now);
         ++this->presenceRepliesSent;
-        this->sendOwnRouterMessage(this->buildRouterMessage(sender, RouterWire::SUBTYPE_PRESENCE_REPLY, {}));
+        // Our record goes along: the PRESENCE came from a joiner, which by definition lacks it — it verifies us at once,
+        // without parking the answer and asking a neighbor for the record (a small queue would drop answers meanwhile)
+        this->sendOwnRouterMessage(this->buildRouterMessage(sender, RouterWire::SUBTYPE_PRESENCE_REPLY, this->network.getSelfRecord()));
     }
 }
 
@@ -689,6 +692,15 @@ void Router::handleIncomingSigned(RoutedMessage message, const PeerId& receivedF
 
     const auto senderEntry = this->peerDirectory->findPeer(message.sender);
     if (!senderEntry) {
+        // A PRESENCE_REPLY carries its sender's record: self-signed, and its keys must give the sender's PeerId. It is
+        // only used to verify this message (storing records is Network's address-book policy, not the Router's).
+        SignedPeerRecord attached;
+        if (message.group == RouterWire::ROUTER_PROTOCOL_GROUP && message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY && !message.payload.empty()
+            && SignedPeerRecordCodec::deserialize(message.payload, attached) == SignedRecordStatus::Success && attached.peerId == message.sender) {
+            const auto key = attached.ed25519Pub;
+            this->acceptWithKey(std::move(message), receivedFrom, key);
+            return;
+        }
         this->awaitSenderRecord(std::move(message), receivedFrom);
         return;
     }

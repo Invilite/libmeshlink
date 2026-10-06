@@ -174,7 +174,7 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_RECORD_ROUTE          = 0x0102;                  // route probe (R-5)
         constexpr uint16_t SUBTYPE_ROUTE_REPORT          = 0x0103;                  // probe answer from the destination (R-5)
         constexpr uint16_t SUBTYPE_PRESENCE              = 0x0104;                  // "I am here": a node's Router to every other Router, empty — teaches the way back to it
-        constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender, empty — teaches it the way back to us
+        constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender — teaches it the way back to us; carries our SignedPeerRecord (a joiner lacks it)
         constexpr uint16_t SUBTYPE_STATE_QUERY           = 0x0106;                  // "show me your state" — diagnostics, `meshlink map` (state_report_wire.h)
         constexpr uint16_t SUBTYPE_STATE_REPORT          = 0x0107;                  // answer to STATE_QUERY, to its sender
         constexpr uint16_t SUBTYPE_TREE_BEACON           = 0x0108;                  // "I shape the broadcast tree": the tree root to every Router, empty (docs/router.md 4.3)

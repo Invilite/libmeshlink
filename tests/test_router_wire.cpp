@@ -661,15 +661,25 @@ TEST(RouterWireTest, PresenceTravelsToEveryNodeOnly) {
     EXPECT_EQ(decodeFrame(ack, out), RoutedMessageStatus::PresenceToOneNode);
 }
 
-TEST(RouterWireTest, PresenceReplyIsAnEmptyRouterMessageToOneNode) {
+// PRESENCE_REPLY carries its sender's record (2026-10-06) — or nothing, from an older node; TREE_BEACON stays empty
+TEST(RouterWireTest, PresenceReplyCarriesARecordTreeBeaconIsEmpty) {
     const auto sender = LocalIdentity::generate();
     RoutedMessage reply = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
     reply.subtype = RouterWire::SUBTYPE_PRESENCE_REPLY;
-    reply.payload.clear();
-    reply.signature = sender.sign(RouterWire::bytesToSign(reply));
     RoutedMessage out;
-    EXPECT_EQ(decodeFrame(RouterWire::encode(reply), out), RoutedMessageStatus::Success);
-    reply.payload = { 1 };
-    reply.signature = sender.sign(RouterWire::bytesToSign(reply));
-    EXPECT_EQ(decodeFrame(RouterWire::encode(reply), out), RoutedMessageStatus::MalformedEncoding);
+    for (const std::vector<uint8_t>& payload : { std::vector<uint8_t>{}, std::vector<uint8_t>(200, 0x5A) }) {
+        reply.payload = payload;
+        reply.signature = sender.sign(RouterWire::bytesToSign(reply));
+        EXPECT_EQ(decodeFrame(RouterWire::encode(reply), out), RoutedMessageStatus::Success);
+        EXPECT_EQ(out.payload, payload);
+    }
+
+    RoutedMessage beacon = makeMessage(sender, RoutingMode::Broadcast, Content::Ack);
+    beacon.subtype = RouterWire::SUBTYPE_TREE_BEACON;
+    beacon.payload.clear();
+    beacon.signature = sender.sign(RouterWire::bytesToSign(beacon));
+    EXPECT_EQ(decodeFrame(RouterWire::encode(beacon), out), RoutedMessageStatus::Success);
+    beacon.payload = { 1 };
+    beacon.signature = sender.sign(RouterWire::bytesToSign(beacon));
+    EXPECT_EQ(decodeFrame(RouterWire::encode(beacon), out), RoutedMessageStatus::MalformedEncoding);   // a beacon is empty
 }

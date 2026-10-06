@@ -984,7 +984,7 @@ void Network::handleWakeup() {
                 // for a replaced connection is skipped once that peer is Closing.
                 if (dismissedPeer) {
                     ++this->inboundDismissedForNoSlots;
-                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Dismissed, dismissedPeer, GoodbyeReason::NoSlots });
+                    this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Dismissed, dismissedPeer, GoodbyeReason::NoSlots, std::string() });
                 }
                 if (activatedPeer) {
                     const std::string connectedFrom = activatedPeer->isOutbound() ? std::string() : activatedPeer->getConnection()->getRemoteClientAddress();

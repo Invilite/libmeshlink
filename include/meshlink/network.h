@@ -202,6 +202,8 @@ namespace invilite::Mesh {
         std::vector<ObservedSelfAddress> getObservedSelfAddresses() const;
         size_t                          getConnectedPeerCount() const;
         NetworkDiagnostics              getDiagnostics() const;
+        // This node's SignedPeerRecord as sent in HELLO (serialized); built by start(), empty before it
+        std::vector<uint8_t>            getSelfRecord() const { return this->selfRecordSerialized; }
 
         // Returns snapshot of known peers (learned via HELLO or PEX_ANNOUNCE).
         // Convenience wrapper over peerDirectory — equivalent to projecting `record` from each KnownPeer.

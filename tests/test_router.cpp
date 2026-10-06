@@ -1755,6 +1755,28 @@ TEST(RouterTest, LateJoinerLearnsEveryoneThroughASmallVerificationQueue) {
     gamma.network->stop();
 }
 
+// Each PRESENCE_REPLY carries its sender's record, so a joiner verifies every answer at once — even with no room at all
+// for messages from unknown senders (nothing parked, no PEX_REQUEST, no race between answers)
+TEST(RouterTest, LateJoinerVerifiesAnswersByTheirAttachedRecords) {
+    RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 200ms; },
+                    [](NetworkConfig& config) { config.initialPexBatchSize = 0; });  // no gossip: the joiner knows only its neighbor's record
+    ASSERT_TRUE(mesh.ready);
+
+    TestNode gamma(mesh.secret, "gamma");
+    gamma.network->start();
+    gamma.network->connectToPeer("127.0.0.1", mesh.nodes[4]->port);
+    RouterConfig joinerConfig;
+    joinerConfig.pendingVerificationPerNeighbor = 0;
+    Router gammaRouter(*gamma.network, gamma.directory, gamma.identity, joinerConfig);
+    gammaRouter.start();
+    EXPECT_TRUE(waitUntil([&] {
+        for (size_t i = 0; i < 5; ++i) if (gammaRouter.getRouteCandidates(mesh.id(i)).empty()) return false;
+        return true;
+    }, 8s));
+    gammaRouter.stop();
+    gamma.network->stop();
+}
+
 // Review PRESENCE I2: one node's answers together are budgeted — the rest wait for the next second, none is lost
 TEST(RouterTest, PresenceRepliesAreBudgetedPerSecond) {
     RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) {
