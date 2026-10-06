@@ -1545,6 +1545,28 @@ void Network::markRecordsAnnounced(const std::vector<PeerId>& recordIds) {
     }
 }
 
+std::vector<RememberedPeer> Network::exportKnownPeers() const {
+    std::vector<RememberedPeer> remembered;
+    for (const KnownPeer& known : this->peerDirectory->listPeers()) remembered.push_back({ known.record, known.hasEverConnected });
+    return remembered;
+}
+
+size_t Network::importKnownPeers(const std::vector<RememberedPeer>& peers) {
+    if (this->running.load()) return 0;
+    size_t taken = 0;
+    for (const RememberedPeer& peer : peers) {
+        if (peer.record.peerId == this->selfIdentity->getPeerId()) continue;
+        SignedPeerRecord verified;
+        if (SignedPeerRecordCodec::deserialize(SignedPeerRecordCodec::serialize(peer.record), verified) != SignedRecordStatus::Success || verified.peerId != peer.record.peerId) continue;
+        const PeerId peerId = verified.peerId;
+        // "Ever worked" is the evidence an outbound match gives: hasEverConnected, Available — dialed right away
+        this->upsertKnownPeer(std::move(verified), peer.hasEverConnected);
+        if (this->peerDirectory->findPeer(peerId)) ++taken;
+    }
+    this->log.format(LogLevel::Info, "address book: {} of {} remembered peer(s) taken", taken, peers.size());
+    return taken;
+}
+
 // ============================================================
 // Common known-peer insert/update for HELLO and PEX_ANNOUNCE
 // ============================================================

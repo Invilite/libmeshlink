@@ -573,6 +573,52 @@ TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
     for (auto* node : { &dismissed, &first, &full }) node->network->stop();
 }
 
+// Remembered peers survive a restart: a node given its address book back dials a peer that worked before by itself
+TEST(NetworkIntegrationTest, ImportedAddressBookIsDialedAfterRestart) {
+    const auto secret = makeSecret();
+    TestNode listener(secret, "listener");
+    listener.network->start();
+    std::vector<RememberedPeer> remembered;
+    {
+        TestNode before(secret, "before");
+        before.network->start();
+        before.network->connectToPeer("127.0.0.1", listener.port);
+        ASSERT_TRUE(waitUntil([&] { const auto e = before.knownPeer(listener); return e && e->hasEverConnected; }, 5s));
+        remembered = before.network->exportKnownPeers();
+        before.network->stop();
+    }
+    ASSERT_FALSE(remembered.empty());
+
+    TestNode after(secret, "after");
+    EXPECT_EQ(after.network->importKnownPeers(remembered), 1u);
+    const auto entry = after.knownPeer(listener);
+    ASSERT_TRUE(entry.has_value());
+    EXPECT_TRUE(entry->hasEverConnected);
+    EXPECT_EQ(entry->availability, AvailabilityState::Available);
+    after.network->start();
+    EXPECT_TRUE(waitUntil([&] { return after.network->getConnectedPeerCount() == 1; }, 10s)) << "Topology did not dial the remembered peer";
+    EXPECT_EQ(after.network->importKnownPeers(remembered), 0u);                               // only before start()
+
+    after.network->stop();
+    listener.network->stop();
+}
+
+// The file may be tampered with: a record whose signature no longer matches is not taken; our own record is skipped
+TEST(NetworkIntegrationTest, ImportRefusesTamperedAndOwnRecords) {
+    const auto secret = makeSecret();
+    TestNode node(secret, "node");
+    const auto other = LocalIdentity::generate();
+    SignedPeerRecord genuine = makeSignedRecord(other, { ipv4("127.0.0.1", pickUnusedPort()) }, std::chrono::system_clock::now());
+    SignedPeerRecord tampered = genuine;
+    tampered.addresses = { ipv4("10.9.8.7", 4242) };                                          // the signature covers the addresses
+    const SignedPeerRecord own = node.identity->buildSelfRecord({ ipv4("127.0.0.1", node.port) });
+
+    EXPECT_EQ(node.network->importKnownPeers({ { tampered, true }, { own, true } }), 0u);
+    EXPECT_EQ(node.directory->size(), 0u);
+    EXPECT_EQ(node.network->importKnownPeers({ { genuine, false } }), 1u);
+    EXPECT_EQ(node.directory->findPeer(genuine.peerId)->availability, AvailabilityState::Unknown);   // never worked: the probe decides
+}
+
 // DIAG b: the snapshot the Router's STATE_REPORT is built from — links, limits, address book
 TEST(NetworkIntegrationTest, DiagnosticsDescribeLinksLimitsAndAddressBook) {
     const auto secret = makeSecret();

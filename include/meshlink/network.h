@@ -126,6 +126,13 @@ namespace invilite::Mesh {
         PeerId excludePeerId;                                                           // source — we never send back to where we learned it from
     };
 
+    // An address book entry worth keeping across restarts: the peer's signed record and whether it ever worked for us.
+    // Storing them is the application's job (meshlinkd: state-dir/known_peers); Network only exports and imports.
+    struct RememberedPeer {
+        SignedPeerRecord    record;
+        bool                hasEverConnected = false;
+    };
+
     // Read-only snapshot for diagnostics (the Router's STATE_REPORT, docs/router.md 4.6 sections B and F). Taken from
     // several sources one after another, so the parts may differ by a moment.
     struct NetworkDiagnostics {
@@ -208,6 +215,14 @@ namespace invilite::Mesh {
         // Returns snapshot of known peers (learned via HELLO or PEX_ANNOUNCE).
         // Convenience wrapper over peerDirectory — equivalent to projecting `record` from each KnownPeer.
         std::vector<SignedPeerRecord>   getKnownPeers() const;
+
+        // The address book to keep across restarts (every entry; bounded by maxKnownPeers)
+        std::vector<RememberedPeer>     exportKnownPeers() const;
+        // Before start() only (the address book is the management thread's afterwards): takes remembered peers back. Each
+        // record's signature and PeerId are checked again (a file can be tampered with), our own is skipped, the address
+        // book limit (R2) applies. A peer that ever worked starts Available — Topology dials it at once; one that does not
+        // answer goes to the probe after connectionFailuresBeforeUnavailable dials (B8). Returns how many were taken.
+        size_t                          importKnownPeers(const std::vector<RememberedPeer>& peers);
 
     private:
         struct Command {
