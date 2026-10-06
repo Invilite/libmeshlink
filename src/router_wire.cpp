@@ -1,4 +1,5 @@
 #include "meshlink/router_wire.h"
+#include "wire_bytes.h"
 
 #include <botan/ed25519.h>
 #include <botan/pubkey.h>
@@ -8,10 +9,15 @@
 
 namespace invilite::Mesh::RouterWire {
 
+using WireBytes::WireReader;
+using WireBytes::writeBE16;
+using WireBytes::writeBE32;
+using WireBytes::writeBE64;
+using WireBytes::PEER_ID_SIZE;
+
 namespace {
     constexpr std::string_view SIGNATURE_DOMAIN = "MeshLink-Router-V1";
 
-    constexpr size_t  PEER_ID_SIZE          = 32;
     constexpr size_t  ED25519_PUB_SIZE      = 32;
     constexpr size_t  MAX_LIST_ENTRIES      = 255;                                  // 1-byte count of the source route
     constexpr size_t  MAX_TLV_LENGTH        = 0xFFFF;                               // 2-byte TLV length and extensions total length
@@ -30,19 +36,6 @@ namespace {
         return std::find(std::begin(KNOWN_EXTENSION_TYPES), std::end(KNOWN_EXTENSION_TYPES), type) != std::end(KNOWN_EXTENSION_TYPES);
     }
 
-    void writeBE16(std::vector<uint8_t>& out, uint16_t v) {
-        out.push_back(static_cast<uint8_t>(v >> 8));
-        out.push_back(static_cast<uint8_t>(v));
-    }
-
-    void writeBE32(std::vector<uint8_t>& out, uint32_t v) {
-        for (int shift = 24; shift >= 0; shift -= 8) out.push_back(static_cast<uint8_t>(v >> shift));
-    }
-
-    void writeBE64(std::vector<uint8_t>& out, uint64_t v) {
-        for (int shift = 56; shift >= 0; shift -= 8) out.push_back(static_cast<uint8_t>(v >> shift));
-    }
-
     void writePeerIds(std::vector<uint8_t>& out, const std::vector<PeerId>& ids) {
         for (const PeerId& id : ids) out.insert(out.end(), id.begin(), id.end());
     }
@@ -52,52 +45,6 @@ namespace {
         writeBE16(out, static_cast<uint16_t>(extension.value.size()));
         out.insert(out.end(), extension.value.begin(), extension.value.end());
     }
-
-    // Bounds-checked sequential reader over a received span. Every read fails (returns false) instead of overrunning.
-    class WireReader {
-    public:
-        explicit WireReader(std::span<const uint8_t> data) : data(data) {}
-
-        size_t remaining() const { return data.size() - offset; }
-
-        bool readBytes(size_t count, std::span<const uint8_t>& out) {
-            if (count > remaining()) return false;
-            out = data.subspan(offset, count);
-            offset += count;
-            return true;
-        }
-
-        bool readU8(uint8_t& out) {
-            if (remaining() < 1) return false;
-            out = data[offset++];
-            return true;
-        }
-
-        bool readUnsignedBE(size_t width, uint64_t& out) {
-            if (remaining() < width) return false;
-            out = 0;
-            for (size_t i = 0; i < width; ++i) out = (out << 8) | data[offset++];
-            return true;
-        }
-
-        bool readPeerId(PeerId& out) {
-            std::span<const uint8_t> bytes;
-            if (!readBytes(PEER_ID_SIZE, bytes)) return false;
-            std::copy(bytes.begin(), bytes.end(), out.begin());
-            return true;
-        }
-
-        bool readPeerIds(size_t count, std::vector<PeerId>& out) {
-            if (count > remaining() / PEER_ID_SIZE) return false;                   // check before allocating
-            out.resize(count);
-            for (PeerId& id : out) readPeerId(id);
-            return true;
-        }
-
-    private:
-        std::span<const uint8_t> data;
-        size_t                   offset = 0;
-    };
 
     uint8_t versionAndModeByte(const RoutedMessage& message) {
         return static_cast<uint8_t>(WIRE_VERSION << 4) | static_cast<uint8_t>(message.mode);
