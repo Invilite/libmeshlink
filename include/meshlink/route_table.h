@@ -15,24 +15,30 @@
 
 namespace invilite::Mesh {
 
-    // How we know a route — only from messages signed by the destination itself (D5): a relay can suggest a bad route,
-    // never make one look confirmed
-    enum class RouteEvidence : uint8_t {
-        Broadcast = 0,                                                              // the destination's broadcast came in over this neighbor
-        Ack       = 1,                                                              // the destination's ACK came in over it: a round trip worked
+    // Standing of a candidate, best first (docs/router.md 4.4a). Only messages signed by the destination count (D5).
+    enum class RouteTier : uint8_t {
+        Measured  = 0,                                                              // our round-trip probe through this neighbor came back over it
+        Delivered = 1,                                                              // an ACK answered a message we handed this neighbor
+        Hinted    = 2,                                                              // the destination's signed message came in over it — "somewhere behind"
+        Failing   = 3,                                                              // the last measurement or awaited ACK failed
     };
 
     struct RouteCandidate {
-        PeerId                                  via{};                              // neighbor to hand the message to
-        uint8_t                                 hops = 0;                           // to the destination, 1 = the neighbor itself
-        RouteEvidence                           evidence = RouteEvidence::Broadcast;    // strongest seen for this neighbor
-        std::chrono::steady_clock::time_point   lastConfirmedAt;
-        std::optional<std::chrono::milliseconds> rtt;                               // smoothed, from ACKs
+        PeerId                                      via{};                          // neighbor to hand the message to
+        uint8_t                                     hops = 0;                       // to the destination, 1 = the neighbor itself; from unsigned TTL, a hint
+        std::chrono::steady_clock::time_point       lastHeardAt;                    // latest hint, delivery or measurement
+        uint32_t                                    deliveries = 0;                 // ACKs for our messages sent through it
+        std::optional<std::chrono::milliseconds>    rtt;                            // round-trip probe through it, smoothed
+        std::optional<std::chrono::steady_clock::time_point> measuredAt;
+        uint8_t                                     failures = 0;                   // in a row; a success clears them
+
+        [[nodiscard]] RouteTier tier() const;
     };
 
     struct RouteTableConfig {
         size_t  candidatesPerDestination = 3;
         size_t  maxDestinations          = 4096;                                    // identities are free to mint: memory is bounded, least recently heard first
+        uint8_t failuresToForget         = 3;                                       // failures in a row that remove a candidate
     };
 
     // Point-to-point routes learned from traffic (docs/router.md 4.4): per destination a few neighbors it was heard
@@ -43,13 +49,23 @@ namespace invilite::Mesh {
     public:
         explicit RouteTable(RouteTableConfig config = {});
 
-        // `destination` reached us over `via` in `hops`. Newer data for the same neighbor replaces hops and refreshes
-        // the entry; an ACK-confirmed neighbor stays confirmed; an RTT is smoothed into the previous one.
-        void learn(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::chrono::steady_clock::time_point now,
-                   std::optional<std::chrono::milliseconds> rtt = std::nullopt);
+        // A hint: a message signed by `destination` came in over `via`, `hops` away. Refreshes, or adds the candidate when
+        // there is room (or it beats the worst); never touches deliveries or measurements.
+        void learn(const PeerId& destination, const PeerId& via, uint8_t hops, std::chrono::steady_clock::time_point now);
 
-        // Neighbors to try for `destination`, best first: ACK-confirmed, then fewer hops, then lower RTT, then most
-        // recently confirmed. `excluded` (where the message came from) is left out.
+        // The destination acknowledged a message we handed `via` (docs/router.md 4.4a): it works, maybe not symmetrically.
+        // A direct neighbor (`via` == `destination`) is added if missing; anyone else must already be a candidate.
+        void recordDelivery(const PeerId& destination, const PeerId& via, std::chrono::steady_clock::time_point now);
+
+        // Our probe through `via` came back the same way: `rtt` for the whole loop, `hops` as recorded. Adds the
+        // candidate when missing (a measured route is worth more than any hint).
+        void recordMeasurement(const PeerId& destination, const PeerId& via, uint8_t hops, std::chrono::milliseconds rtt, std::chrono::steady_clock::time_point now);
+
+        // A measurement failed, or an awaited ACK did not come. Removes the candidate after failuresToForget in a row.
+        void recordFailure(const PeerId& destination, const PeerId& via);
+
+        // Neighbors to try for `destination`, best first (RouteTier, then RTT / hops / failures). `excluded` (where the
+        // message came from) is left out.
         [[nodiscard]] std::vector<PeerId> nextHops(const PeerId& destination, const std::optional<PeerId>& excluded = std::nullopt) const;
 
         [[nodiscard]] std::vector<RouteCandidate> candidates(const PeerId& destination) const;   // best first (diagnostics, tests)
@@ -67,10 +83,16 @@ namespace invilite::Mesh {
             std::list<PeerId>::iterator             recency;                        // position in leastRecentFirst
         };
 
-        void eraseDestination(std::unordered_map<PeerId, Destination, PeerIDHash>::iterator entry);
+        using Destinations = std::unordered_map<PeerId, Destination, PeerIDHash>;
+
+        void eraseDestination(Destinations::iterator entry);
+        // The destination's entry, created when `create` (evicting the least recently heard at the limit); marks it heard
+        Destination* touch(const PeerId& destination, bool create);
+        // Adds `fresh` if there is room or it beats the worst candidate; false when it was not taken
+        bool admit(Destination& entry, const RouteCandidate& fresh);
 
         RouteTableConfig                                        config;
-        std::unordered_map<PeerId, Destination, PeerIDHash>    byDestination;
+        Destinations                                            byDestination;
         std::list<PeerId>                                       leastRecentFirst;   // destinations by last time anything was learned
     };
 

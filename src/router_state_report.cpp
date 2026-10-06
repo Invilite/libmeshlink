@@ -80,8 +80,8 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         routes.destinationCount = static_cast<uint32_t>(this->routes.destinationCount());
         for (const auto& [destination, candidates] : this->routes.destinationsPage(query.routeOffset, query.routeCount)) {
             for (const RouteCandidate& candidate : candidates) {
-                routes.routes.push_back({ destination, candidate.via, candidate.hops, static_cast<uint8_t>(candidate.evidence),
-                                          candidate.rtt ? std::optional(clampedMs(*candidate.rtt)) : std::nullopt, clampedMs(now - candidate.lastConfirmedAt) });
+                routes.routes.push_back({ destination, candidate.via, candidate.hops, static_cast<uint8_t>(candidate.tier()),
+                                          candidate.rtt ? std::optional(clampedMs(*candidate.rtt)) : std::nullopt, clampedMs(now - candidate.lastHeardAt) });
             }
         }
     }

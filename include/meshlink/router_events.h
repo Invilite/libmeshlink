@@ -44,6 +44,8 @@ namespace invilite::Mesh {
         std::vector<RouteHop>       hops;                                           // relays in order; offsets in ms after sending (synchronized clocks)
         uint32_t                    receivedOffsetMs = 0;                           // at the destination
         std::chrono::milliseconds   rtt{0};                                         // probe out + report back, our clock only
+        std::optional<PeerId>       firstHop;                                       // the neighbor the probe was handed to, when one
+        bool                        returnedSameWay = false;                        // the report came back over the reversed route: a measurement (docs/router.md 4.4a)
     };
 
     // A message we sent along a source route (Router::sendAlongRoute) did not get through: a relay of the route reported

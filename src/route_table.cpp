@@ -4,53 +4,115 @@
 
 namespace invilite::Mesh {
 
+RouteTier RouteCandidate::tier() const {
+    if (this->failures > 0) return RouteTier::Failing;
+    if (this->rtt)          return RouteTier::Measured;
+    if (this->deliveries)   return RouteTier::Delivered;
+    return RouteTier::Hinted;
+}
+
 namespace {
-    // Ranking of docs/router.md 4.4: ACK-confirmed first, then fewer hops, lower RTT (unknown last), most recent
+    // docs/router.md 4.4a: measured (by RTT), delivered, hinted (by hops, then freshness), failing (by failures)
     bool isBetter(const RouteCandidate& a, const RouteCandidate& b) {
-        if (a.evidence != b.evidence) return a.evidence == RouteEvidence::Ack;
+        if (a.tier() != b.tier()) return a.tier() < b.tier();
+        switch (a.tier()) {
+            case RouteTier::Measured: if (*a.rtt != *b.rtt) return *a.rtt < *b.rtt; break;
+            case RouteTier::Failing:  if (a.failures != b.failures) return a.failures < b.failures; break;
+            default: break;
+        }
         if (a.hops != b.hops) return a.hops < b.hops;
-        if (a.rtt.has_value() != b.rtt.has_value()) return a.rtt.has_value();
-        if (a.rtt && *a.rtt != *b.rtt) return *a.rtt < *b.rtt;
-        return a.lastConfirmedAt > b.lastConfirmedAt;
+        return a.lastHeardAt > b.lastHeardAt;
     }
 
     std::chrono::milliseconds smoothed(std::chrono::milliseconds previous, std::chrono::milliseconds sample) {
         return (3 * previous + sample) / 4;                                         // EWMA, weight 1/4 for the new sample
     }
+
+    std::vector<RouteCandidate>::iterator findVia(std::vector<RouteCandidate>& candidates, const PeerId& via) {
+        return std::find_if(candidates.begin(), candidates.end(), [&](const RouteCandidate& c) { return c.via == via; });
+    }
 }
 
 RouteTable::RouteTable(RouteTableConfig config) : config(config) {}
 
-void RouteTable::learn(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::chrono::steady_clock::time_point now,
-                       std::optional<std::chrono::milliseconds> rtt) {
-    if (hops == 0 || this->config.candidatesPerDestination == 0 || this->config.maxDestinations == 0) return;
-
+RouteTable::Destination* RouteTable::touch(const PeerId& destination, bool create) {
     auto found = this->byDestination.find(destination);
     if (found == this->byDestination.end()) {
+        if (!create || this->config.maxDestinations == 0) return nullptr;
         if (this->byDestination.size() >= this->config.maxDestinations) this->eraseDestination(this->byDestination.find(this->leastRecentFirst.front()));
         this->leastRecentFirst.push_back(destination);
         found = this->byDestination.emplace(destination, Destination{ {}, std::prev(this->leastRecentFirst.end()) }).first;
     } else {
         this->leastRecentFirst.splice(this->leastRecentFirst.end(), this->leastRecentFirst, found->second.recency);   // heard of it now
     }
+    return &found->second;
+}
 
-    auto& candidates = found->second.candidates;
-    const auto existing = std::find_if(candidates.begin(), candidates.end(), [&](const RouteCandidate& c) { return c.via == via; });
-    if (existing != candidates.end()) {
-        // Newer data replaces — except that a broadcast's hop count (unsigned, a relay can lower it) never rewrites an
-        // ACK-confirmed candidate (review R-5 M1)
-        if (evidence == RouteEvidence::Ack || existing->evidence != RouteEvidence::Ack) existing->hops = hops;
-        existing->lastConfirmedAt = now;
-        if (evidence == RouteEvidence::Ack) existing->evidence = RouteEvidence::Ack;
-        if (rtt) existing->rtt = existing->rtt ? smoothed(*existing->rtt, *rtt) : *rtt;
-    } else {
-        const RouteCandidate fresh{ via, hops, evidence, now, rtt };
-        if (candidates.size() >= this->config.candidatesPerDestination) {
-            if (!isBetter(fresh, candidates.back())) return;                        // the known ones are all at least as good
-            candidates.pop_back();
-        }
-        candidates.push_back(fresh);
+bool RouteTable::admit(Destination& entry, const RouteCandidate& fresh) {
+    if (this->config.candidatesPerDestination == 0) return false;
+    if (entry.candidates.size() >= this->config.candidatesPerDestination) {
+        if (!isBetter(fresh, entry.candidates.back())) return false;                 // the known ones are all at least as good
+        entry.candidates.pop_back();
     }
+    entry.candidates.push_back(fresh);
+    return true;
+}
+
+void RouteTable::learn(const PeerId& destination, const PeerId& via, uint8_t hops, std::chrono::steady_clock::time_point now) {
+    if (hops == 0) return;
+    Destination* entry = this->touch(destination, true);
+    if (!entry) return;
+    if (const auto existing = findVia(entry->candidates, via); existing != entry->candidates.end()) {
+        // A hint's hop count is unsigned (a relay can lower it): it never rewrites what a probe recorded (review R-5 M1)
+        if (!existing->rtt) existing->hops = hops;
+        existing->lastHeardAt = now;
+    } else if (!this->admit(*entry, RouteCandidate{ via, hops, now }) && entry->candidates.empty()) {
+        this->eraseDestination(this->byDestination.find(destination));
+        return;
+    }
+    std::sort(entry->candidates.begin(), entry->candidates.end(), isBetter);
+}
+
+void RouteTable::recordDelivery(const PeerId& destination, const PeerId& via, std::chrono::steady_clock::time_point now) {
+    Destination* entry = this->touch(destination, via == destination);
+    if (!entry) return;
+    auto existing = findVia(entry->candidates, via);
+    if (existing == entry->candidates.end()) {
+        if (via != destination || !this->admit(*entry, RouteCandidate{ via, 1, now })) return;
+        existing = std::prev(entry->candidates.end());
+    }
+    ++existing->deliveries;
+    existing->failures = 0;
+    existing->lastHeardAt = now;
+    std::sort(entry->candidates.begin(), entry->candidates.end(), isBetter);
+}
+
+void RouteTable::recordMeasurement(const PeerId& destination, const PeerId& via, uint8_t hops, std::chrono::milliseconds rtt, std::chrono::steady_clock::time_point now) {
+    if (hops == 0) return;
+    Destination* entry = this->touch(destination, true);
+    if (!entry) return;
+    auto existing = findVia(entry->candidates, via);
+    if (existing == entry->candidates.end()) {
+        if (!this->admit(*entry, RouteCandidate{ via, hops, now, 0, rtt, now })) return;
+        existing = std::prev(entry->candidates.end());
+    } else {
+        existing->rtt = existing->rtt ? smoothed(*existing->rtt, rtt) : rtt;
+    }
+    existing->hops       = hops;                                                    // as the probe recorded it — better than a TTL hint
+    existing->measuredAt = now;
+    existing->failures   = 0;
+    existing->lastHeardAt = now;
+    std::sort(entry->candidates.begin(), entry->candidates.end(), isBetter);
+}
+
+void RouteTable::recordFailure(const PeerId& destination, const PeerId& via) {
+    const auto found = this->byDestination.find(destination);
+    if (found == this->byDestination.end()) return;
+    auto& candidates = found->second.candidates;
+    const auto existing = findVia(candidates, via);
+    if (existing == candidates.end()) return;
+    if (++existing->failures >= this->config.failuresToForget) candidates.erase(existing);
+    if (candidates.empty()) { this->eraseDestination(found); return; }
     std::sort(candidates.begin(), candidates.end(), isBetter);
 }
 
@@ -99,7 +161,7 @@ void RouteTable::forgetRoute(const PeerId& destination, const PeerId& via) {
     if (found->second.candidates.empty()) this->eraseDestination(found);
 }
 
-void RouteTable::eraseDestination(std::unordered_map<PeerId, Destination, PeerIDHash>::iterator entry) {
+void RouteTable::eraseDestination(Destinations::iterator entry) {
     this->leastRecentFirst.erase(entry->second.recency);
     this->byDestination.erase(entry);
 }

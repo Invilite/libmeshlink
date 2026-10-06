@@ -84,8 +84,9 @@ struct Router::Event {
     struct FrameReceived        { NetworkMessage message; };
     struct SendRequested        { RoutedMessage message; };                         // built (and signed when required) by broadcast() / send()
     struct OwnStateRequested    { uint64_t queryMsgId; StateReportWire::StateQuery query; };   // queryState() of this node
+    struct MeasureRequested     { RoutedMessage probe; PeerId via; };            // measureRoute(): signed by the caller
 
-    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, SendRequested, OwnStateRequested> content;
+    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, SendRequested, OwnStateRequested, MeasureRequested> content;
 };
 
 // The only object Network holds: it owns the queue, so Network may outlive the Router without dangling.
@@ -104,7 +105,9 @@ Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, s
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
       log(logger ? std::move(logger) : network.getLogger(), "Router"),
       inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity), unsignedSeenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
-      plumtree(config.plumtree), treeRootElection(this->selfIdentity->getPeerId(), config.treeRoot), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
+      plumtree(config.plumtree), treeRootElection(this->selfIdentity->getPeerId(), config.treeRoot),
+      probeScheduler([&] { ProbeSchedulerConfig probing = config.routeEvaluation.probing; probing.probeTimeout = config.routeEvaluation.probeTimeout; return probing; }()),
+      broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
 
 Router::~Router() {
     this->stop();
@@ -121,6 +124,12 @@ void Router::start() {
     this->routeErrorReportedAt.clear();
     this->awaitedReplies.clear();
     this->awaitedReplyOrder.clear();
+    this->answerDeadlines.clear();
+    {
+        ProbeSchedulerConfig probing = this->config.routeEvaluation.probing;
+        probing.probeTimeout = this->config.routeEvaluation.probeTimeout;
+        this->probeScheduler = ProbeScheduler(probing);
+    }
     this->plumtree       = PlumtreeState(this->config.plumtree);
     if (this->config.treeRoot.enabled) this->treeRootElection.start(std::chrono::steady_clock::now(), this->treeRootListeningTime());
     {
@@ -193,6 +202,14 @@ std::optional<uint64_t> Router::recordRoute(const PeerId& destination) {
     return msgId;
 }
 
+std::optional<uint64_t> Router::measureRoute(const PeerId& destination, const PeerId& via) {
+    if (!this->running.load() || this->config.unicastTtl == 0 || destination == this->selfIdentity->getPeerId() || !this->isNeighbor(via)) return std::nullopt;
+    RoutedMessage probe = this->buildRouterMessage(destination, RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ currentUnixMs(), {} }));
+    const uint64_t msgId = probe.msgId;
+    this->inbox->events.push({ Event::MeasureRequested{ std::move(probe), via } });   // signed here, off the Router thread
+    return msgId;
+}
+
 std::optional<uint64_t> Router::send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options) {
     if (!this->running.load() || group > RouterWire::MAX_ROUTED_GROUP || this->config.unicastTtl == 0 || destination == this->selfIdentity->getPeerId()) return std::nullopt;
 
@@ -261,7 +278,7 @@ RouterStatistics Router::getStatistics() const {
              this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load(),
              this->stateRepliesSent.load(), this->delivered.load(), this->unicastForwarded.load(), this->acksReceived.load(), this->routeErrorsReceived.load(),
              this->ihaveKeysReceived.load(), this->graftsReceived.load(), this->prunesReceived.load(), this->graftsForMissing.load(), this->unknownModeReportsSent.load(),
-             this->clockWindowRejections.load(), this->treeBeaconsSent.load() };
+             this->clockWindowRejections.load(), this->treeBeaconsSent.load(), this->routeMeasurements.load(), this->routeFailures.load(), this->scheduledProbes.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -296,6 +313,24 @@ void Router::routerLoop() {
         this->announcePresenceWhenDue(std::chrono::steady_clock::now());
         this->sendDuePresenceReplies(std::chrono::steady_clock::now());
         this->runTreeRootTimers(std::chrono::steady_clock::now());
+        this->sendScheduledProbes(std::chrono::steady_clock::now());
+    }
+}
+
+void Router::noteDataTraffic(const RoutedMessage& message) {
+    if (message.group <= RouterWire::MAX_ROUTED_GROUP && message.destination) this->probeScheduler.noteTraffic(*message.destination, std::chrono::steady_clock::now());
+}
+
+// docs/router.md 4.4a: urgent, active, background — within probesPerSecond; quiet (no onRouteReported)
+void Router::sendScheduledProbes(std::chrono::steady_clock::time_point now) {
+    std::vector<ProbeScheduler::Probe> probes;
+    {
+        std::lock_guard lock(this->routesMutex);
+        probes = this->probeScheduler.takeDueProbes(now, this->routes);
+    }
+    for (const ProbeScheduler::Probe& probe : probes) {
+        ++this->scheduledProbes;
+        this->startMeasurement(this->buildRouterMessage(probe.destination, RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ currentUnixMs(), {} })), probe.via, false);
     }
 }
 
@@ -451,6 +486,11 @@ void Router::processEvent(Event& event) {
             this->broadcastCache.forgetNeighbor(content.peerId);
             {
                 std::lock_guard lock(this->routesMutex);
+                // Active destinations reached through it are measured again at once (docs/router.md 4.4a)
+                for (const PeerId& destination : this->probeScheduler.activeDestinations(std::chrono::steady_clock::now())) {
+                    const auto candidates = this->routes.candidates(destination);
+                    if (std::any_of(candidates.begin(), candidates.end(), [&](const RouteCandidate& c) { return c.via == content.peerId; })) this->probeScheduler.noteUrgent(destination);
+                }
                 this->routes.forgetNeighbor(content.peerId);                        // routes do not expire — they end with their neighbor
             }
             {
@@ -477,8 +517,16 @@ void Router::processEvent(Event& event) {
                                  isRouted ? std::optional(content.message.sourceRoute->hops) : std::nullopt);
             }
             this->rememberSeen(content.message);
-            if (isRouted) this->forwardRouted(content.message, std::nullopt);
-            else          this->forwardUnicast(content.message, std::nullopt);
+            const bool isRouteProbe = isRouterMessage && content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE;
+            const bool judgesRoute  = content.message.ackRequested || isRouteProbe;   // a STATE_QUERY's answer says nothing about the route
+            if (isRouteProbe) this->awaitedReplies[content.message.msgId].measuresRoute = true;
+            if (isRouted) {
+                this->forwardRouted(content.message, std::nullopt);
+            } else if (const std::optional<PeerId> firstHop = this->forwardUnicast(content.message, std::nullopt); firstHop && judgesRoute) {
+                this->setFirstHop(content.message.msgId, *firstHop, isRouteProbe ? this->config.routeEvaluation.probeTimeout : this->config.routeEvaluation.ackTimeout);
+            }
+        } else if constexpr (std::is_same_v<T, Event::MeasureRequested>) {
+            this->startMeasurement(content.probe, content.via, true);
         } else if constexpr (std::is_same_v<T, Event::OwnStateRequested>) {
             StateReportReceipt receipt{ this->selfIdentity->getPeerId(), content.queryMsgId, std::chrono::milliseconds(0), this->buildStateReport(content.query) };
             receipt.report.queryMsgId = content.queryMsgId;
@@ -571,6 +619,7 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
     this->dropExpiredAwaitedReplies(now);
+    this->checkAnswerDeadlines(now);
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -686,7 +735,7 @@ void Router::acceptWithKey(RoutedMessage message, const PeerId& receivedFrom, st
 
 void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId& receivedFrom) {
     // D6: the first copy came by the fastest path — the sender is reachable over that neighbor (signed, so D5 holds)
-    this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
+    this->learnRoute(message.sender, receivedFrom, hopsTraveled(message));
     if (message.group != RouterWire::ROUTER_PROTOCOL_GROUP) {                       // PRESENCE is for Routers, not applications
         this->deliverLocally(message, true);                                        // signature checked
         if (message.ackRequested) this->sendAck(message);                           // every node is an addressee
@@ -710,14 +759,14 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT) this->receiveRouteReportForUs(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) this->sendRouteReport(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_ERROR)  this->receiveRouteErrorForUs(message);
-        if (message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
+        if (message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message));
         if (message.subtype == RouterWire::SUBTYPE_STATE_QUERY)  this->answerStateQuery(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_STATE_REPORT) this->receiveStateReportForUs(message, receivedFrom);
         return;                                                                     // unknown subtype: nothing
     }
     // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee
     // over us — broadcast-grade evidence, or a relay replaying ACKs would look confirmed (review R-5 I2, D5)
-    if (isAnswer) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
+    if (isAnswer) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message));
     if (message.mode == RoutingMode::Routed) {                                      // e.g. a ROUTE_REPORT on the reversed route
         this->relayRouted(std::move(message), receivedFrom);
         return;
@@ -741,11 +790,18 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
 void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFrom) {
     AckPayload payload;
     RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
+    // The ACK may come back any way: for the neighbor it came over only a hint (docs/router.md 4.4a). What it proves is
+    // that the message we handed our first hop got through — a delivery for that route.
+    const auto awaited = this->awaitedReplies.find(payload.acknowledgedMsgId);
+    const std::optional<PeerId> firstHop = awaited != this->awaitedReplies.end() ? awaited->second.firstHop : std::nullopt;
     const auto rtt = this->acceptAnswer(payload.acknowledgedMsgId, ack.sender);
-    // A round trip we asked for confirms the route; an unsolicited ACK teaches it like a broadcast
-    this->learnRoute(ack.sender, receivedFrom, hopsTraveled(ack), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, rtt);
+    this->learnRoute(ack.sender, receivedFrom, hopsTraveled(ack));
     if (!rtt) return;                                                               // not asked for, not from the addressee, a repeat or too late
     ++this->acksReceived;
+    if (firstHop) {
+        std::lock_guard lock(this->routesMutex);
+        this->routes.recordDelivery(ack.sender, *firstHop, std::chrono::steady_clock::now());
+    }
 
     const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
@@ -754,10 +810,32 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
 void Router::receiveRouteReportForUs(const RoutedMessage& report, const PeerId& receivedFrom) {
     RouteReportPayload payload;
     RouterWire::decodeRouteReportPayload(report.payload, payload);                 // shape checked by decode
+    const auto awaited = this->awaitedReplies.find(payload.probeMsgId);
+    if (awaited == this->awaitedReplies.end()) return;
+    const std::optional<PeerId> firstHop = awaited->second.firstHop;
+    const bool measuresRoute = awaited->second.measuresRoute;
+    const bool reportToListeners = awaited->second.reportToListeners;
     const auto rtt = this->acceptAnswer(payload.probeMsgId, report.sender);
-    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, rtt);   // a round trip that worked, like an ACK
+    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report));            // any answer: a hint for where it came from
     if (!rtt) return;                                                               // not our probe, not from the probed node, a repeat or too late
-    const RouteReport event{ report.sender, payload.probeMsgId, std::move(payload.hops), payload.receivedOffsetMs, *rtt };
+
+    // A measurement only when it came back the way it went: over the reversed recorded route, through our first hop
+    // (docs/router.md 4.4a). Our clock times the loop, so a hostile relay can only make the route look slower.
+    std::vector<PeerId> reversed;
+    for (auto hop = payload.hops.rbegin(); hop != payload.hops.rend(); ++hop) reversed.push_back(hop->node);
+    const bool sameWay = firstHop && report.mode == RoutingMode::Routed && receivedFrom == *firstHop && report.sourceRoute && report.sourceRoute->hops == reversed;
+    if (measuresRoute && firstHop) {
+        this->probeScheduler.noteProbeFinished(report.sender, *firstHop);
+        if (sameWay) {
+            ++this->routeMeasurements;
+            std::lock_guard lock(this->routesMutex);
+            this->routes.recordMeasurement(report.sender, *firstHop, static_cast<uint8_t>(std::min<size_t>(payload.hops.size() + 1, 255)), *rtt, std::chrono::steady_clock::now());
+        } else {
+            this->recordRouteFailure(report.sender, *firstHop);
+        }
+    }
+    if (!reportToListeners) return;
+    const RouteReport event{ report.sender, payload.probeMsgId, std::move(payload.hops), payload.receivedOffsetMs, *rtt, firstHop, sameWay };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteReported(event); }, "onRouteReported");
 }
 
@@ -831,6 +909,7 @@ void Router::concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, cons
     reply.failureReported = true;
 
     const PeerId destination = *reply.addressee;
+    this->probeScheduler.noteUrgent(destination);
     if (reply.routeRelays && reason == RouteErrorReason::NextHopNotNeighbor) {
         // Only a missing link says the route is broken: a refused send is a full queue or a too large message (review R-6 I1),
         // an exhausted TTL a too short TTL or a relay that lowered it
@@ -872,7 +951,7 @@ void Router::reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receiv
 // docs/router.md 4.6. The query is signed by its sender, so it teaches the way back (D6) — over which alone the report
 // goes, never by local flooding. Budgeted per node: queries past it are dropped, the collector asks again.
 void Router::answerStateQuery(const RoutedMessage& query, const PeerId& receivedFrom) {
-    this->learnRoute(query.sender, receivedFrom, hopsTraveled(query), RouteEvidence::Broadcast);
+    this->learnRoute(query.sender, receivedFrom, hopsTraveled(query));
     StateReportWire::StateQuery wanted;
     if (!this->config.answerStateQueries || !StateReportWire::decodeQuery(query.payload, wanted) || !this->knowsWayTo(query.sender)) return;
 
@@ -894,7 +973,7 @@ void Router::receiveStateReportForUs(const RoutedMessage& report, const PeerId& 
         return;
     }
     // Only a hint about the way to its signer: the report says nothing about how good the route is (docs/router.md 4.4a)
-    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report), RouteEvidence::Broadcast);
+    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report));
     const auto rtt = this->acceptAnswer(receipt.report.queryMsgId, report.sender);
     if (!rtt) return;                                                               // not our query, not from its addressee, a repeat or too late
     receipt.queryMsgId = receipt.report.queryMsgId;
@@ -929,13 +1008,55 @@ void Router::sendOwnRouterMessage(const RoutedMessage& message) {
 // Routes end only with their neighbor (no expiry). A message parked for its sender's record may be accepted after the
 // neighbor that handed it over has left — it must not bring a route through that neighbor back. The Router thread is
 // the only writer of both sets, so the check cannot go stale before the insert.
-void Router::learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt) {
+void Router::learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops) {
     {
         std::lock_guard lock(this->neighborsMutex);
         if (!this->neighbors.contains(via)) return;
     }
     std::lock_guard lock(this->routesMutex);
-    this->routes.learn(destination, via, hops, evidence, std::chrono::steady_clock::now(), rtt);
+    this->routes.learn(destination, via, hops, std::chrono::steady_clock::now());
+}
+
+// A probe handed to `via` itself — the route measured is the one through it (docs/router.md 4.4a)
+void Router::startMeasurement(const RoutedMessage& probe, const PeerId& via, bool reportToListeners) {
+    this->awaitReply(probe.msgId, probe.destination, true);
+    AwaitedReply& awaited = this->awaitedReplies[probe.msgId];
+    awaited.measuresRoute     = true;
+    awaited.reportToListeners = reportToListeners;
+    this->rememberSeen(probe);
+    const std::vector<uint8_t> frame = RouterWire::encode(probe);
+    if (!this->isNeighbor(via) || frame.empty() || !this->sendFullCopy(via, frame)) {
+        this->probeScheduler.noteProbeFinished(*probe.destination, via);
+        this->recordRouteFailure(*probe.destination, via);
+        return;
+    }
+    this->setFirstHop(probe.msgId, via, this->config.routeEvaluation.probeTimeout);
+}
+
+void Router::setFirstHop(uint64_t msgId, const PeerId& firstHop, std::chrono::milliseconds answerTimeout) {
+    const auto awaited = this->awaitedReplies.find(msgId);
+    if (awaited == this->awaitedReplies.end()) return;
+    awaited->second.firstHop = firstHop;
+    this->answerDeadlines.emplace(awaited->second.sentAt + answerTimeout, msgId);
+}
+
+// An ACK or report that did not come in time fails the route through the first hop (docs/router.md 4.4a)
+void Router::checkAnswerDeadlines(std::chrono::steady_clock::time_point now) {
+    while (!this->answerDeadlines.empty() && this->answerDeadlines.begin()->first <= now) {
+        const uint64_t msgId = this->answerDeadlines.begin()->second;
+        this->answerDeadlines.erase(this->answerDeadlines.begin());
+        const auto awaited = this->awaitedReplies.find(msgId);
+        if (awaited == this->awaitedReplies.end() || !awaited->second.answeredBy.empty() || !awaited->second.firstHop || !awaited->second.addressee) continue;
+        if (awaited->second.measuresRoute) this->probeScheduler.noteProbeFinished(*awaited->second.addressee, *awaited->second.firstHop);
+        this->recordRouteFailure(*awaited->second.addressee, *awaited->second.firstHop);
+    }
+}
+
+void Router::recordRouteFailure(const PeerId& destination, const PeerId& via) {
+    ++this->routeFailures;
+    this->probeScheduler.noteUrgent(destination);
+    std::lock_guard lock(this->routesMutex);
+    this->routes.recordFailure(destination, via);
 }
 
 void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, bool acceptsAnswers, std::optional<std::vector<PeerId>> routeRelays) {
@@ -945,7 +1066,11 @@ void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, 
         this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
-    this->awaitedReplies[msgId] = AwaitedReply{ now, addressee, acceptsAnswers, std::move(routeRelays), false, {} };
+    AwaitedReply& reply = this->awaitedReplies[msgId] = AwaitedReply{};
+    reply.sentAt         = now;
+    reply.addressee      = addressee;
+    reply.acceptsAnswers = acceptsAnswers;
+    reply.routeRelays    = std::move(routeRelays);
     this->awaitedReplyOrder.emplace_back(now, msgId);
 }
 
@@ -1106,6 +1231,7 @@ void Router::relayRouted(RoutedMessage message, const PeerId& receivedFrom) {
 // To the hop the route names next — no other choice: the sender asked for this route. A next hop that is not a neighbor,
 // or refuses the send, ends the message here; the sender hears of it (ROUTE_ERROR, or directly when it is us).
 void Router::forwardRouted(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
+    this->noteDataTraffic(outgoing);
     const PeerId& nextHop = nextRoutedHop(outgoing);
     bool isNeighbor;
     {
@@ -1127,15 +1253,16 @@ void Router::forwardRouted(const RoutedMessage& outgoing, const std::optional<Pe
 
 // The next hop for one node: the destination itself when it is a neighbor, else the learned routes in order (the first
 // that accepts the send), else every neighbor but the one it came from — local flooding, bounded by TTL and duplicates
-void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
+std::optional<PeerId> Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
     const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
-    if (frame.empty()) return;
+    if (frame.empty()) return std::nullopt;
+    this->noteDataTraffic(outgoing);
     const PeerId& destination = *outgoing.destination;
     const std::vector<PeerId> neighbors = this->neighborsSnapshot();
 
     if (std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) {
         if (receivedFrom) ++this->unicastForwarded;
-        return;
+        return destination;
     }
 
     std::vector<PeerId> nextHops;
@@ -1146,7 +1273,7 @@ void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<P
     for (const PeerId& nextHop : nextHops) {
         if (nextHop != outgoing.sender && this->sendFullCopy(nextHop, frame)) {
             if (receivedFrom) ++this->unicastForwarded;
-            return;
+            return nextHop;
         }
     }
 
@@ -1154,6 +1281,7 @@ void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<P
     for (const PeerId& neighbor : neighbors) {
         if (neighbor != receivedFrom && neighbor != outgoing.sender) this->sendFullCopy(neighbor, frame);
     }
+    return std::nullopt;
 }
 
 void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticated) {

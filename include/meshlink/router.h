@@ -8,6 +8,7 @@
 #include "meshlink/log.h"
 #include "meshlink/peer_directory.h"
 #include "meshlink/plumtree_state.h"
+#include "meshlink/probe_scheduler.h"
 #include "meshlink/route_table.h"
 #include "meshlink/router_events.h"
 #include "meshlink/router_wire.h"
@@ -24,6 +25,7 @@
 #include <array>
 #include <deque>
 #include <functional>
+#include <map>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -33,6 +35,13 @@ namespace invilite::Mesh {
 
     class Network;
     struct NetworkMessage;
+
+    // Route evaluation (docs/router.md 4.4a, R-8)
+    struct RouteEvaluationConfig {
+        std::chrono::milliseconds   ackTimeout              = std::chrono::seconds(5);    // no ACK by then: a failure for the first hop it went to
+        std::chrono::milliseconds   probeTimeout            = std::chrono::seconds(5);    // no report by then: a failed measurement
+        ProbeSchedulerConfig        probing;                                        // which routes to measure when (its probeTimeout is the one above)
+    };
 
     // Router parameters (docs/router.md 5, initial values)
     struct RouterConfig {
@@ -53,6 +62,7 @@ namespace invilite::Mesh {
         std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
         size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
         RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
+        RouteEvaluationConfig       routeEvaluation;                                // ACK and probe judging routes (4.4a)
         std::chrono::seconds        replyWaitWindow         = std::chrono::seconds(60);   // how long our messages wait for ACKs / route reports
         size_t                      maxAwaitedReplies       = 4096;                 // messages waiting at once; the oldest is given up first
         size_t                      unicastAcksPerNeighborPerSecond = 32;           // ACKs we sign for unsigned UNICASTs one neighbor handed us (review R-5 I4)
@@ -91,6 +101,9 @@ namespace invilite::Mesh {
         uint64_t    unknownModeReportsSent = 0;
         uint64_t    clockWindowRejections = 0;                                      // routed messages with a timestamp outside maxClockSkew
         uint64_t    treeBeaconsSent    = 0;
+        uint64_t    routeMeasurements  = 0;                                         // probes that came back the same way (RTT recorded)
+        uint64_t    routeFailures      = 0;                                         // failed measurements and ACKs that did not come in time
+        uint64_t    scheduledProbes    = 0;                                         // probes the scheduler sent (measureRoute not counted)
     };
 
     struct SendOptions {
@@ -143,6 +156,12 @@ namespace invilite::Mesh {
         // Diagnostics: a probe to `destination` that records every relay and its time; the answer arrives as
         // onRouteReported. Travels as UNICAST, so it shows the path messages to that node take now.
         std::optional<uint64_t> recordRoute(const PeerId& destination);
+
+        // Route evaluation (docs/router.md 4.4a): a probe handed to neighbor `via` (relays then pick the way as for
+        // UNICAST). When its report comes back over the reversed route through `via`, the RTT ranks the route to
+        // `destination` through `via`; otherwise it counts as a failed measurement. Also reported as onRouteReported.
+        // Nothing when the Router is not running, `destination` is this node or `via` is not a neighbor.
+        std::optional<uint64_t> measureRoute(const PeerId& destination, const PeerId& via);
 
         // Diagnostics (docs/router.md 4.6): ask `destination` for its state; the answer arrives as onStateReported.
         // Asking this node itself is answered locally. Nothing when the Router is not running or unicastTtl is 0.
@@ -204,7 +223,14 @@ namespace invilite::Mesh {
         // UNICAST, or ROUTED along `relays` when given
         [[nodiscard]] RoutedMessage buildRouterMessage(const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload, std::optional<std::vector<PeerId>> relays = std::nullopt) const;
         void sendOwnRouterMessage(const RoutedMessage& message);
-        void learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops, RouteEvidence evidence, std::optional<std::chrono::milliseconds> rtt = std::nullopt);
+        void learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops);   // a hint (docs/router.md 4.4a)
+        void startMeasurement(const RoutedMessage& probe, const PeerId& via, bool reportToListeners);
+        // The first hop our message `msgId` went to, when it went to one neighbor: an answer judges that route
+        void setFirstHop(uint64_t msgId, const PeerId& firstHop, std::chrono::milliseconds answerTimeout);
+        void checkAnswerDeadlines(std::chrono::steady_clock::time_point now);
+        void recordRouteFailure(const PeerId& destination, const PeerId& via);
+        void sendScheduledProbes(std::chrono::steady_clock::time_point now);
+        void noteDataTraffic(const RoutedMessage& message);                         // point-to-point user data sent or relayed: its destination is active
         // addressee nullopt: every node answers (broadcast); routeRelays: a ROUTED message, which may get a ROUTE_ERROR
         void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, bool acceptsAnswers, std::optional<std::vector<PeerId>> routeRelays = std::nullopt);
         [[nodiscard]] std::optional<std::chrono::milliseconds> acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer);
@@ -229,7 +255,8 @@ namespace invilite::Mesh {
         void sendDuePresenceReplies(std::chrono::steady_clock::time_point now);
         void rememberPresenceReply(const PeerId& sender, std::chrono::steady_clock::time_point now);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
-        void forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
+        // Returns the one neighbor it went to; nothing for local flooding or when nobody took it
+        std::optional<PeerId> forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
         void relayRouted(RoutedMessage message, const PeerId& receivedFrom);
         void forwardRouted(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
@@ -252,6 +279,7 @@ namespace invilite::Mesh {
         SeenMessageCache                            unsignedSeenMessages;           // unsigned UNICAST data — kept apart (review R-5 C1)
         PlumtreeState                               plumtree;
         TreeRootElection                            treeRootElection;
+        ProbeScheduler                              probeScheduler;
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
@@ -270,10 +298,14 @@ namespace invilite::Mesh {
             bool                                    acceptsAnswers = true;          // false: a ROUTED message without ACK_REQUESTED, kept for ROUTE_ERROR
             std::optional<std::vector<PeerId>>      routeRelays;                    // ROUTED: its relays, the only nodes that may report it broken
             bool                                    failureReported = false;        // onRouteFailed at most once per message
+            std::optional<PeerId>                   firstHop;                       // where we handed it: an answer, or its absence, judges that route
+            bool                                    measuresRoute = false;          // a RECORD_ROUTE probe: the report is a measurement (4.4a)
+            bool                                    reportToListeners = true;       // onRouteReported (internal probes of the scheduler stay quiet)
             std::unordered_set<PeerId, PeerIDHash>  answeredBy;                     // each answers once; bounded by the verified records we hold
         };
         std::unordered_map<uint64_t, AwaitedReply>  awaitedReplies;
         std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedReplyOrder;
+        std::multimap<std::chrono::steady_clock::time_point, uint64_t> answerDeadlines;   // ackTimeout / probeTimeout of messages with a first hop
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
         // ACKs signed this second for unsigned UNICASTs, per neighbor that handed them over: (window start, count)
@@ -319,6 +351,9 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       unknownModeReportsSent{0};
         std::atomic<uint64_t>                       clockWindowRejections{0};
         std::atomic<uint64_t>                       treeBeaconsSent{0};
+        std::atomic<uint64_t>                       routeMeasurements{0};
+        std::atomic<uint64_t>                       routeFailures{0};
+        std::atomic<uint64_t>                       scheduledProbes{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

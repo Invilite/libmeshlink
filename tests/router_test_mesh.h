@@ -139,6 +139,7 @@ struct RouterMesh {
             RouterConfig config;
             config.announcePresence = false;                                                  // tests count traffic exactly; PRESENCE tests turn it on
             config.treeRoot.enabled = false;                                                  // likewise: no beacons, every broadcast shapes the tree
+            config.routeEvaluation.probing.enabled = false;                                   // and no scheduled probes
             if (adjustRouter) adjustRouter(i, config);
             this->routers.push_back(std::make_unique<Router>(*this->nodes[i]->network, this->nodes[i]->directory, this->nodes[i]->identity, config));
             this->recorders.push_back(std::make_shared<DeliveryRecorder>());

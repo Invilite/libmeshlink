@@ -719,7 +719,7 @@ TEST(RouterTest, BroadcastTeachesRouteToItsSenderAndDisconnectEndsIt) {
         ASSERT_EQ(candidates.size(), 1u) << "node " << i;
         EXPECT_EQ(candidates.front().via, mesh.id(i - 1));                                    // back the way it came
         EXPECT_EQ(candidates.front().hops, i);
-        EXPECT_EQ(candidates.front().evidence, RouteEvidence::Broadcast);
+        EXPECT_EQ(candidates.front().tier(), RouteTier::Hinted);
     }
     EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(0)).empty());                     // no route to ourselves
 
@@ -838,20 +838,28 @@ TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     EXPECT_EQ(receipt.hopsTraveled, 3);
     EXPECT_LT(receipt.rtt, 2s);
 
-    // The signed ACK taught the way to node 3 on every hop it crossed, our own end with an RTT. Only the addressee measured a
-    // round trip: relays learn it like a broadcast (review R-5 I2 — a relay replaying ACKs must not look confirmed)
+    // The signed ACK taught the way to node 3 on every hop it crossed — a hint only (docs/router.md 4.4a): it may come back
+    // any way. The first message went by local flooding (no first hop), so it proves no route.
     const auto atSender = mesh.routers[0]->getRouteCandidates(mesh.id(3));
     ASSERT_EQ(atSender.size(), 1u);
-    EXPECT_EQ(atSender.front().evidence, RouteEvidence::Ack);
+    EXPECT_EQ(atSender.front().tier(), RouteTier::Hinted);
     EXPECT_EQ(atSender.front().via, mesh.id(1));
-    EXPECT_TRUE(atSender.front().rtt.has_value());
     for (size_t i = 1; i < 3; ++i) {
         const auto atRelay = mesh.routers[i]->getRouteCandidates(mesh.id(3));
         ASSERT_EQ(atRelay.size(), 1u) << "node " << i;
-        EXPECT_EQ(atRelay.front().evidence, RouteEvidence::Broadcast);
+        EXPECT_EQ(atRelay.front().tier(), RouteTier::Hinted);
         EXPECT_EQ(atRelay.front().hops, 3 - i);
     }
-    EXPECT_EQ(mesh.routers[3]->getStatistics().acksSent, 1u);
+
+    // Now the route is known: the second message goes to node 1, and its ACK is a delivery for "node 3 through node 1"
+    const uint64_t second = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'b' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(second).size() == 1; }, 5s));
+    const auto delivered = mesh.routers[0]->getRouteCandidates(mesh.id(3));
+    ASSERT_EQ(delivered.size(), 1u);
+    EXPECT_EQ(delivered.front().tier(), RouteTier::Delivered);
+    EXPECT_EQ(delivered.front().deliveries, 1u);
+    for (size_t i = 1; i < 3; ++i) EXPECT_EQ(mesh.routers[i]->getRouteCandidates(mesh.id(3)).front().tier(), RouteTier::Hinted) << "node " << i;
+    EXPECT_EQ(mesh.routers[3]->getStatistics().acksSent, 2u);
     EXPECT_EQ(mesh.routers[1]->getStatistics().acksSent, 0u);                                 // relays never acknowledge
 }
 
@@ -936,10 +944,130 @@ TEST(RouterTest, RouteProbeRecordsEveryRelayInOrderWithTimes) {
 
     // Neither a delivery to applications nor an ACK
     for (size_t i = 1; i < 5; ++i) EXPECT_EQ(mesh.recorders[i]->total(), 0u);
-    // The signed report confirmed the way to node 4, as an ACK would
+    // The probe flooded locally (no route yet, no first hop): the signed report is only a hint, not a measurement
     const auto route = mesh.routers[0]->getRouteCandidates(mesh.id(4));
     ASSERT_FALSE(route.empty());
-    EXPECT_EQ(route.front().evidence, RouteEvidence::Ack);
+    EXPECT_EQ(route.front().tier(), RouteTier::Hinted);
+    EXPECT_FALSE(report.returnedSameWay);
+}
+
+// ── Route evaluation (R-8, docs/router.md 4.4a) ─────────────────────────────
+
+// A probe through a chosen neighbor that comes back over the reversed route measures that route
+TEST(RouterTest, MeasuredRouteThroughChosenNeighborRanksFirst) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[3]->broadcast(0x10, 0, { 'h' }).value();             // a hint: node 3 is behind node 1
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(3), hello) == 1; }, 5s));
+
+    const uint64_t probe = mesh.routers[0]->measureRoute(mesh.id(3), mesh.id(1)).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probe).size() == 1; }, 5s));
+    const RouteReport report = mesh.recorders[0]->reportsFor(probe).front();
+    EXPECT_TRUE(report.returnedSameWay);
+    EXPECT_EQ(report.firstHop, mesh.id(1));
+
+    const auto route = mesh.routers[0]->getRouteCandidates(mesh.id(3));
+    ASSERT_EQ(route.size(), 1u);
+    EXPECT_EQ(route.front().tier(), RouteTier::Measured);
+    EXPECT_TRUE(route.front().rtt.has_value());
+    EXPECT_EQ(route.front().hops, 3);                                                         // as the probe recorded it
+    EXPECT_EQ(mesh.routers[0]->getStatistics().routeMeasurements, 1u);
+    EXPECT_FALSE(mesh.routers[0]->measureRoute(mesh.id(3), mesh.id(2)).has_value());          // not a neighbor
+}
+
+// An ACK credits the neighbor we handed the message to, not the one it came back over: in a diamond node 0 sends
+// through node 1 (measured best), node 3 answers through node 2 (measured best for it)
+TEST(RouterTest, AckCreditsTheFirstHopNotTheWayBack) {
+    RouterMesh mesh(4, { { 0, 1 }, { 0, 2 }, { 1, 3 }, { 2, 3 } });
+    ASSERT_TRUE(mesh.ready);
+    for (size_t sender : { size_t{ 0 }, size_t{ 3 } }) {
+        const uint64_t hello = mesh.routers[sender]->broadcast(0x10, 0, { 'h' }).value();
+        ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(sender, hello); }, 5s));
+    }
+    const uint64_t out = mesh.routers[0]->measureRoute(mesh.id(3), mesh.id(1)).value();
+    const uint64_t back = mesh.routers[3]->measureRoute(mesh.id(0), mesh.id(2)).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(out).size() == 1 && mesh.recorders[3]->reportsFor(back).size() == 1; }, 5s));
+    ASSERT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(3)).front().via, mesh.id(1));
+    ASSERT_EQ(mesh.routers[3]->getRouteCandidates(mesh.id(0)).front().via, mesh.id(2));
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'd' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
+    for (const RouteCandidate& candidate : mesh.routers[0]->getRouteCandidates(mesh.id(3))) {
+        EXPECT_EQ(candidate.deliveries, candidate.via == mesh.id(1) ? 1u : 0u) << "the ACK came back over node 2";
+    }
+}
+
+// A report that did not come back the way the probe went (here: as UNICAST over the other neighbor) is no measurement —
+// it counts as a failed one, so a relay cannot make a route look measured by answering around it
+TEST(RouterTest, ReportComingBackAnotherWayIsAFailedMeasurement) {
+    RouterMesh mesh(4, { { 0, 1 }, { 0, 2 }, { 1, 3 }, { 2, 3 } });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[3]->broadcast(0x10, 0, { 'h' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(3, hello); }, 5s));
+    mesh.routers[3]->stop();                                                                  // the genuine report never comes
+
+    const uint64_t probe = mesh.routers[0]->measureRoute(mesh.id(3), mesh.id(1)).value();
+    RouteReportPayload payload{ probe, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()), 5, { { mesh.id(1), 2 } } };
+    RoutedMessage report = testRouterMessage(mesh.id(3), mesh.id(0), RouterWire::SUBTYPE_ROUTE_REPORT, RouterWire::encodeRouteReportPayload(payload));
+    report.signature = mesh.nodes[3]->identity->sign(RouterWire::bytesToSign(report));
+    ASSERT_GT(mesh.nodes[2]->network->sendToPeer(mesh.id(0), RouterWire::encode(report)), 0);
+
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(probe).size() == 1; }, 5s));
+    EXPECT_FALSE(mesh.recorders[0]->reportsFor(probe).front().returnedSameWay);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().routeMeasurements, 0u);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().routeFailures, 1u);
+    for (const RouteCandidate& candidate : mesh.routers[0]->getRouteCandidates(mesh.id(3))) EXPECT_NE(candidate.tier(), RouteTier::Measured);
+}
+
+// The scheduler (docs/router.md 4.4a) measures the routes of a destination we send to, without anyone asking — and in
+// the background, a known route nobody sends to
+TEST(RouterTest, ScheduledProbesMeasureActiveAndIdleRoutes) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t, RouterConfig& c) { c.routeEvaluation.probing.enabled = true; });
+    ASSERT_TRUE(mesh.ready);
+    for (size_t sender : { size_t{ 2 }, size_t{ 3 } }) {
+        const uint64_t hello = mesh.routers[sender]->broadcast(0x10, 0, { 'h' }).value();
+        ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(sender), hello) == 1; }, 5s));
+    }
+    ASSERT_TRUE(mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'd' }).has_value());             // node 3 becomes active
+    EXPECT_TRUE(waitUntil([&] {
+        const auto toActive = mesh.routers[0]->getRouteCandidates(mesh.id(3));
+        const auto toIdle   = mesh.routers[0]->getRouteCandidates(mesh.id(2));
+        return !toActive.empty() && toActive.front().tier() == RouteTier::Measured && !toIdle.empty() && toIdle.front().tier() == RouteTier::Measured;
+    }, 5s));
+    EXPECT_GE(mesh.routers[0]->getStatistics().scheduledProbes, 2u);
+    EXPECT_EQ(mesh.recorders[0]->routeReports.size(), 0u);                                    // the scheduler's probes are quiet
+}
+
+// No report in probeTimeout, no ACK in ackTimeout: a failure for the route through the first hop — it drops to the end
+TEST(RouterTest, MissingAnswersFailTheRouteThroughTheFirstHop) {
+    RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& c) {
+        c.routeEvaluation.ackTimeout   = 300ms;
+        c.routeEvaluation.probeTimeout = 300ms;
+    });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[2]->broadcast(0x10, 0, { 'h' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(2), hello) == 1; }, 5s));
+    mesh.routers[2]->stop();                                                                  // its Network still takes frames: nobody answers
+
+    ASSERT_TRUE(mesh.routers[0]->measureRoute(mesh.id(2), mesh.id(1)).has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().routeFailures == 1; }, 3s));
+    EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).front().tier(), RouteTier::Failing);
+
+    ASSERT_TRUE(mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'x' }, { .ackRequested = true }).has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().routeFailures == 2; }, 3s));
+    ASSERT_TRUE(mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'y' }, { .ackRequested = true }).has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[0]->getStatistics().routeFailures == 3; }, 3s));
+    EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(2)).empty());                    // three in a row: forgotten
+
+    // Control: a message without ACK_REQUESTED waits for nothing and fails nothing
+    mesh.routers[2]->start();                                                                 // teach the route again
+    const uint64_t again = mesh.routers[2]->broadcast(0x10, 0, { 'h' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(2), again) == 1; }, 5s));
+    mesh.routers[2]->stop();
+    ASSERT_TRUE(mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'z' }).has_value());
+    std::this_thread::sleep_for(600ms);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().routeFailures, 3u);
+    EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).front().tier(), RouteTier::Hinted);
 }
 
 // Nobody knows node 6 yet: the probe floods locally, the first copy wins, the report shows a real path to it

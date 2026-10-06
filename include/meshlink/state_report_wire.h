@@ -131,7 +131,7 @@ namespace invilite::Mesh {
             PeerId                  destination{};
             PeerId                  via{};
             uint8_t                 hops             = 0;
-            uint8_t                 evidence         = 0;                           // RouteEvidence as a raw value
+            uint8_t                 evidence         = 0;                           // RouteTier as a raw value: 0 measured, 1 delivered, 2 hinted, 3 failing
             std::optional<uint32_t> rttMs;
             uint32_t                sinceConfirmedMs = 0;
 
