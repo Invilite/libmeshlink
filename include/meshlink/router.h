@@ -166,6 +166,7 @@ namespace invilite::Mesh {
         void receiveRouteErrorForUs(const RoutedMessage& error);
         void concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, const PeerId& unreachableHop, RouteErrorReason reason);
         void sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFrom, const PeerId& unreachableHop, RouteErrorReason reason);
+        void reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receivedFrom);
         [[nodiscard]] bool isNeighbor(const PeerId& node) const;
         [[nodiscard]] bool knowsWayTo(const PeerId& node) const;
         // UNICAST, or ROUTED along `relays` when given
@@ -231,6 +232,7 @@ namespace invilite::Mesh {
             std::optional<PeerId>                   addressee;                      // the only node that may answer; nullopt = every node (broadcast)
             bool                                    acceptsAnswers = true;          // false: a ROUTED message without ACK_REQUESTED, kept for ROUTE_ERROR
             std::optional<std::vector<PeerId>>      routeRelays;                    // ROUTED: its relays, the only nodes that may report it broken
+            bool                                    failureReported = false;        // onRouteFailed at most once per message
             std::unordered_set<PeerId, PeerIDHash>  answeredBy;                     // each answers once; bounded by the verified records we hold
         };
         std::unordered_map<uint64_t, AwaitedReply>  awaitedReplies;

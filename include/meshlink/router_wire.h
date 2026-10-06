@@ -39,6 +39,7 @@ namespace invilite::Mesh {
     enum class RouteErrorReason : uint8_t {
         NextHopNotNeighbor = 0x01,                                                  // next source-route hop is not my neighbor
         NextHopSendRefused = 0x02,                                                  // send to the next hop refused (queue full / connection closed)
+        TtlExhausted       = 0x03,                                                  // TTL ran out at a hop that knew the way on (point-to-point only)
     };
 
     // TLV extension. Type bit 7 = critical (unknown → reject message), bit 6 = per-hop (unsigned, relays may change it).

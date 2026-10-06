@@ -622,7 +622,10 @@ void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& re
         this->relayRouted(std::move(message), receivedFrom);
         return;
     }
-    if (message.ttlRemaining <= 1) return;
+    if (message.ttlRemaining <= 1) {
+        this->reportTtlExhausted(message, receivedFrom);
+        return;
+    }
     message.ttlRemaining -= 1;
     if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) {
         RecordRoutePayload probe;
@@ -713,23 +716,24 @@ void Router::receiveRouteErrorForUs(const RoutedMessage& error) {
     this->concludeRouteFailure(payload.stuckMsgId, error.sender, payload.unreachableDestination, payload.reason);
 }
 
-// One failure per message, and only from a relay of its route (or this node, when the first hop failed): anyone else
-// could otherwise make us drop good routes. The route learned through the failed route's first hop goes too.
+// One failure per message. For ROUTED only from a relay of its route (or this node, when the first hop failed): anyone
+// else could otherwise make us drop good routes; a missing link drops the route learned through its first hop too.
+// For UNICAST (tracked only with ACK_REQUESTED, and probes) only a TTL report: its relays are unknown, so it is just passed on.
 void Router::concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, const PeerId& unreachableHop, RouteErrorReason reason) {
     const auto awaited = this->awaitedReplies.find(msgId);
-    if (awaited == this->awaitedReplies.end() || !awaited->second.routeRelays || !awaited->second.addressee) return;
-    const std::vector<PeerId> relays = std::move(*awaited->second.routeRelays);
-    awaited->second.routeRelays.reset();
-    if (reportedBy != this->selfIdentity->getPeerId() && std::find(relays.begin(), relays.end(), reportedBy) == relays.end()) {
-        awaited->second.routeRelays = relays;                                       // not a relay of this route: ignored, still waiting
-        return;
-    }
+    if (awaited == this->awaitedReplies.end() || !awaited->second.addressee || awaited->second.failureReported) return;
+    AwaitedReply& reply = awaited->second;
+    if (!reply.routeRelays && reason != RouteErrorReason::TtlExhausted) return;
+    if (reply.routeRelays && reportedBy != this->selfIdentity->getPeerId()
+        && std::find(reply.routeRelays->begin(), reply.routeRelays->end(), reportedBy) == reply.routeRelays->end()) return;
+    reply.failureReported = true;
 
-    const PeerId destination = *awaited->second.addressee;
-    if (reason != RouteErrorReason::NextHopSendRefused) {
-        // A refused send (full queue, message too large) says nothing about the route — only a missing link does (review R-6 I1)
+    const PeerId destination = *reply.addressee;
+    if (reply.routeRelays && reason == RouteErrorReason::NextHopNotNeighbor) {
+        // Only a missing link says the route is broken: a refused send is a full queue or a too large message (review R-6 I1),
+        // an exhausted TTL a too short TTL or a relay that lowered it
         std::lock_guard lock(this->routesMutex);
-        this->routes.forgetRoute(destination, relays.empty() ? destination : relays.front());
+        this->routes.forgetRoute(destination, reply.routeRelays->empty() ? destination : reply.routeRelays->front());
     }
     const RouteFailure failure{ destination, msgId, reportedBy, unreachableHop, reason };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onRouteFailed(failure); }, "onRouteFailed");
@@ -746,6 +750,21 @@ void Router::sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFr
     lastReport = now;
     ++this->routeErrorsSent;
     this->sendOwnRouterMessage(this->buildRouterMessage(stuck.sender, RouterWire::SUBTYPE_ROUTE_ERROR, RouterWire::encodeRouteErrorPayload({ stuck.msgId, unreachableHop, reason })));
+}
+
+// TTL ran out here (docs/router.md 4.2). Reported only when the message would have gone on over a known way — a ROUTED
+// next hop, the destination as a neighbor or a learned route; a hop that would flood locally stays silent, as nearly
+// every branch of local flooding ends this way. Only data and probes are reported: nobody waits on an answer's fate.
+void Router::reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receivedFrom) {
+    const bool isRouterMessage = stuck.group == RouterWire::ROUTER_PROTOCOL_GROUP;
+    if (isRouterMessage && stuck.subtype != RouterWire::SUBTYPE_RECORD_ROUTE) return;
+    const PeerId& destination = *stuck.destination;
+    if (stuck.mode != RoutingMode::Routed && !this->isNeighbor(destination)) {
+        std::lock_guard lock(this->routesMutex);
+        const std::vector<PeerId> nextHops = this->routes.nextHops(destination, receivedFrom);
+        if (std::none_of(nextHops.begin(), nextHops.end(), [&](const PeerId& hop) { return hop != stuck.sender; })) return;
+    }
+    this->sendRouteError(stuck, receivedFrom, destination, RouteErrorReason::TtlExhausted);
 }
 
 // Signed UNICAST of the Router's own (Group 0xFE); safe on any thread — signing needs only the identity
@@ -791,7 +810,7 @@ void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, 
         this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
-    this->awaitedReplies[msgId] = AwaitedReply{ now, addressee, acceptsAnswers, std::move(routeRelays), {} };
+    this->awaitedReplies[msgId] = AwaitedReply{ now, addressee, acceptsAnswers, std::move(routeRelays), false, {} };
     this->awaitedReplyOrder.emplace_back(now, msgId);
 }
 
@@ -915,7 +934,10 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
         if (message.ackRequested && this->mayAcknowledgeUnsigned(message.sender, receivedFrom)) this->sendAck(message);
         return;
     }
-    if (message.ttlRemaining <= 1) return;                                          // the next hop would receive TTL 0
+    if (message.ttlRemaining <= 1) {                                                // the next hop would receive TTL 0
+        this->reportTtlExhausted(message, receivedFrom);
+        return;
+    }
     message.ttlRemaining -= 1;
     this->forwardUnicast(message, receivedFrom);
 }
@@ -937,7 +959,10 @@ void Router::handleIncomingRouted(RoutedMessage message, const PeerId& receivedF
 
 // This node is the named relay: step the route on and hand the message to the next hop
 void Router::relayRouted(RoutedMessage message, const PeerId& receivedFrom) {
-    if (message.ttlRemaining <= 1) return;                                          // the sender gives enough TTL for its route
+    if (message.ttlRemaining <= 1) {                                                // the sender gives enough TTL for its route: someone lowered it
+        this->reportTtlExhausted(message, receivedFrom);
+        return;
+    }
     message.ttlRemaining -= 1;
     message.sourceRoute->nextHopIndex += 1;
     this->forwardRouted(message, receivedFrom);

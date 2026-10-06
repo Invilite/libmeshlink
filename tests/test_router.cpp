@@ -1211,11 +1211,11 @@ TEST(RouterTest, UnicastAcksPerNeighborAreLimited) {
 uint32_t testUnixNow() { return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()); }
 
 // Unsigned ROUTED data message as a neighbor could craft it
-std::vector<uint8_t> craftRoutedFrame(const PeerId& sender, const PeerId& destination, std::vector<PeerId> hops, uint8_t nextHopIndex) {
+std::vector<uint8_t> craftRoutedFrame(const PeerId& sender, const PeerId& destination, std::vector<PeerId> hops, uint8_t nextHopIndex, uint8_t ttl = 16) {
     RoutedMessage routed;
     routed.group = 0x10;
     routed.mode = RoutingMode::Routed;
-    routed.ttlInitial = routed.ttlRemaining = 16;
+    routed.ttlInitial = routed.ttlRemaining = ttl;
     routed.msgId = randomTestMsgId();
     routed.sentAtUnixSeconds = testUnixNow();
     routed.sender = sender;
@@ -1360,6 +1360,118 @@ TEST(RouterTest, LocallyRefusedSendKeepsTheRoute) {
     EXPECT_EQ(failure.unreachableHop, mesh.id(1));
     EXPECT_EQ(failure.reason, RouteErrorReason::NextHopSendRefused);
     EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).size(), 1u);
+}
+
+// ── TTL exhausted on a known way (ROUTE_ERROR 0x03, docs/router.md 4.2) ───────────────────────────────────────────
+
+// Every node of the line learns the way to both ends, so a relay whose TTL runs out knows where the message would go
+void learnBothEnds(RouterMesh& mesh) {
+    const size_t last = mesh.nodes.size() - 1;
+    for (size_t end : { size_t{ 0 }, last }) {
+        const uint64_t hello = mesh.routers[end]->broadcast(0x10, 0, { 'h' }).value();
+        ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(end, hello); }, 5s));
+    }
+}
+
+TEST(RouterTest, UnicastTtlEndingOnKnownWayReportsRouteError) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t i, RouterConfig& c) { if (i == 0) c.unicastTtl = 2; });
+    ASSERT_TRUE(mesh.ready);
+    learnBothEnds(mesh);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 't' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(msgId).size() == 1; }, 5s));
+    const RouteFailure failure = mesh.recorders[0]->failuresFor(msgId).front();
+    EXPECT_EQ(failure.reason, RouteErrorReason::TtlExhausted);
+    EXPECT_EQ(failure.reportedBy, mesh.id(2));                                                // node 2 receives TTL 1, node 3 is its neighbor
+    EXPECT_EQ(failure.unreachableHop, mesh.id(3));
+    EXPECT_EQ(failure.destination, mesh.id(3));
+    EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(3)).size(), 1u);                   // the link works: the route stays
+    EXPECT_EQ(mesh.recorders[3]->countOf(mesh.id(0), msgId), 0u);
+}
+
+// A relay that would flood locally stays silent: nearly every branch of local flooding ends with TTL 0
+TEST(RouterTest, UnicastTtlEndingInLocalFloodingIsNotReported) {
+    RouterMesh mesh(5, lineEdges(5), [](size_t i, RouterConfig& c) { if (i == 0) c.unicastTtl = 2; });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[0]->broadcast(0x10, 0, { 'h' }).value();             // the way back to node 0 is known
+    ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, hello); }, 5s));
+
+    const uint64_t toFar = mesh.routers[0]->send(mesh.id(4), 0x10, 0, { 'f' }, { .ackRequested = true }).value();
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->failuresFor(toFar).empty());
+    for (size_t i = 0; i < 5; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().routeErrorsSent, 0u) << "node " << i;
+
+    // Control: the same TTL toward node 3 — a neighbor of node 2, where the TTL runs out — is reported
+    const uint64_t toNeighborOfLast = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'n' }, { .ackRequested = true }).value();
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(toNeighborOfLast).size() == 1; }, 5s));
+}
+
+// Without ACK_REQUESTED the sender ignores the report: it does not track the UNICAST at all
+TEST(RouterTest, UnicastTtlReportIsIgnoredWithoutAckRequested) {
+    RouterMesh mesh(4, lineEdges(4), [](size_t i, RouterConfig& c) { if (i == 0) c.unicastTtl = 2; });
+    ASSERT_TRUE(mesh.ready);
+    learnBothEnds(mesh);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'q' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.routers[2]->getStatistics().routeErrorsSent == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->failuresFor(msgId).empty());
+}
+
+TEST(RouterTest, RoutedTtlEndingAtRelayReportsRouteError) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), craftRoutedFrame(mesh.id(0), mesh.id(3), { mesh.id(1), mesh.id(2) }, 0, 1)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[1]->getStatistics().routeErrorsSent == 1; }, 5s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().routedForwarded, 0u);
+    EXPECT_EQ(mesh.recorders[3]->total(), 0u);
+}
+
+// For UNICAST the sender does not know the relays, so only a TTL report counts — and only once; a "broken link" claim about
+// a hop it never chose must not reach the application
+TEST(RouterTest, UnicastAcceptsOnlyTtlReportOnce) {
+    RouterMesh mesh(3, lineEdges(3));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'u' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+
+    auto errorFromNodeOne = [&](RouteErrorReason reason) {
+        RoutedMessage error = testRouterMessage(mesh.id(1), mesh.id(0), RouterWire::SUBTYPE_ROUTE_ERROR, RouterWire::encodeRouteErrorPayload({ msgId, mesh.id(2), reason }));
+        error.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(error));
+        return RouterWire::encode(error);
+    };
+    ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), errorFromNodeOne(RouteErrorReason::NextHopNotNeighbor)), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_TRUE(mesh.recorders[0]->failuresFor(msgId).empty());
+
+    // Control: a TTL report counts, a repeat does not
+    for (int i = 0; i < 2; ++i) ASSERT_GT(mesh.nodes[1]->network->sendToPeer(mesh.id(0), errorFromNodeOne(RouteErrorReason::TtlExhausted)), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(msgId).size() == 1; }, 3s));
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.recorders[0]->failuresFor(msgId).size(), 1u);
+}
+
+// Nobody waits for a report about an answer (ACK, ROUTE_ERROR, ROUTE_REPORT, PRESENCE_REPLY) — only about data and probes
+TEST(RouterTest, AnswerRunningOutOfTtlIsNotReported) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    learnBothEnds(mesh);
+
+    auto signedFromNodeZero = [&](uint16_t subtype, std::vector<uint8_t> payload) {
+        RoutedMessage message = testRouterMessage(mesh.id(0), mesh.id(3), subtype, std::move(payload));
+        message.ttlInitial = message.ttlRemaining = 2;                                         // runs out at node 2
+        message.signature = mesh.nodes[0]->identity->sign(RouterWire::bytesToSign(message));
+        return RouterWire::encode(message);
+    };
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), signedFromNodeZero(RouterWire::SUBTYPE_ACK, RouterWire::encodeAckPayload({ randomTestMsgId() }))), 0);
+    std::this_thread::sleep_for(300ms);
+    EXPECT_EQ(mesh.routers[2]->getStatistics().routeErrorsSent, 0u);
+
+    // Control: a route probe running out the same way is reported
+    const auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), signedFromNodeZero(RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ nowMs, {} }))), 0);
+    EXPECT_TRUE(waitUntil([&] { return mesh.routers[2]->getStatistics().routeErrorsSent == 1; }, 5s));
 }
 
 // ── PRESENCE: the Router's own "I am here" to every other Router ────────────────────────────────────────────────────
