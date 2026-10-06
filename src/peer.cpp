@@ -1,10 +1,11 @@
 #include "meshlink/peer.h"
 #include "meshlink/errors.h"
 
-invilite::Mesh::Peer::Peer(std::shared_ptr<Connection> connection, PeerIdentity identity, bool outbound)
+invilite::Mesh::Peer::Peer(std::shared_ptr<Connection> connection, PeerIdentity identity, bool outbound, bool holePunched)
     : connection(std::move(connection)),
       identity(std::move(identity)),
       outbound(outbound),
+      holePunched(holePunched),
       connectedAt(std::chrono::steady_clock::now()) {
 }
 

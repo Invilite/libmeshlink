@@ -17,6 +17,7 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   exchangeTimeout  = std::chrono::seconds(10);     // REQUEST → NOW at the latest; also how long a nonce is remembered
         std::chrono::milliseconds   requestInterval  = std::chrono::seconds(5);      // one request per neighbor this often — R never becomes an amplifier
         size_t                      maxOpenExchanges = 64;
+        bool                        sameNetworkShortcut = true;                     // off only in loopback tests (every node is 127.0.0.1)
     };
 
     // The common neighbor's side of hole punching (docs/nat-traversal.md 4, role R): passes a request from A to B as an
@@ -31,7 +32,7 @@ namespace invilite::Mesh {
         // PUNCH_REQUEST from neighbor `requester`, seen by us at `requesterEndpoint`. Endpoints exist only for neighbors
         // that dialed us — their source port is the NAT mapping the punch reuses; nothing when we dialed the requester, or
         // for `targetEndpoint` when the target is not such a neighbor. Returns an offer to the target or a decline to the
-        // requester; nothing for a nonce already used.
+        // requester (SameNetwork when both are at one public address); nothing for a nonce already used.
         std::vector<HolePunchMessage> onRequest(const PeerId& requester, const std::optional<HolePunchEndpoint>& requesterEndpoint, const HolePunchRequest& request,
                                                 const std::optional<HolePunchEndpoint>& targetEndpoint, std::chrono::steady_clock::time_point now);
 

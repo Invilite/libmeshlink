@@ -1,6 +1,7 @@
 #include "meshlink/network.h"
 #include "meshlink/peer_reachability.h"
 #include "meshlink/known_peer_eviction.h"
+#include "meshlink/hole_punch_policy.h"
 #include "meshlink/identity.h"
 #include "meshlink/thread_signals.h"
 #include "transport/TcpClient.h"
@@ -186,7 +187,7 @@ void Network::start() {
     this->peerLifecycleEvents.reopen();
     this->holePunchRequests.reopen();
     this->holePunchOutcomes.reopen();
-    this->holePunchCoordinator.emplace();
+    this->holePunchCoordinator.emplace(HolePunchCoordinatorConfig{ .sameNetworkShortcut = this->config.holePunching.sameNetworkShortcut });
     this->holePunchParticipant.emplace(this->selfIdentity->getPeerId());
     this->holePunchCoordinatorsLeft.clear();
     {
@@ -997,7 +998,7 @@ void Network::handleWakeup() {
                         // farewell (HELLO + PEX + GOODBYE(NoSlots)) sent by the management thread.
                         const size_t activeInbound = static_cast<size_t>(std::count_if(this->peersById.begin(), this->peersById.end(),
                                 [](const auto& entry) { return !entry.second->isOutbound() && entry.second->isActive(); }));
-                        const bool overInboundSoft = !cmd.peer->isOutbound() && !cmd.holePunched && activeInbound >= this->config.connectionLimits.inbound.soft;
+                        const bool overInboundSoft = !cmd.peer->isOutbound() && !cmd.peer->wasHolePunched() && activeInbound >= this->config.connectionLimits.inbound.soft;
 
                         this->peersById[cmd.peer->getPeerId()] = cmd.peer;
                         this->peersBySocket[fd]                = cmd.peer;
@@ -1222,6 +1223,7 @@ void Network::managementLoop() {
     auto lastBroadcastTick = std::chrono::steady_clock::now();
     auto topologyNextTick = std::chrono::steady_clock::now();
     auto periodicPexNextTick = std::chrono::steady_clock::now() + this->pickRandomPexInterval();
+    auto holePunchPolicyNextTick = std::chrono::steady_clock::now() + this->pickHolePunchPolicyInterval();   // the mesh forms first
     constexpr auto BROADCAST_TICK_INTERVAL = std::chrono::seconds(1);
 
     while (this->running.load()) {
@@ -1269,6 +1271,11 @@ void Network::managementLoop() {
         if (now >= periodicPexNextTick) {
             this->tickPeriodicPex();
             periodicPexNextTick = now + this->pickRandomPexInterval();
+        }
+
+        if (now >= holePunchPolicyNextTick) {
+            if (!this->stopping.load()) this->tickHolePunchPolicy();
+            holePunchPolicyNextTick = now + this->pickHolePunchPolicyInterval();
         }
 
         // Probe scheduling — at most one in flight, throttled internally
@@ -1322,9 +1329,30 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
     }
 }
 
-std::chrono::milliseconds Network::tickTopology() {
+std::vector<SignedPeerRecord> Network::collectDialCandidates(const std::vector<PeerId>& registered) const {
+    // Snapshot directory once and filter locally — directory release happens before TopologyPlanner runs.
     const PeerId& selfId = this->selfIdentity->getPeerId();
+    const auto    now    = std::chrono::steady_clock::now();
+    std::vector<SignedPeerRecord> candidates;
+    for (const auto& entry : this->peerDirectory->listPeers()) {
+        // TopologyPlanner only dials peers we have evidence are currently reachable.
+        // hasEverConnected alone is not enough — a peer may have gone offline since.
+        if (entry.availability != AvailabilityState::Available) continue;
+        // Connection-attempt backoff — skip peers we just failed to dial. The cooldown grows
+        // with consecutiveConnectionFailures (see computeBackoffInterval).
+        if (now < entry.nextConnectionAttemptAt) continue;
+        const PeerId& id = entry.record.peerId;
+        if (id == selfId) continue;
+        if (std::find(registered.begin(), registered.end(), id) != registered.end()) continue;
+        SignedPeerRecord candidate = entry.record;
+        candidate.addresses = dialableAddresses(entry);                             // the planner sees only what we could reach
+        if (candidate.addresses.empty()) continue;
+        candidates.push_back(std::move(candidate));
+    }
+    return candidates;
+}
 
+std::chrono::milliseconds Network::tickTopology() {
     // Planner sees established connections only; candidates exclude every registered peer, departing ones included —
     // we are still connected to those, dialing them again would only collide.
     std::vector<ConnectedPeerInfo> connected;
@@ -1339,28 +1367,7 @@ std::chrono::milliseconds Network::tickTopology() {
         }
     }
 
-    // Snapshot directory once and filter locally — directory release happens before TopologyPlanner runs.
-    std::vector<SignedPeerRecord> candidates;
-    {
-        const auto now      = std::chrono::steady_clock::now();
-        const auto allPeers = this->peerDirectory->listPeers();
-        for (const auto& entry : allPeers) {
-            // TopologyPlanner only dials peers we have evidence are currently reachable.
-            // hasEverConnected alone is not enough — a peer may have gone offline since.
-            if (entry.availability != AvailabilityState::Available) continue;
-            // Connection-attempt backoff — skip peers we just failed to dial. The cooldown grows
-            // with consecutiveConnectionFailures (see computeBackoffInterval).
-            if (now < entry.nextConnectionAttemptAt) continue;
-            const PeerId& id = entry.record.peerId;
-            if (id == selfId) continue;
-            if (std::find(registered.begin(), registered.end(), id) != registered.end()) continue;
-            SignedPeerRecord candidate = entry.record;
-            candidate.addresses = dialableAddresses(entry);                         // the planner sees only what we could reach
-            if (candidate.addresses.empty()) continue;
-            candidates.push_back(std::move(candidate));
-        }
-    }
-
+    const std::vector<SignedPeerRecord> candidates = this->collectDialCandidates(registered);
     const TopologyDecision decision = this->topologyPlanner.evaluate(connected, candidates, this->config);
 
     if (decision.connectTo) {
@@ -1509,7 +1516,7 @@ NetworkDiagnostics Network::getDiagnostics() const {
             if (!peer->isActive()) continue;
             const std::shared_ptr<Connection> connection = peer->getConnection();
             diagnostics.links.push_back({ id, !peer->isOutbound(), std::chrono::duration_cast<std::chrono::seconds>(now - peer->getConnectedAt()),
-                                          connection->getBytesSent(), connection->getBytesReceived(), connection->getQueuedSendBytes() });
+                                          connection->getBytesSent(), connection->getBytesReceived(), connection->getQueuedSendBytes(), peer->wasHolePunched() });
             ++(peer->isOutbound() ? diagnostics.activeOutbound : diagnostics.activeInbound);
         }
     }
@@ -1524,6 +1531,15 @@ NetworkDiagnostics Network::getDiagnostics() const {
         if (availability < diagnostics.knownByAvailability.size()) ++diagnostics.knownByAvailability[availability];
     }
     for (const ObservedSelfAddress& observed : this->getObservedSelfAddresses()) diagnostics.observedSelfAddresses.push_back(observed.address);
+    auto& punching = diagnostics.holePunching;
+    punching.behindNat    = this->isBehindNat();
+    punching.privateLinks = this->countPrivateLinks();
+    punching.requested    = this->holePunchCounters.requested.load();
+    punching.declined     = this->holePunchCounters.declined.load();
+    punching.started      = this->holePunchCounters.started.load();
+    punching.connected    = this->holePunchCounters.connected.load();
+    punching.failed       = this->holePunchCounters.failed.load();
+    punching.coordinated  = this->holePunchCounters.coordinated.load();
     return diagnostics;
 }
 
@@ -2174,14 +2190,16 @@ void Network::processHolePunchMessage(const ProtocolMessage& msg) {
         if (!msg.peer->isOutbound())                                    obstacle = HolePunchDeclineReason::NotAllowed;
         else if (this->stopping.load())                                 obstacle = HolePunchDeclineReason::NoSlot;
         else if (this->findActivePeer(offer->initiator))                obstacle = HolePunchDeclineReason::AlreadyConnected;
-        else if (this->connectionSlots.outboundInUse() >= this->config.connectionLimits.outbound.effectiveHard()) obstacle = HolePunchDeclineReason::NoSlot;
+        else if (this->connectionSlots.outboundInUse() >= this->holePunchOutboundLimit())   obstacle = HolePunchDeclineReason::NoSlot;
         if (const auto answer = this->holePunchParticipant->onOffer(from, *offer, obstacle, now)) {
             this->log.format(LogLevel::Debug, "hole punch offer from {} via {}: {}", peerIdShort(offer->initiator), peerIdShort(from),
                              std::holds_alternative<HolePunchAccept>(answer->body) ? "accepted" : holePunchDeclineReasonName(std::get<HolePunchDecline>(answer->body).reason));
             this->sendHolePunchMessages({ *answer });
         }
     } else if (const auto* accept = std::get_if<HolePunchAccept>(&*body)) {
-        this->sendHolePunchMessages(this->holePunchCoordinator->onAccept(from, *accept, now));
+        const auto messages = this->holePunchCoordinator->onAccept(from, *accept, now);
+        if (!messages.empty()) ++this->holePunchCounters.coordinated;
+        this->sendHolePunchMessages(messages);
     } else if (const auto* decline = std::get_if<HolePunchDecline>(&*body)) {
         // Either B's answer to us as R (forwarded to A), or R's word to us as A or B — the nonce tells which
         const auto forwarded = this->holePunchCoordinator->onDecline(from, *decline, now);
@@ -2248,6 +2266,7 @@ void Network::askNextHolePunchCoordinator(const PeerId& target) {
             this->holePunchCoordinatorsLeft.erase(it);
             return;
         }
+        ++this->holePunchCounters.requested;
         this->log.format(LogLevel::Debug, "asking {} to coordinate a hole punch to {}", peerIdShort(via), peerIdShort(target));
         this->sendHolePunchMessages({ *request });
         return;                                                                     // the entry stays until the exchange ends
@@ -2262,9 +2281,22 @@ void Network::onHolePunchFailure(const HolePunchFailure& failure) {
     this->log.format(LogLevel::Info, "hole punch with {} via {} ended: {}", peerIdShort(failure.peer), peerIdShort(failure.via),
                      failure.reason ? holePunchDeclineReasonName(*failure.reason) : std::string_view("no answer in time"));
     if (!holePunchInitiatesHandshake(this->selfIdentity->getPeerId(), failure.peer)) return;   // B: nothing to retry
+    ++this->holePunchCounters.declined;
 
     // A: the coordinator could not help (not the target's neighbor, busy with us, someone left) — ask the next one
     using Reason = HolePunchDeclineReason;
+    if (failure.reason == Reason::SameNetwork) {
+        // One LAN: dial the local addresses instead — the F4 rule (no private addresses of a peer behind NAT relative to
+        // us) does not hold for a pair behind the same NAT. No punching for a while either way.
+        this->holePunchCoordinatorsLeft.erase(failure.peer);
+        this->holePunchParticipant->recordFailedAttempt(failure.peer, std::chrono::steady_clock::now());
+        const auto known = this->peerDirectory->findPeer(failure.peer);
+        if (known && !known->record.addresses.empty()) {
+            this->log.format(LogLevel::Info, "{} shares our public address — dialing its own addresses instead of punching", peerIdShort(failure.peer));
+            this->dialAddresses(known->record.addresses);
+        }
+        return;
+    }
     if (failure.reason == Reason::NotNeighbor || failure.reason == Reason::RateLimited || failure.reason == Reason::PeerLeft) {
         this->askNextHolePunchCoordinator(failure.peer);
         return;
@@ -2281,20 +2313,23 @@ void Network::startHolePunchWorker(const HolePunchStart& start) {
         this->holePunchParticipant->finishPunch(start.peer, true, now);
         return;
     }
+    ++this->holePunchCounters.started;
 
     // From the port of our connection with the coordinator: the NAT mapping it saw and told the other side about
     const auto     via       = this->findActivePeer(start.via);
     const uint16_t localPort = via && via->getConnection() ? via->getConnection()->getLocalPort() : 0;
     if (localPort == 0) {
         this->log.format(LogLevel::Info, "hole punch with {}: connection with {} is gone", peerIdShort(start.peer), peerIdShort(start.via));
+        ++this->holePunchCounters.failed;
         this->holePunchParticipant->finishPunch(start.peer, false, now);
         return;
     }
 
-    // A punched connection is one we chose — an outbound slot on both sides (R10)
-    auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
+    // A punched connection is one we chose — an outbound slot on both sides (R10), from the reserve if private links are short
+    auto slot = this->connectionSlots.tryTakeOutbound(this->holePunchOutboundLimit());
     if (!slot) {
         this->log.format(LogLevel::Info, "hole punch with {}: outbound hard limit reached", peerIdShort(start.peer));
+        ++this->holePunchCounters.failed;
         this->holePunchParticipant->finishPunch(start.peer, false, now);
         return;
     }
@@ -2307,6 +2342,7 @@ void Network::startHolePunchWorker(const HolePunchStart& start) {
         });
     } catch (const std::system_error& e) {
         this->log.format(LogLevel::Critical, "cannot start hole punch worker: {}", e.what());   // slot returns with the lambda
+        ++this->holePunchCounters.failed;
         this->holePunchParticipant->finishPunch(start.peer, false, now);
         return;
     }
@@ -2365,12 +2401,12 @@ void Network::runHolePunchWorker(HolePunchStart start, const uint16_t localPort,
 
     // Registered like any other connection; a duplicate is settled by the tie-break (B4), whose winning direction —
     // the smaller PeerId's outbound — is exactly the punch's initiator
-    auto peer = std::make_shared<Peer>(std::move(result.connection), std::move(result.remoteIdentity), start.initiatesHandshake);
+    // A punched peer holds an outbound slot on both sides and is never dismissed by the inbound soft limit (we agreed to it)
+    auto peer = std::make_shared<Peer>(std::move(result.connection), std::move(result.remoteIdentity), start.initiatesHandshake, true);
     Command cmd;
-    cmd.type        = Command::Type::AddPeer;
-    cmd.peer        = std::move(peer);
-    cmd.slot        = std::move(slot);
-    cmd.holePunched = true;
+    cmd.type = Command::Type::AddPeer;
+    cmd.peer = std::move(peer);
+    cmd.slot = std::move(slot);
     this->commandQueue.push(std::move(cmd));
     this->wakeupIoThread();
 
@@ -2383,8 +2419,91 @@ void Network::collectHolePunchOutcomes() {
     while (this->holePunchOutcomes.tryPop(outcome)) {
         this->holePunchParticipant->finishPunch(outcome.peer, outcome.connected, std::chrono::steady_clock::now());
         this->holePunchCoordinatorsLeft.erase(outcome.peer);
+        ++(outcome.connected ? this->holePunchCounters.connected : this->holePunchCounters.failed);
         if (outcome.connected) this->log.format(LogLevel::Notice, "hole punched to {}", peerIdShort(outcome.peer));
         else                   this->log.format(LogLevel::Info, "hole punch to {} failed: {}", peerIdShort(outcome.peer), outcome.failure);
+    }
+}
+
+namespace {
+    // Whether anyone could dial the peer at an announced address from anywhere
+    bool announcesPublicAddress(const SignedPeerRecord& record) {
+        return std::any_of(record.addresses.begin(), record.addresses.end(), [](const PeerAddress& address) { return !isPrivateAddress(address.address); });
+    }
+}
+
+bool Network::isBehindNat() const {
+    std::lock_guard lock(this->observedSelfMutex);
+    return std::any_of(this->observedSelfAddresses.begin(), this->observedSelfAddresses.end(), [&](const ObservedSelfAddress& observed) {
+        const bool announced = std::any_of(this->config.announcedAddresses.begin(), this->config.announcedAddresses.end(), [&](const PeerAddress& a) { return a.address == observed.address; });
+        return !announced && !isPrivateAddress(observed.address);
+    });
+}
+
+size_t Network::countPrivateLinks() const {
+    size_t links = 0;
+    for (const auto& peer : this->activePeersSnapshot()) {
+        if (peer->wasHolePunched()) { ++links; continue; }
+        const auto known = this->peerDirectory->findPeer(peer->getPeerId());
+        if (known && !announcesPublicAddress(known->record)) ++links;
+    }
+    return links;
+}
+
+uint16_t Network::holePunchOutboundLimit() const {
+    const uint16_t hard    = this->config.connectionLimits.outbound.effectiveHard();
+    const uint16_t reserve = this->config.holePunching.minPrivateLinks;
+    // Full outbound slots must not block the links that keep the mesh alive without public servers (docs/nat-traversal.md 5)
+    return this->countPrivateLinks() < reserve ? static_cast<uint16_t>(hard + reserve) : hard;
+}
+
+std::chrono::milliseconds Network::pickHolePunchPolicyInterval() const {
+    // Random 0.5–1.5 × the interval: nodes that start together (network formation) do not punch in step
+    static thread_local std::mt19937 rng(std::random_device{}());
+    const auto base = std::chrono::duration_cast<std::chrono::milliseconds>(this->config.holePunching.attemptInterval);
+    std::uniform_int_distribution<int64_t> spread(base.count() / 2, std::max<int64_t>(base.count() / 2, base.count() * 3 / 2));
+    return std::chrono::milliseconds(spread(rng));
+}
+
+void Network::tickHolePunchPolicy() {
+    if (!this->config.holePunching.enabled) return;
+    const PeerId& self = this->selfIdentity->getPeerId();
+    const auto    now  = std::chrono::steady_clock::now();
+
+    HolePunchSituation situation;
+    situation.behindNat = this->isBehindNat();
+    if (!situation.behindNat) return;                                               // everyone can dial us
+
+    std::vector<ConnectedPeerInfo> connected;
+    std::vector<PeerId>            registered;
+    {
+        std::shared_lock lock(this->peersMutex);
+        for (const auto& [id, peer] : this->peersById) {
+            registered.push_back(id);
+            if (peer->isActive()) connected.push_back({ id, peer->isOutbound() });
+        }
+    }
+    situation.privateLinks           = this->countPrivateLinks();
+    situation.outboundConnections    = static_cast<size_t>(std::count_if(connected.begin(), connected.end(), [](const ConnectedPeerInfo& p) { return p.isOutbound; }));
+    situation.outboundTarget         = TopologyPlanner::outboundTarget(connected, this->config);
+    situation.dialableCandidatesLeft = !this->collectDialCandidates(registered).empty();
+
+    // Candidates: larger PeerId (the smaller asks), not connected, not something Topology dials, and nobody can dial
+    // them — no public address, or its public addresses failed
+    for (const KnownPeer& known : this->peerDirectory->listPeers()) {
+        const PeerId& id = known.record.peerId;
+        if (!holePunchInitiatesHandshake(self, id)) continue;
+        if (std::find(registered.begin(), registered.end(), id) != registered.end()) continue;
+        if (known.availability == AvailabilityState::Available) continue;
+        if (announcesPublicAddress(known.record) && known.availability != AvailabilityState::Unavailable) continue;
+        if (this->holePunchParticipant->isExchangingWith(id) || this->holePunchParticipant->isResting(id, now)) continue;
+        situation.candidates.push_back({ id, known.record.createdAt });
+    }
+
+    if (const auto target = chooseHolePunchTarget(situation, this->config.holePunching.minPrivateLinks)) {
+        this->log.format(LogLevel::Info, "hole punch policy — {} (private links {}/{}, outbound {}/{})", peerIdShort(*target), situation.privateLinks,
+                         this->config.holePunching.minPrivateLinks, situation.outboundConnections, situation.outboundTarget);
+        this->beginHolePunch(*target);
     }
 }
 

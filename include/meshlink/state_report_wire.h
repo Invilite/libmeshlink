@@ -94,6 +94,14 @@ namespace invilite::Mesh {
             KnownUnavailable        = 0x030A,
             KnownUnknown            = 0x030B,
             KnownProbing            = 0x030C,
+            HolePunchBehindNat      = 0x030D,                                       // 1: peers see the node at a public address it does not announce
+            HolePunchPrivateLinks   = 0x030E,                                       // active links to nodes nobody can dial
+            HolePunchesRequested    = 0x030F,                                       // as A: PUNCH_REQUESTs sent
+            HolePunchesDeclined     = 0x0310,                                       // as A: exchanges ended before NOW
+            HolePunchesStarted      = 0x0311,                                       // NOW received, simultaneous connect began
+            HolePunchesConnected    = 0x0312,
+            HolePunchesFailed       = 0x0313,
+            HolePunchesCoordinated  = 0x0314,                                       // as R: NOW sent to both sides
         };
 
         struct CounterValue {
@@ -123,6 +131,7 @@ namespace invilite::Mesh {
             uint64_t    bytesSent        = 0;
             uint64_t    bytesReceived    = 0;
             uint32_t    sendQueueBytes   = 0;
+            bool        holePunched      = false;                                   // the link came from NAT hole punching (F7); older nodes never set it
 
             bool operator==(const NeighborState&) const = default;
         };

@@ -12,21 +12,25 @@ namespace invilite::Mesh {
         constexpr auto TICK_SATISFIED   = std::chrono::milliseconds(30000);            // outbound target met
     }
 
+    size_t TopologyPlanner::outboundTarget(const std::vector<ConnectedPeerInfo>& connected, const NetworkConfig& config) {
+        const size_t inboundCount = static_cast<size_t>(std::count_if(connected.begin(), connected.end(), [](const ConnectedPeerInfo& p) { return !p.isOutbound; }));
+
+        // Fill up to the healthy total with what inbound does not cover, never below min (we pick those ourselves —
+        // eclipse protection) and never above soft. A public node with plenty of inbound keeps only min outbound; a node
+        // behind NAT (no inbound) dials up to soft.
+        const ConnectionLimits::Outbound& outbound = config.connectionLimits.outbound;
+        const size_t uncovered = config.connectionLimits.total > inboundCount ? config.connectionLimits.total - inboundCount : 0;
+        return std::clamp<size_t>(uncovered, outbound.min, outbound.soft);
+    }
+
     TopologyDecision TopologyPlanner::evaluate(const std::vector<ConnectedPeerInfo>& connected,
                                                const std::vector<SignedPeerRecord>&  candidates,
                                                const NetworkConfig&                  config) const {
         TopologyDecision decision;
 
-        const size_t outboundCount = std::count_if(connected.begin(), connected.end(),
-                                                   [](const ConnectedPeerInfo& p) { return p.isOutbound; });
-        const size_t inboundCount  = connected.size() - outboundCount;
-
-        // Outbound target (R10): fill up to the healthy total with what inbound does not cover, never below min (we pick
-        // those ourselves — eclipse protection) and never above soft. A public node with plenty of inbound keeps only
-        // min outbound; a node behind NAT (no inbound) dials up to soft.
-        const ConnectionLimits::Outbound& outbound = config.connectionLimits.outbound;
-        const size_t uncovered      = config.connectionLimits.total > inboundCount ? config.connectionLimits.total - inboundCount : 0;
-        const size_t outboundTarget = std::clamp<size_t>(uncovered, outbound.min, outbound.soft);
+        const size_t outboundCount  = std::count_if(connected.begin(), connected.end(),
+                                                    [](const ConnectedPeerInfo& p) { return p.isOutbound; });
+        const size_t outboundTarget = TopologyPlanner::outboundTarget(connected, config);  // R10
 
         if (outboundCount >= outboundTarget || candidates.empty()) {
             decision.nextTick = (outboundCount >= outboundTarget)

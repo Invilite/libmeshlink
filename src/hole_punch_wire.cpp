@@ -15,6 +15,7 @@ std::string_view holePunchDeclineReasonName(const HolePunchDeclineReason reason)
         case HolePunchDeclineReason::RateLimited:      return "rate limited";
         case HolePunchDeclineReason::PeerLeft:         return "peer left";
         case HolePunchDeclineReason::NotAllowed:       return "not allowed";
+        case HolePunchDeclineReason::SameNetwork:      return "same network";
     }
     return "unknown";
 }
@@ -83,7 +84,7 @@ namespace {
     }
 
     bool isKnownReason(uint8_t value) {
-        return value >= static_cast<uint8_t>(HolePunchDeclineReason::NoSlot) && value <= static_cast<uint8_t>(HolePunchDeclineReason::NotAllowed);
+        return value >= static_cast<uint8_t>(HolePunchDeclineReason::NoSlot) && value <= static_cast<uint8_t>(HolePunchDeclineReason::SameNetwork);
     }
 }
 

@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include "meshlink/hole_punch_coordinator.h"
 #include "meshlink/hole_punch_participant.h"
+#include "meshlink/hole_punch_policy.h"
 #include "meshlink/hole_punch_wire.h"
 
 using namespace invilite::Mesh;
@@ -144,6 +145,15 @@ TEST(HolePunchCoordinatorTest, RequestsThatCannotBeCoordinatedAreDeclined) {
     EXPECT_EQ(reasonOf(coordinator.onRequest(peerId(0x01), std::nullopt, { B, nonceOf(5) }, EXT_B, T0)), HolePunchDeclineReason::NotAllowed);
 }
 
+TEST(HolePunchCoordinatorTest, PairAtOnePublicAddressIsToldToUseLocalAddresses) {
+    HolePunchCoordinator coordinator;
+    const auto out = coordinator.onRequest(A, EXT_A, { B, nonceOf(1) }, HolePunchEndpoint{ EXT_A.address, 40999 }, T0);
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].peer, A);
+    EXPECT_EQ(bodyAs<HolePunchDecline>(out[0]).reason, HolePunchDeclineReason::SameNetwork);
+    EXPECT_EQ(coordinator.openExchangeCount(), 0u);
+}
+
 TEST(HolePunchCoordinatorTest, OpenExchangesAreBounded) {
     HolePunchCoordinator coordinator({ 10s, 5s, 2 });
     EXPECT_TRUE(std::holds_alternative<HolePunchOffer>(coordinator.onRequest(peerId(1), EXT_A, { B, nonceOf(1) }, EXT_B, T0)[0].body));
@@ -274,4 +284,32 @@ TEST(HolePunchParticipantTest, FailedPunchesRestThePairWithGrowingPauses) {
     b.recordFailedAttempt(A, T0);
     const auto answer = b.onOffer(R, { A, nonceOf(9), EXT_A }, std::nullopt, T0 + 1s);
     EXPECT_EQ(std::get<HolePunchDecline>(answer->body).reason, HolePunchDeclineReason::TooManyAttempts);
+}
+
+// ── policy ────────────────────────────────────────────────────────────────────
+
+TEST(HolePunchPolicyTest, PrivateLinksFirstThenTopologyGapFreshestRecordFirst) {
+    const auto now = std::chrono::system_clock::now();
+    HolePunchSituation situation;
+    situation.behindNat      = true;
+    situation.outboundTarget = 4;
+    situation.candidates     = { { B, now - 1h }, { OTHER, now - 1min }, { R, now - 2h } };
+
+    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // (c): no private link yet
+
+    situation.privateLinks           = 2;
+    situation.outboundConnections    = 2;
+    situation.dialableCandidatesLeft = true;
+    EXPECT_FALSE(chooseHolePunchTarget(situation, 2));                             // Topology can still dial someone
+    situation.dialableCandidatesLeft = false;
+    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // (a): below target, nothing dialable
+    situation.outboundConnections = 4;
+    EXPECT_FALSE(chooseHolePunchTarget(situation, 2));                             // target met
+
+    situation.privateLinks = 0;
+    situation.behindNat    = false;                                                 // everyone can dial us — no punching
+    EXPECT_FALSE(chooseHolePunchTarget(situation, 2));
+    situation.behindNat  = true;
+    situation.candidates.clear();
+    EXPECT_FALSE(chooseHolePunchTarget(situation, 2));
 }

@@ -53,6 +53,9 @@ namespace invilite::Mesh {
         TopologyDecision evaluate(const std::vector<ConnectedPeerInfo>& connected,
                                   const std::vector<SignedPeerRecord>&  candidates,
                                   const NetworkConfig&                  config) const;
+
+        // How many outbound connections Topology aims for with these connections (R10)
+        static size_t outboundTarget(const std::vector<ConnectedPeerInfo>& connected, const NetworkConfig& config);
     };
 
 } // namespace invilite::Mesh

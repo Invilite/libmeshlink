@@ -16,7 +16,7 @@ StateReport fullReport() {
     report.node       = NodeState{ "node-a", 1, 3'600'000, 1'800'000'000'123ULL, 7, peerId(0x05) };
     report.neighbors  = std::vector<NeighborState>{
         { peerId(0x01), true,  true,  120, 10'000, 20'000, 0 },
-        { peerId(0x02), false, false, 5,   300,    400,    1'500 },
+        { peerId(0x02), false, false, 5,   300,    400,    1'500, true },           // hole punched
     };
     report.plumtree   = Counters{ { counterId(StateCounter::GraftsSent), 3 }, { counterId(StateCounter::EagerLinks), 1 } };
     report.routes     = RoutesState{ 2, 0, {
@@ -136,5 +136,6 @@ TEST(StateReportWireTest, OverlongNameIsCut) {
 TEST(StateReportWireTest, CountersHaveStableNames) {
     EXPECT_EQ(counterName(static_cast<uint16_t>(StateCounter::GraftsForMissing)), "grafts_for_missing");
     EXPECT_EQ(counterName(static_cast<uint16_t>(StateCounter::NoSlotsRejectionsSent)), "no_slots_rejections_sent");
+    EXPECT_EQ(counterName(static_cast<uint16_t>(StateCounter::HolePunchesCoordinated)), "hole_punches_coordinated");
     EXPECT_TRUE(counterName(0x0FFF).empty());
 }

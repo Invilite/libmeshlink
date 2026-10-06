@@ -27,7 +27,8 @@ enum class PeerState : uint8_t {
 // Methods are thread-safe where documented; send() never blocks (Connection queues what the socket cannot take).
 class Peer {
 public:
-    Peer(std::shared_ptr<Connection> connection, PeerIdentity identity, bool outbound);
+    // `holePunched`: the connection came from NAT hole punching (F7); `outbound` then names the handshake initiator
+    Peer(std::shared_ptr<Connection> connection, PeerIdentity identity, bool outbound, bool holePunched = false);
     ~Peer() = default;
 
     Peer(const Peer&)            = delete;
@@ -39,6 +40,7 @@ public:
     [[nodiscard]] const PeerIdentity& getIdentity() const { return this->identity; }
     [[nodiscard]] const PeerId& getPeerId() const { return this->identity.getPeerId(); }
     [[nodiscard]] bool isOutbound() const { return this->outbound; }
+    [[nodiscard]] bool wasHolePunched() const { return this->holePunched; }
 
     // ===== Connection access — used by I/O thread for poll() and recv() =====
     [[nodiscard]] int getSocket() const;
@@ -92,6 +94,7 @@ private:
     const std::shared_ptr<Connection>               connection;                     // underlying transport, immutable ref
     const PeerIdentity                              identity;                       // verified remote identity, immutable
     const bool                                      outbound;                       // true if we initiated the connection
+    const bool                                      holePunched;
     const std::chrono::steady_clock::time_point     connectedAt;
 
     std::atomic<PeerState>                          state{PeerState::Joining};

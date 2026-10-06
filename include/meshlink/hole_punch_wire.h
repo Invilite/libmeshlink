@@ -51,6 +51,7 @@ namespace invilite::Mesh {
         RateLimited      = 6,                                                       // A asked R too often
         PeerLeft         = 7,                                                       // the other side left R during the exchange
         NotAllowed       = 8,                                                       // protocol rule broken (e.g. the larger PeerId offered)
+        SameNetwork      = 9,                                                       // R sees both at one public address: one LAN — dial the local addresses
     };
 
     std::string_view holePunchDeclineReasonName(HolePunchDeclineReason reason);

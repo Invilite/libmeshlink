@@ -51,7 +51,7 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         const bool eager = this->plumtree.hasLink(link.peerId) && this->plumtree.isEager(link.peerId);
         ++(eager ? eagerLinks : lazyLinks);
         neighbors.push_back({ link.peerId, link.inbound, eager, static_cast<uint32_t>(std::min<int64_t>(link.connectedFor.count(), UINT32_MAX)),
-                              link.bytesSent, link.bytesReceived, static_cast<uint32_t>(std::min<size_t>(link.sendQueueBytes, UINT32_MAX)) });
+                              link.bytesSent, link.bytesReceived, static_cast<uint32_t>(std::min<size_t>(link.sendQueueBytes, UINT32_MAX)), link.holePunched });
     }
     if (wants(query, StateSection::Neighbors)) report.neighbors = std::move(neighbors);
 
@@ -121,6 +121,15 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         addCounter(state.counters, StateCounter::KnownAvailable, network.knownByAvailability[static_cast<size_t>(AvailabilityState::Available)]);
         addCounter(state.counters, StateCounter::KnownUnavailable, network.knownByAvailability[static_cast<size_t>(AvailabilityState::Unavailable)]);
         addCounter(state.counters, StateCounter::KnownProbing, network.knownByAvailability[static_cast<size_t>(AvailabilityState::Probing)]);
+        const auto& punching = network.holePunching;
+        addCounter(state.counters, StateCounter::HolePunchBehindNat, punching.behindNat ? 1 : 0);
+        addCounter(state.counters, StateCounter::HolePunchPrivateLinks, punching.privateLinks);
+        addCounter(state.counters, StateCounter::HolePunchesRequested, punching.requested);
+        addCounter(state.counters, StateCounter::HolePunchesDeclined, punching.declined);
+        addCounter(state.counters, StateCounter::HolePunchesStarted, punching.started);
+        addCounter(state.counters, StateCounter::HolePunchesConnected, punching.connected);
+        addCounter(state.counters, StateCounter::HolePunchesFailed, punching.failed);
+        addCounter(state.counters, StateCounter::HolePunchesCoordinated, punching.coordinated);
         state.observedSelfAddresses = network.observedSelfAddresses;
     }
     return report;

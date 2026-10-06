@@ -95,6 +95,16 @@ namespace invilite::Mesh {
             std::chrono::seconds    interval = std::chrono::seconds(15);
             int                     probes   = 4;
         }                           tcpKeepalive;
+        // NAT hole punching (F7, docs/nat-traversal.md). Only a node behind NAT punches on its own; every node coordinates
+        // for its neighbors and answers offers.
+        struct HolePunching {
+            bool                    enabled         = true;                         // off: no punches of our own (requestHolePunch still works)
+            uint16_t                minPrivateLinks = 2;                            // direct links to nodes nobody can dial; also the slot reserve for them
+            std::chrono::seconds    attemptInterval = std::chrono::seconds(20);     // average pause between our own attempts (0.5–1.5×, spread over the mesh)
+            // R answers SameNetwork when both sides come from one public address (docs/nat-traversal.md 6). Off only in
+            // loopback tests, where every node is 127.0.0.1.
+            bool                    sameNetworkShortcut = true;
+        }                           holePunching;
         // A peer whose queued frames made no progress for this long has stopped reading — its connection is closed.
         std::chrono::seconds        sendStallTimeout        = std::chrono::seconds(15);
 
@@ -152,6 +162,19 @@ namespace invilite::Mesh {
             uint64_t                    bytesSent      = 0;                         // application bytes, before encryption
             uint64_t                    bytesReceived  = 0;
             size_t                      sendQueueBytes = 0;                         // encrypted frames waiting for the socket
+            bool                        holePunched    = false;                     // came from NAT hole punching (F7)
+        };
+
+        // NAT hole punching since start (F7); without these a test on a real network says nothing
+        struct HolePunching {
+            bool                        behindNat   = false;                        // peers see us at a public address we do not announce
+            size_t                      privateLinks = 0;                           // active links to peers nobody can dial
+            uint64_t                    requested   = 0;                            // as A: exchanges started (PUNCH_REQUEST sent)
+            uint64_t                    declined    = 0;                            // as A: ended before NOW — declined or no answer in time
+            uint64_t                    started     = 0;                            // as A or B: NOW received, simultaneous connect began
+            uint64_t                    connected   = 0;                            // ... and ended with a verified connection
+            uint64_t                    failed      = 0;                            // ... and ended without one
+            uint64_t                    coordinated = 0;                            // as R: NOW sent to both sides
         };
 
         std::string                     nodeName;                                   // as announced in handshakes (NetworkConfig::nodeName)
@@ -165,6 +188,7 @@ namespace invilite::Mesh {
         size_t                          knownPeers         = 0;
         std::array<size_t, 4>           knownByAvailability{};                      // indexed by AvailabilityState
         std::vector<std::string>        observedSelfAddresses;                      // as getObservedSelfAddresses, addresses only
+        HolePunching                    holePunching;
     };
 
     class Network {
@@ -250,9 +274,6 @@ namespace invilite::Mesh {
             Type                                    type = Type::AddPeer;
             std::shared_ptr<Peer>                   peer;
             std::optional<ConnectionSlots::Slot>    slot;                               // resources the connection holds — kept until it closes (R10)
-            // Agreed in a hole punch (F7): holds an outbound slot on both sides, so the inbound soft limit does not dismiss
-            // it on the side that is the handshake responder
-            bool                                    holePunched = false;
         };
 
         // Connection-layer fact handed to the management thread (I/O → Management). Replaces the old "send HELLO"
@@ -398,6 +419,17 @@ namespace invilite::Mesh {
         void onNeighborClosed(const PeerId& neighbor);
         void joinFinishedHolePunchWorkers();
         [[nodiscard]] std::shared_ptr<Peer> findActivePeer(const PeerId& peerId) const;
+        // Policy (F7-d, docs/nat-traversal.md 5): one punch of our own when the situation asks for it
+        void tickHolePunchPolicy();
+        [[nodiscard]] std::chrono::milliseconds pickHolePunchPolicyInterval() const;
+        // Peers see us at a public address we do not announce
+        [[nodiscard]] bool isBehindNat() const;
+        // Active links to peers nobody can dial (punched, or a record without a public address)
+        [[nodiscard]] size_t countPrivateLinks() const;
+        // Outbound hard limit for a punch: the reserve for private links on top while they are below minPrivateLinks
+        [[nodiscard]] uint16_t holePunchOutboundLimit() const;
+        // Topology's dial candidates (R9 backoff, F4 dialable addresses), excluding every registered peer
+        [[nodiscard]] std::vector<SignedPeerRecord> collectDialCandidates(const std::vector<PeerId>& registered) const;
 
         // ===== Helpers =====
         void wakeupIoThread() const;
@@ -531,6 +563,9 @@ namespace invilite::Mesh {
         std::vector<std::unique_ptr<HandshakeWorker>>                   holePunchWorkers;
         ThreadSafeQueue<PeerId>                                         holePunchRequests;              // requestHolePunch (any thread) → Management
         ThreadSafeQueue<HolePunchOutcome>                               holePunchOutcomes;              // punch workers → Management
+        struct HolePunchCounters {                                                                    // management thread writes, diagnostics read
+            std::atomic<uint64_t> requested{0}, declined{0}, started{0}, connected{0}, failed{0}, coordinated{0};
+        }                                                               holePunchCounters;
 
         TopologyPlanner topologyPlanner;
     };

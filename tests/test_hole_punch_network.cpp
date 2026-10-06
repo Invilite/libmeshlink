@@ -54,7 +54,8 @@ void announceNothing(NetworkConfig& config) { config.announcedAddresses.clear();
 
 TEST(HolePunchNetworkTest, TwoNodesNobodyCanDialConnectDirectlyThroughCommonNeighbor) {
     const auto secret = makeSecret();
-    TestNode coordinator(secret, "R");
+    // On loopback every node is 127.0.0.1 — R would take the pair for one LAN (SameNetwork) without this
+    TestNode coordinator(secret, "R", [](NetworkConfig& config) { config.holePunching.sameNetworkShortcut = false; });
     TestNode first(secret, "first", announceNothing), second(secret, "second", announceNothing);
     TestNode& smaller = first.identity->getPeerId() < second.identity->getPeerId() ? first : second;   // only the smaller asks
     TestNode& larger  = &smaller == &first ? second : first;
@@ -82,6 +83,20 @@ TEST(HolePunchNetworkTest, TwoNodesNobodyCanDialConnectDirectlyThroughCommonNeig
     EXPECT_EQ(coordinator.network->getConnectedPeerCount(), 2u);
     EXPECT_TRUE(isConnectedTo(smaller, coordinator));
     EXPECT_TRUE(isConnectedTo(larger, coordinator));
+
+    // Counters for a real network test (F7-d): R coordinated once, both sides started and connected, the link is marked
+    // (the management thread counts a punch when it collects the worker's outcome — just after the peer is registered)
+    ASSERT_TRUE(waitUntil([&] { return smaller.network->getDiagnostics().holePunching.connected == 1 && larger.network->getDiagnostics().holePunching.connected == 1; }, 2s));
+    const auto atSmaller = smaller.network->getDiagnostics().holePunching;
+    const auto atLarger  = larger.network->getDiagnostics().holePunching;
+    EXPECT_EQ(coordinator.network->getDiagnostics().holePunching.coordinated, 1u);
+    EXPECT_GE(atSmaller.requested, 1u);
+    EXPECT_EQ(atSmaller.connected, 1u);
+    EXPECT_EQ(atLarger.started, 1u);
+    EXPECT_EQ(atLarger.connected, 1u);
+    EXPECT_EQ(atSmaller.privateLinks, 2u);                                          // R announces only a private address on loopback too
+    const auto links = smaller.network->getDiagnostics().links;
+    EXPECT_EQ(std::count_if(links.begin(), links.end(), [](const NetworkDiagnostics::Link& link) { return link.holePunched; }), 1);
 
     larger.network->stop();
     smaller.network->stop();

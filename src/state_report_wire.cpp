@@ -21,6 +21,7 @@ namespace {
     constexpr uint8_t  FLAG_TRUNCATED      = 0x01;
     constexpr uint8_t  NEIGHBOR_INBOUND    = 0x01;
     constexpr uint8_t  NEIGHBOR_EAGER      = 0x02;
+    constexpr uint8_t  NEIGHBOR_HOLE_PUNCHED = 0x04;
     // flag 0x04 was "pinned" (withdrawn) — not reused
     constexpr uint32_t RTT_UNKNOWN         = 0xFFFFFFFF;
 
@@ -93,7 +94,7 @@ namespace {
         for (size_t i = 0; i < count; ++i) {
             const NeighborState& neighbor = neighbors[i];
             writePeerId(out, neighbor.peerId);
-            out.push_back(static_cast<uint8_t>((neighbor.inbound ? NEIGHBOR_INBOUND : 0) | (neighbor.eager ? NEIGHBOR_EAGER : 0)));
+            out.push_back(static_cast<uint8_t>((neighbor.inbound ? NEIGHBOR_INBOUND : 0) | (neighbor.eager ? NEIGHBOR_EAGER : 0) | (neighbor.holePunched ? NEIGHBOR_HOLE_PUNCHED : 0)));
             writeBE32(out, neighbor.connectedSeconds);
             writeBE64(out, neighbor.bytesSent);
             writeBE64(out, neighbor.bytesReceived);
@@ -113,6 +114,7 @@ namespace {
             reader.readU8(flags);
             neighbor.inbound = (flags & NEIGHBOR_INBOUND) != 0;
             neighbor.eager   = (flags & NEIGHBOR_EAGER) != 0;
+            neighbor.holePunched = (flags & NEIGHBOR_HOLE_PUNCHED) != 0;
             readBE(reader, neighbor.connectedSeconds);
             readBE(reader, neighbor.bytesSent);
             readBE(reader, neighbor.bytesReceived);
@@ -236,6 +238,14 @@ std::string_view counterName(uint16_t id) {
         case StateCounter::KnownUnavailable: return "known_unavailable";
         case StateCounter::KnownUnknown: return "known_unknown";
         case StateCounter::KnownProbing: return "known_probing";
+        case StateCounter::HolePunchBehindNat: return "hole_punch_behind_nat";
+        case StateCounter::HolePunchPrivateLinks: return "hole_punch_private_links";
+        case StateCounter::HolePunchesRequested: return "hole_punches_requested";
+        case StateCounter::HolePunchesDeclined: return "hole_punches_declined";
+        case StateCounter::HolePunchesStarted: return "hole_punches_started";
+        case StateCounter::HolePunchesConnected: return "hole_punches_connected";
+        case StateCounter::HolePunchesFailed: return "hole_punches_failed";
+        case StateCounter::HolePunchesCoordinated: return "hole_punches_coordinated";
     }
     return {};
 }
