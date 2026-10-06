@@ -107,7 +107,7 @@ Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, s
       inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity), unsignedSeenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
       plumtree(config.plumtree), treeRootElection(this->selfIdentity->getPeerId(), config.treeRoot),
       probeScheduler([&] { ProbeSchedulerConfig probing = config.routeEvaluation.probing; probing.probeTimeout = config.routeEvaluation.probeTimeout; return probing; }()),
-      broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
+      broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), deliveredUnicastBases(config.duplicateWindow, config.duplicateCacheCapacity), routes(config.routes) {}
 
 Router::~Router() {
     this->stop();
@@ -125,6 +125,7 @@ void Router::start() {
     this->awaitedReplies.clear();
     this->awaitedReplyOrder.clear();
     this->answerDeadlines.clear();
+    this->retainedBytes = 0;
     {
         ProbeSchedulerConfig probing = this->config.routeEvaluation.probing;
         probing.probeTimeout = this->config.routeEvaluation.probeTimeout;
@@ -220,7 +221,7 @@ std::optional<uint64_t> Router::send(const PeerId& destination, uint8_t group, u
     message.ackRequested      = options.ackRequested;
     message.ttlInitial        = this->config.unicastTtl;
     message.ttlRemaining      = this->config.unicastTtl;
-    message.msgId             = randomMessageId();
+    message.msgId             = RouterWire::baseMessageId(randomMessageId());   // the two low bits number retries (R-8 e)
     message.sentAtUnixSeconds = currentUnixSeconds();
     message.sender            = this->selfIdentity->getPeerId();
     message.destination       = destination;
@@ -278,7 +279,8 @@ RouterStatistics Router::getStatistics() const {
              this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load(),
              this->stateRepliesSent.load(), this->delivered.load(), this->unicastForwarded.load(), this->acksReceived.load(), this->routeErrorsReceived.load(),
              this->ihaveKeysReceived.load(), this->graftsReceived.load(), this->prunesReceived.load(), this->graftsForMissing.load(), this->unknownModeReportsSent.load(),
-             this->clockWindowRejections.load(), this->treeBeaconsSent.load(), this->routeMeasurements.load(), this->routeFailures.load(), this->scheduledProbes.load() };
+             this->clockWindowRejections.load(), this->treeBeaconsSent.load(), this->routeMeasurements.load(), this->routeFailures.load(), this->scheduledProbes.load(),
+             this->retriesSent.load(), this->acksMissing.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -522,8 +524,19 @@ void Router::processEvent(Event& event) {
             if (isRouteProbe) this->awaitedReplies[content.message.msgId].measuresRoute = true;
             if (isRouted) {
                 this->forwardRouted(content.message, std::nullopt);
-            } else if (const std::optional<PeerId> firstHop = this->forwardUnicast(content.message, std::nullopt); firstHop && judgesRoute) {
-                this->setFirstHop(content.message.msgId, *firstHop, isRouteProbe ? this->config.routeEvaluation.probeTimeout : this->config.routeEvaluation.ackTimeout);
+            } else {
+                // Data asking for an ACK is resent when the ACK does not come (R-8 e): a copy is kept, within a byte budget
+                if (content.message.ackRequested && !isRouterMessage) {
+                    AwaitedReply& reply = this->awaitedReplies[content.message.msgId];
+                    reply.reportsMissingAck = true;
+                    const size_t size = content.message.payload.size() + RouterWire::FIXED_HEADER_SIZE;
+                    if (this->config.routeEvaluation.maxRetries > 0 && this->retainedBytes + size <= this->config.routeEvaluation.retainedForRetryBytes) {
+                        reply.retained = content.message;
+                        this->retainedBytes += size;
+                    }
+                }
+                const std::optional<PeerId> firstHop = this->forwardUnicast(content.message, std::nullopt);
+                if (judgesRoute) this->armAnswerTimer(content.message.msgId, firstHop, isRouteProbe ? this->config.routeEvaluation.probeTimeout : this->config.routeEvaluation.ackTimeout);
             }
         } else if constexpr (std::is_same_v<T, Event::MeasureRequested>) {
             this->startMeasurement(content.probe, content.via, true);
@@ -792,18 +805,22 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
     RouterWire::decodeAckPayload(ack.payload, payload);                            // shape checked by decode
     // The ACK may come back any way: for the neighbor it came over only a hint (docs/router.md 4.4a). What it proves is
     // that the message we handed our first hop got through — a delivery for that route.
-    const auto awaited = this->awaitedReplies.find(payload.acknowledgedMsgId);
-    const std::optional<PeerId> firstHop = awaited != this->awaitedReplies.end() ? awaited->second.firstHop : std::nullopt;
+    // A retry's ACK names the attempt (two low msgId bits, R-8 e): it credits that attempt's first hop
+    uint8_t attempt = 0;
+    AwaitedReply* awaited = this->findAwaited(payload.acknowledgedMsgId, attempt);
+    const uint64_t awaitedMsgId = attempt == 0 ? payload.acknowledgedMsgId : RouterWire::baseMessageId(payload.acknowledgedMsgId);
+    const std::optional<PeerId> firstHop = awaited ? awaited->firstHopByAttempt[attempt] : std::nullopt;
     const auto rtt = this->acceptAnswer(payload.acknowledgedMsgId, ack.sender);
     this->learnRoute(ack.sender, receivedFrom, hopsTraveled(ack));
     if (!rtt) return;                                                               // not asked for, not from the addressee, a repeat or too late
     ++this->acksReceived;
+    this->releaseRetained(*awaited);                                               // delivered: nothing to resend
     if (firstHop) {
         std::lock_guard lock(this->routesMutex);
         this->routes.recordDelivery(ack.sender, *firstHop, std::chrono::steady_clock::now());
     }
 
-    const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
+    const AckReceipt receipt{ awaitedMsgId, ack.sender, *rtt, hopsTraveled(ack), attempt };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
 }
 
@@ -1030,26 +1047,89 @@ void Router::startMeasurement(const RoutedMessage& probe, const PeerId& via, boo
         this->recordRouteFailure(*probe.destination, via);
         return;
     }
-    this->setFirstHop(probe.msgId, via, this->config.routeEvaluation.probeTimeout);
+    this->armAnswerTimer(probe.msgId, via, this->config.routeEvaluation.probeTimeout);
 }
 
-void Router::setFirstHop(uint64_t msgId, const PeerId& firstHop, std::chrono::milliseconds answerTimeout) {
+void Router::armAnswerTimer(uint64_t msgId, const std::optional<PeerId>& firstHop, std::chrono::milliseconds answerTimeout) {
     const auto awaited = this->awaitedReplies.find(msgId);
     if (awaited == this->awaitedReplies.end()) return;
-    awaited->second.firstHop = firstHop;
-    this->answerDeadlines.emplace(awaited->second.sentAt + answerTimeout, msgId);
+    AwaitedReply& reply = awaited->second;
+    reply.firstHop = firstHop;
+    reply.firstHopByAttempt[reply.attempt] = firstHop;
+    this->answerDeadlines.emplace(reply.attemptSentAt + answerTimeout, std::pair{ msgId, reply.attempt });
 }
 
 // An ACK or report that did not come in time fails the route through the first hop (docs/router.md 4.4a)
 void Router::checkAnswerDeadlines(std::chrono::steady_clock::time_point now) {
     while (!this->answerDeadlines.empty() && this->answerDeadlines.begin()->first <= now) {
-        const uint64_t msgId = this->answerDeadlines.begin()->second;
+        const auto [msgId, attempt] = this->answerDeadlines.begin()->second;
         this->answerDeadlines.erase(this->answerDeadlines.begin());
         const auto awaited = this->awaitedReplies.find(msgId);
-        if (awaited == this->awaitedReplies.end() || !awaited->second.answeredBy.empty() || !awaited->second.firstHop || !awaited->second.addressee) continue;
-        if (awaited->second.measuresRoute) this->probeScheduler.noteProbeFinished(*awaited->second.addressee, *awaited->second.firstHop);
-        this->recordRouteFailure(*awaited->second.addressee, *awaited->second.firstHop);
+        // Answered, or a later attempt is under way: nothing to judge
+        if (awaited == this->awaitedReplies.end() || !awaited->second.answeredBy.empty() || awaited->second.attempt != attempt || !awaited->second.addressee) continue;
+        AwaitedReply& reply = awaited->second;
+        if (reply.firstHop) {
+            if (reply.measuresRoute) this->probeScheduler.noteProbeFinished(*reply.addressee, *reply.firstHop);
+            this->recordRouteFailure(*reply.addressee, *reply.firstHop);
+        }
+        if (reply.reportsMissingAck && !reply.gaveUp) this->retryOrGiveUp(msgId);
     }
+}
+
+// R-8 e: the next attempt — the best route now (the failed one was demoted), the last one by local flooding on every hop
+// — or, out of attempts or without a kept copy, onAckMissing
+void Router::retryOrGiveUp(uint64_t msgId) {
+    AwaitedReply& reply = this->awaitedReplies.at(msgId);
+    if (!reply.retained || reply.attempt >= this->config.routeEvaluation.maxRetries || reply.attempt >= RouterWire::LAST_ATTEMPT) {
+        ++this->acksMissing;
+        const AckMissing missing{ *reply.addressee, msgId, static_cast<uint8_t>(reply.attempt + 1) };
+        this->releaseRetained(reply);
+        reply.gaveUp = true;
+        this->notifyListeners([&](RouterEventListener& listener) { listener.onAckMissing(missing); }, "onAckMissing");
+        return;
+    }
+    ++reply.attempt;
+    ++this->retriesSent;
+    RoutedMessage retry = *reply.retained;
+    retry.msgId        = msgId | reply.attempt;
+    retry.ttlRemaining = retry.ttlInitial;
+    reply.attemptSentAt = std::chrono::steady_clock::now();
+    this->rememberSeen(retry);
+    std::optional<PeerId> firstHop;
+    if (reply.attempt == RouterWire::LAST_ATTEMPT || reply.attempt == this->config.routeEvaluation.maxRetries) {
+        // The last chance does not trust route tables (a stale entry on some hop could swallow every attempt)
+        retry.msgId = msgId | RouterWire::LAST_ATTEMPT;
+        this->floodLocally(retry, std::nullopt);
+    } else {
+        std::vector<PeerId> alreadyTried;                                           // the next route, not the one that failed
+        for (const auto& hop : reply.firstHopByAttempt) if (hop) alreadyTried.push_back(*hop);
+        firstHop = this->forwardUnicast(retry, std::nullopt, alreadyTried);
+    }
+    this->armAnswerTimer(msgId, firstHop, this->config.routeEvaluation.ackTimeout);
+}
+
+void Router::releaseRetained(AwaitedReply& reply) {
+    if (!reply.retained) return;
+    this->retainedBytes -= std::min(this->retainedBytes, reply.retained->payload.size() + RouterWire::FIXED_HEADER_SIZE);
+    reply.retained.reset();
+}
+
+Router::AwaitedReply* Router::findAwaited(uint64_t answeredMsgId, uint8_t& attempt) {
+    if (const auto exact = this->awaitedReplies.find(answeredMsgId); exact != this->awaitedReplies.end()) {
+        attempt = 0;
+        return &exact->second;
+    }
+    const auto base = this->awaitedReplies.find(RouterWire::baseMessageId(answeredMsgId));
+    if (base == this->awaitedReplies.end() || !base->second.reportsMissingAck) return nullptr;   // only resent data numbers its attempts
+    attempt = RouterWire::attemptOf(answeredMsgId);
+    return &base->second;
+}
+
+void Router::eraseAwaited(uint64_t msgId) {
+    const auto awaited = this->awaitedReplies.find(msgId);
+    if (awaited == this->awaitedReplies.end()) return;
+    this->releaseRetained(awaited->second);
+    this->awaitedReplies.erase(awaited);
 }
 
 void Router::recordRouteFailure(const PeerId& destination, const PeerId& via) {
@@ -1063,11 +1143,12 @@ void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, 
     const auto now = std::chrono::steady_clock::now();
     this->dropExpiredAwaitedReplies(now);
     if (this->awaitedReplyOrder.size() >= this->config.maxAwaitedReplies && !this->awaitedReplyOrder.empty()) {
-        this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
+        this->eraseAwaited(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
     AwaitedReply& reply = this->awaitedReplies[msgId] = AwaitedReply{};
     reply.sentAt         = now;
+    reply.attemptSentAt  = now;
     reply.addressee      = addressee;
     reply.acceptsAnswers = acceptsAnswers;
     reply.routeRelays    = std::move(routeRelays);
@@ -1078,17 +1159,20 @@ void Router::awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, 
 // the addressee (anyone for a broadcast — every node is one) and has not answered yet. Kept until the window ends: a
 // broadcast collects one ACK from every node. Answers are signed by the answerer, so a relay cannot answer for another.
 std::optional<std::chrono::milliseconds> Router::acceptAnswer(uint64_t awaitedMsgId, const PeerId& answerer) {
-    const auto awaited = this->awaitedReplies.find(awaitedMsgId);
-    if (awaited == this->awaitedReplies.end()) return std::nullopt;
-    AwaitedReply& reply = awaited->second;
+    uint8_t attempt = 0;
+    AwaitedReply* found = this->findAwaited(awaitedMsgId, attempt);
+    if (!found) return std::nullopt;
+    AwaitedReply& reply = *found;
     if (!reply.acceptsAnswers || (reply.addressee && *reply.addressee != answerer)) return std::nullopt;
     if (!reply.answeredBy.insert(answerer).second) return std::nullopt;
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - reply.sentAt);
+    // The round trip of the attempt answered — the latest one is timed from its own send
+    const auto sentAt = attempt == reply.attempt ? reply.attemptSentAt : reply.sentAt;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - sentAt);
 }
 
 void Router::dropExpiredAwaitedReplies(std::chrono::steady_clock::time_point now) {
     while (!this->awaitedReplyOrder.empty() && now - this->awaitedReplyOrder.front().first >= this->config.replyWaitWindow) {
-        this->awaitedReplies.erase(this->awaitedReplyOrder.front().second);
+        this->eraseAwaited(this->awaitedReplyOrder.front().second);
         this->awaitedReplyOrder.pop_front();
     }
 }
@@ -1190,7 +1274,13 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
     this->rememberSeen(message);
 
     if (message.destination == this->selfIdentity->getPeerId()) {
-        this->deliverLocally(message, message.sender == receivedFrom);               // the link proves only a direct neighbor
+        // Every attempt is a message of its own to relays, but the application gets it once; each attempt is answered,
+        // since it is the ACK that may have been lost (R-8 e)
+        const RoutedMessageKey base{ message.sender, RouterWire::baseMessageId(message.msgId) };
+        if (!this->deliveredUnicastBases.contains(base)) {
+            this->deliveredUnicastBases.remember(base, std::min(message.sentAtUnixSeconds, currentUnixSeconds()), std::chrono::steady_clock::now());
+            this->deliverLocally(message, message.sender == receivedFrom);           // the link proves only a direct neighbor
+        }
         if (message.ackRequested && this->mayAcknowledgeUnsigned(message.sender, receivedFrom)) this->sendAck(message);
         return;
     }
@@ -1199,7 +1289,8 @@ void Router::handleIncomingUnicast(RoutedMessage message, const PeerId& received
         return;
     }
     message.ttlRemaining -= 1;
-    this->forwardUnicast(message, receivedFrom);
+    if (RouterWire::attemptOf(message.msgId) == RouterWire::LAST_ATTEMPT && message.ackRequested) this->floodLocally(message, receivedFrom);   // the last chance trusts no route table
+    else                                                                                                     this->forwardUnicast(message, receivedFrom);
 }
 
 // docs/router.md 4.2, unsigned ROUTED data: like UNICAST — seen at once, nothing learned — but the route is the sender's
@@ -1253,14 +1344,15 @@ void Router::forwardRouted(const RoutedMessage& outgoing, const std::optional<Pe
 
 // The next hop for one node: the destination itself when it is a neighbor, else the learned routes in order (the first
 // that accepts the send), else every neighbor but the one it came from — local flooding, bounded by TTL and duplicates
-std::optional<PeerId> Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
+std::optional<PeerId> Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, const std::vector<PeerId>& alreadyTried) {
+    const auto tried = [&](const PeerId& hop) { return std::find(alreadyTried.begin(), alreadyTried.end(), hop) != alreadyTried.end(); };
     const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
     if (frame.empty()) return std::nullopt;
     this->noteDataTraffic(outgoing);
     const PeerId& destination = *outgoing.destination;
     const std::vector<PeerId> neighbors = this->neighborsSnapshot();
 
-    if (std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) {
+    if (!tried(destination) && std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) {
         if (receivedFrom) ++this->unicastForwarded;
         return destination;
     }
@@ -1271,17 +1363,24 @@ std::optional<PeerId> Router::forwardUnicast(const RoutedMessage& outgoing, cons
         nextHops = this->routes.nextHops(destination, receivedFrom);
     }
     for (const PeerId& nextHop : nextHops) {
-        if (nextHop != outgoing.sender && this->sendFullCopy(nextHop, frame)) {
+        if (nextHop != outgoing.sender && !tried(nextHop) && this->sendFullCopy(nextHop, frame)) {
             if (receivedFrom) ++this->unicastForwarded;
             return nextHop;
         }
     }
 
+    this->floodLocally(outgoing, receivedFrom);
+    return std::nullopt;
+}
+
+// Every neighbor but the one it came from and its sender — bounded by TTL and duplicates (docs/router.md 4.2)
+void Router::floodLocally(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom) {
+    const std::vector<uint8_t> frame = RouterWire::encode(outgoing);
+    if (frame.empty()) return;
     ++this->localFloods;
-    for (const PeerId& neighbor : neighbors) {
+    for (const PeerId& neighbor : this->neighborsSnapshot()) {
         if (neighbor != receivedFrom && neighbor != outgoing.sender) this->sendFullCopy(neighbor, frame);
     }
-    return std::nullopt;
 }
 
 void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticated) {

@@ -41,6 +41,8 @@ namespace invilite::Mesh {
         std::chrono::milliseconds   ackTimeout              = std::chrono::seconds(5);    // no ACK by then: a failure for the first hop it went to
         std::chrono::milliseconds   probeTimeout            = std::chrono::seconds(5);    // no report by then: a failed measurement
         ProbeSchedulerConfig        probing;                                        // which routes to measure when (its probeTimeout is the one above)
+        uint8_t                     maxRetries              = 3;                    // resends of data without ACK (≤ 3: two msgId bits); 0 = none
+        size_t                      retainedForRetryBytes   = 8 * 1024 * 1024;      // copies kept for resending; beyond it a message is not retried
     };
 
     // Router parameters (docs/router.md 5, initial values)
@@ -104,6 +106,8 @@ namespace invilite::Mesh {
         uint64_t    routeMeasurements  = 0;                                         // probes that came back the same way (RTT recorded)
         uint64_t    routeFailures      = 0;                                         // failed measurements and ACKs that did not come in time
         uint64_t    scheduledProbes    = 0;                                         // probes the scheduler sent (measureRoute not counted)
+        uint64_t    retriesSent        = 0;                                         // resends of data whose ACK did not come
+        uint64_t    acksMissing        = 0;                                         // messages given up without an ACK (onAckMissing)
     };
 
     struct SendOptions {
@@ -142,7 +146,9 @@ namespace invilite::Mesh {
         std::optional<uint64_t> broadcast(uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, RoutingMode mode = RoutingMode::Broadcast, SendOptions options = {});
 
         // Send to one node (UNICAST): each hop picks the next one — a direct neighbor, a learned route, or local flooding
-        // when nothing is known. Not signed (D12). Returns the message id, or nothing when the Router is not running,
+        // when nothing is known. Not signed (D12). With options.ackRequested a message without an ACK in ackTimeout is
+        // resent up to maxRetries times (the next route; the last one floods locally) and finally reported as onAckMissing;
+        // the destination delivers it once. The returned id has its two lowest bits clear (they number the attempts). Returns the message id, or nothing when the Router is not running,
         // `group` is not a user group or `destination` is this node.
         std::optional<uint64_t> send(const PeerId& destination, uint8_t group, uint16_t subtype, std::vector<uint8_t> payload, SendOptions options = {});
 
@@ -185,6 +191,7 @@ namespace invilite::Mesh {
     private:
         class EventInbox;                                                           // NetworkEventListener → Router queue
         struct Event;
+        struct AwaitedReply;
 
         // A broadcast whose sender's record we do not have yet; waits for the PEX_REQUEST answer (docs/router.md 4.1)
         struct PendingVerification {
@@ -225,11 +232,18 @@ namespace invilite::Mesh {
         void sendOwnRouterMessage(const RoutedMessage& message);
         void learnRoute(const PeerId& destination, const PeerId& via, uint8_t hops);   // a hint (docs/router.md 4.4a)
         void startMeasurement(const RoutedMessage& probe, const PeerId& via, bool reportToListeners);
-        // The first hop our message `msgId` went to, when it went to one neighbor: an answer judges that route
-        void setFirstHop(uint64_t msgId, const PeerId& firstHop, std::chrono::milliseconds answerTimeout);
+        // Our message `msgId` was sent (its latest attempt): its answer is due within `answerTimeout`; `firstHop` — the
+        // one neighbor it went to, if one — is judged by the answer or its absence
+        void armAnswerTimer(uint64_t msgId, const std::optional<PeerId>& firstHop, std::chrono::milliseconds answerTimeout);
         void checkAnswerDeadlines(std::chrono::steady_clock::time_point now);
         void recordRouteFailure(const PeerId& destination, const PeerId& via);
         void sendScheduledProbes(std::chrono::steady_clock::time_point now);
+        void retryOrGiveUp(uint64_t msgId);                                         // its ACK did not come in time
+        void releaseRetained(AwaitedReply& reply);
+        // The awaited message an answer refers to: the id itself, or — for a retry's ACK — its base id; `attempt` tells which send
+        AwaitedReply* findAwaited(uint64_t answeredMsgId, uint8_t& attempt);
+        void eraseAwaited(uint64_t msgId);
+        void floodLocally(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
         void noteDataTraffic(const RoutedMessage& message);                         // point-to-point user data sent or relayed: its destination is active
         // addressee nullopt: every node answers (broadcast); routeRelays: a ROUTED message, which may get a ROUTE_ERROR
         void awaitReply(uint64_t msgId, const std::optional<PeerId>& addressee, bool acceptsAnswers, std::optional<std::vector<PeerId>> routeRelays = std::nullopt);
@@ -255,8 +269,9 @@ namespace invilite::Mesh {
         void sendDuePresenceReplies(std::chrono::steady_clock::time_point now);
         void rememberPresenceReply(const PeerId& sender, std::chrono::steady_clock::time_point now);
         void handleIncomingUnicast(RoutedMessage message, const PeerId& receivedFrom);
-        // Returns the one neighbor it went to; nothing for local flooding or when nobody took it
-        std::optional<PeerId> forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
+        // Returns the one neighbor it went to; nothing for local flooding or when nobody took it. `alreadyTried`: first
+        // hops of earlier attempts of the same message (R-8 e) — skipped; with none left it floods locally.
+        std::optional<PeerId> forwardUnicast(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, const std::vector<PeerId>& alreadyTried = {});
         void handleIncomingRouted(RoutedMessage message, const PeerId& receivedFrom);
         void relayRouted(RoutedMessage message, const PeerId& receivedFrom);
         void forwardRouted(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom);
@@ -301,11 +316,19 @@ namespace invilite::Mesh {
             std::optional<PeerId>                   firstHop;                       // where we handed it: an answer, or its absence, judges that route
             bool                                    measuresRoute = false;          // a RECORD_ROUTE probe: the report is a measurement (4.4a)
             bool                                    reportToListeners = true;       // onRouteReported (internal probes of the scheduler stay quiet)
+            uint8_t                                 attempt = 0;                    // the latest send: 0 the first, 1–3 retries
+            std::array<std::optional<PeerId>, 4>    firstHopByAttempt;              // a late ACK of an earlier attempt credits its own first hop
+            std::optional<RoutedMessage>            retained;                       // the data, kept for resending
+            std::chrono::steady_clock::time_point   attemptSentAt;
+            bool                                    reportsMissingAck = false;      // data from send() with ackRequested: resent, finally onAckMissing
+            bool                                    gaveUp = false;                 // onAckMissing reported; a late ACK still counts as a delivery
             std::unordered_set<PeerId, PeerIDHash>  answeredBy;                     // each answers once; bounded by the verified records we hold
         };
         std::unordered_map<uint64_t, AwaitedReply>  awaitedReplies;
         std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> awaitedReplyOrder;
-        std::multimap<std::chrono::steady_clock::time_point, uint64_t> answerDeadlines;   // ackTimeout / probeTimeout of messages with a first hop
+        std::multimap<std::chrono::steady_clock::time_point, std::pair<uint64_t, uint8_t>> answerDeadlines;   // (msgId, attempt): ackTimeout / probeTimeout
+        size_t                                      retainedBytes = 0;              // payloads kept in awaitedReplies for resending
+        SeenMessageCache                            deliveredUnicastBases;          // base ids of UNICAST data delivered here: retries are not delivered again
         // Last UNKNOWN_DELIVERY_MODE sent per neighbor, indexed by the mode nibble; forgotten when the neighbor leaves
         std::unordered_map<PeerId, std::array<std::optional<std::chrono::steady_clock::time_point>, 16>, PeerIDHash> unknownModeReportedAt;
         // ACKs signed this second for unsigned UNICASTs, per neighbor that handed them over: (window start, count)
@@ -354,6 +377,8 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       routeMeasurements{0};
         std::atomic<uint64_t>                       routeFailures{0};
         std::atomic<uint64_t>                       scheduledProbes{0};
+        std::atomic<uint64_t>                       retriesSent{0};
+        std::atomic<uint64_t>                       acksMissing{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

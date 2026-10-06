@@ -35,6 +35,15 @@ namespace invilite::Mesh {
         PeerId                      acknowledgedBy{};
         std::chrono::milliseconds   rtt{0};                                         // from our send to this ACK's arrival
         uint8_t                     hopsTraveled = 0;                               // of the ACK on its way back
+        uint8_t                     attempt = 0;                                    // which send it answers: 0 the first, 1–3 retries (R-8 e)
+    };
+
+    // No ACK for a message sent with ackRequested, after every retry (docs/router.md 4.4a, R-8 e): it may have arrived
+    // all the same (only the ACKs lost), or not
+    struct AckMissing {
+        PeerId                      destination{};
+        uint64_t                    msgId = 0;
+        uint8_t                     attempts = 0;                                   // sends made, the first included
     };
 
     // Answer to Router::recordRoute (diagnostics): the path the probe took and when each relay saw it
@@ -80,6 +89,7 @@ namespace invilite::Mesh {
         virtual void onRouteReported(const RouteReport& report) { (void)report; }
         virtual void onRouteFailed(const RouteFailure& failure) { (void)failure; }
         virtual void onStateReported(const StateReportReceipt& receipt) { (void)receipt; }
+        virtual void onAckMissing(const AckMissing& missing) { (void)missing; }
     };
 
 } // namespace invilite::Mesh

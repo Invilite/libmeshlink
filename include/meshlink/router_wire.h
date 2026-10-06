@@ -179,6 +179,14 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_STATE_REPORT          = 0x0107;                  // answer to STATE_QUERY, to its sender
         constexpr uint16_t SUBTYPE_TREE_BEACON           = 0x0108;                  // "I shape the broadcast tree": the tree root to every Router, empty (docs/router.md 4.3)
 
+        // Retries of unsigned point-to-point data (docs/router.md 4.4a, R-8 e): the two lowest msgId bits number the attempt.
+        // The first send has 00; relays see a retry as a new message, the destination delivers once per base id; the last
+        // attempt (11) floods locally on every hop instead of following route tables.
+        constexpr uint64_t MSG_ATTEMPT_MASK = 0x3;
+        constexpr uint8_t  LAST_ATTEMPT     = 3;
+        constexpr uint64_t baseMessageId(uint64_t msgId) { return msgId & ~MSG_ATTEMPT_MASK; }
+        constexpr uint8_t  attemptOf(uint64_t msgId)     { return static_cast<uint8_t>(msgId & MSG_ATTEMPT_MASK); }
+
         // The Router messages that travel to every node — and only so (FLOOD / BROADCAST)
         constexpr bool travelsToEveryNode(uint16_t subtype) { return subtype == SUBTYPE_PRESENCE || subtype == SUBTYPE_TREE_BEACON; }
 

@@ -1038,11 +1038,86 @@ TEST(RouterTest, ScheduledProbesMeasureActiveAndIdleRoutes) {
     EXPECT_EQ(mesh.recorders[0]->routeReports.size(), 0u);                                    // the scheduler's probes are quiet
 }
 
+// ── Retries (R-8 e): the two low msgId bits number the attempt ──────────────
+
+void fastAcks(size_t, RouterConfig& c) { c.routeEvaluation.ackTimeout = 300ms; }
+
+// The first send goes through node 1, which swallows it (Router stopped); the retry does not take that route again — node 0
+// knows no other (a broadcast teaches only the first copy's neighbor), so it floods locally and arrives through node 2
+TEST(RouterTest, MessageWithoutAckIsResentOverTheNextRoute) {
+    RouterMesh mesh(4, { { 0, 1 }, { 0, 2 }, { 1, 3 }, { 2, 3 } }, fastAcks);
+    ASSERT_TRUE(mesh.ready);
+    for (size_t sender : { size_t{ 0 }, size_t{ 3 } }) {
+        const uint64_t hello = mesh.routers[sender]->broadcast(0x10, 0, { 'h' }).value();
+        ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(sender, hello); }, 5s));
+    }
+    const uint64_t out = mesh.routers[0]->measureRoute(mesh.id(3), mesh.id(1)).value();     // node 1 ranks first
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->reportsFor(out).size() == 1; }, 5s));
+    const uint64_t back = mesh.routers[3]->measureRoute(mesh.id(0), mesh.id(2)).value();    // the ACKs come back through node 2
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[3]->reportsFor(back).size() == 1; }, 5s));
+    mesh.routers[1]->stop();
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'r' }, { .ackRequested = true }).value();
+    EXPECT_EQ(RouterWire::attemptOf(msgId), 0);
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
+    EXPECT_EQ(mesh.recorders[0]->acksFor(msgId).front().attempt, 1);
+    EXPECT_EQ(mesh.recorders[3]->countOf(mesh.id(0), RouterWire::baseMessageId(msgId) | 1), 1u);   // delivered as the retry
+    EXPECT_EQ(mesh.recorders[3]->total(), 2u);                                                // the hello and this, once
+    EXPECT_EQ(mesh.routers[0]->getStatistics().retriesSent, 1u);
+}
+
+// The message arrived but its ACK could not come back (no way to node 0 yet); the retry is not delivered again, only acknowledged
+TEST(RouterTest, RetryOfDeliveredMessageIsAcknowledgedNotDeliveredAgain) {
+    RouterMesh mesh(3, lineEdges(3), fastAcks);
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'o' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
+    EXPECT_EQ(mesh.routers[2]->getStatistics().acksSent, 0u);                                 // no known way back: no ACK (review R-5 I4)
+    const uint64_t hello = mesh.routers[0]->broadcast(0x10, 0, { 'h' }).value();             // now node 2 knows the way back
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), hello) == 1; }, 5s));
+
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 1; }, 5s));
+    EXPECT_GE(mesh.recorders[0]->acksFor(msgId).front().attempt, 1);
+    std::this_thread::sleep_for(400ms);
+    size_t deliveries = 0;
+    for (uint64_t attempt = 0; attempt < 4; ++attempt) deliveries += mesh.recorders[2]->countOf(mesh.id(0), msgId | attempt);
+    EXPECT_EQ(deliveries, 1u);
+}
+
+// Nobody answers: three retries, the last one flooding on every hop, then onAckMissing — once
+TEST(RouterTest, MessageWithoutAckAfterEveryRetryIsReportedMissing) {
+    struct MissingRecorder : RouterEventListener {
+        void onAckMissing(const AckMissing& missing) override { std::lock_guard lock(this->mutex); this->missing.push_back(missing); }
+        std::vector<AckMissing> all() { std::lock_guard lock(this->mutex); return this->missing; }
+        std::mutex mutex;
+        std::vector<AckMissing> missing;
+    };
+    RouterMesh mesh(3, lineEdges(3), fastAcks);
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t hello = mesh.routers[2]->broadcast(0x10, 0, { 'h' }).value();
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(2), hello) == 1; }, 5s));
+    mesh.routers[2]->stop();
+    auto recorder = std::make_shared<MissingRecorder>();
+    mesh.routers[0]->addListener(recorder);
+
+    const uint64_t msgId = mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'm' }, { .ackRequested = true }).value();
+    ASSERT_TRUE(waitUntil([&] { return recorder->all().size() == 1; }, 5s));
+    EXPECT_EQ(recorder->all().front().msgId, msgId);
+    EXPECT_EQ(recorder->all().front().attempts, 4);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().retriesSent, 3u);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().localFloods, 3u);                              // the only route failed: every retry floods
+    EXPECT_GE(mesh.routers[1]->getStatistics().localFloods, 1u);                              // flooded by the relay too, route or not
+    std::this_thread::sleep_for(600ms);
+    EXPECT_EQ(recorder->all().size(), 1u);
+    mesh.routers[0]->removeListener(recorder);
+}
+
 // No report in probeTimeout, no ACK in ackTimeout: a failure for the route through the first hop — it drops to the end
 TEST(RouterTest, MissingAnswersFailTheRouteThroughTheFirstHop) {
     RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& c) {
         c.routeEvaluation.ackTimeout   = 300ms;
         c.routeEvaluation.probeTimeout = 300ms;
+        c.routeEvaluation.maxRetries   = 0;                                                   // failures only; retries have their own tests
     });
     ASSERT_TRUE(mesh.ready);
     const uint64_t hello = mesh.routers[2]->broadcast(0x10, 0, { 'h' }).value();
