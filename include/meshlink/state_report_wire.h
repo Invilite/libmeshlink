@@ -7,6 +7,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace invilite::Mesh {
@@ -163,6 +164,9 @@ namespace invilite::Mesh {
 
             bool operator==(const StateReport&) const = default;
         };
+
+        // Stable snake_case name of a counter for tools (JSON keys, tables); empty for an id this build does not know
+        std::string_view     counterName(uint16_t id);
 
         std::vector<uint8_t> encodeQuery(const StateQuery& query);
         bool                 decodeQuery(std::span<const uint8_t> payload, StateQuery& out);   // exact length

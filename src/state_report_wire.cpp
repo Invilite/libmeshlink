@@ -187,6 +187,53 @@ namespace {
     bool isKnownSection(uint8_t type) { return type <= static_cast<uint8_t>(StateSection::Network); }
 } // namespace
 
+std::string_view counterName(uint16_t id) {
+    switch (static_cast<StateCounter>(id)) {
+        case StateCounter::IhaveKeysSent: return "ihave_keys_sent";
+        case StateCounter::IhaveKeysReceived: return "ihave_keys_received";
+        case StateCounter::GraftsSent: return "grafts_sent";
+        case StateCounter::GraftsReceived: return "grafts_received";
+        case StateCounter::PrunesSent: return "prunes_sent";
+        case StateCounter::PrunesReceived: return "prunes_received";
+        case StateCounter::DuplicatesDropped: return "duplicates_dropped";
+        case StateCounter::GraftsForMissing: return "grafts_for_missing";
+        case StateCounter::TreeOptimizations: return "tree_optimizations";
+        case StateCounter::BroadcastCacheEntries: return "broadcast_cache_entries";
+        case StateCounter::BroadcastCacheBytes: return "broadcast_cache_bytes";
+        case StateCounter::MissingMessagesTracked: return "missing_messages_tracked";
+        case StateCounter::EagerLinks: return "eager_links";
+        case StateCounter::LazyLinks: return "lazy_links";
+        case StateCounter::FullMessagesSent: return "full_messages_sent";
+        case StateCounter::Delivered: return "delivered";
+        case StateCounter::UnicastForwarded: return "unicast_forwarded";
+        case StateCounter::RoutedForwarded: return "routed_forwarded";
+        case StateCounter::LocalFloods: return "local_floods";
+        case StateCounter::AcksSent: return "acks_sent";
+        case StateCounter::AcksReceived: return "acks_received";
+        case StateCounter::AwaitedReplies: return "awaited_replies";
+        case StateCounter::RouteErrorsSent: return "route_errors_sent";
+        case StateCounter::RouteErrorsReceived: return "route_errors_received";
+        case StateCounter::ParkedForSenderRecord: return "parked_for_sender_record";
+        case StateCounter::ParkedExpired: return "parked_expired";
+        case StateCounter::UnknownModeReportsSent: return "unknown_mode_reports_sent";
+        case StateCounter::StateRepliesSent: return "state_replies_sent";
+        case StateCounter::ActiveInbound: return "active_inbound";
+        case StateCounter::ActiveOutbound: return "active_outbound";
+        case StateCounter::InboundSoftLimit: return "inbound_soft_limit";
+        case StateCounter::InboundHardLimit: return "inbound_hard_limit";
+        case StateCounter::OutboundSoftLimit: return "outbound_soft_limit";
+        case StateCounter::OutboundHardLimit: return "outbound_hard_limit";
+        case StateCounter::HandshakesInFlight: return "handshakes_in_flight";
+        case StateCounter::NoSlotsRejectionsSent: return "no_slots_rejections_sent";
+        case StateCounter::KnownPeers: return "known_peers";
+        case StateCounter::KnownAvailable: return "known_available";
+        case StateCounter::KnownUnavailable: return "known_unavailable";
+        case StateCounter::KnownUnknown: return "known_unknown";
+        case StateCounter::KnownProbing: return "known_probing";
+    }
+    return {};
+}
+
 std::vector<uint8_t> encodeQuery(const StateQuery& query) {
     std::vector<uint8_t> out;
     out.reserve(QUERY_SIZE);

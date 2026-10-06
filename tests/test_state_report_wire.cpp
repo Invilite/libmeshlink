@@ -132,3 +132,9 @@ TEST(StateReportWireTest, OverlongNameIsCut) {
     ASSERT_TRUE(decodeReport(encodeReport(report), decoded));
     EXPECT_EQ(decoded.node->name, std::string(255, 'x'));
 }
+
+TEST(StateReportWireTest, CountersHaveStableNames) {
+    EXPECT_EQ(counterName(static_cast<uint16_t>(StateCounter::GraftsForMissing)), "grafts_for_missing");
+    EXPECT_EQ(counterName(static_cast<uint16_t>(StateCounter::NoSlotsRejectionsSent)), "no_slots_rejections_sent");
+    EXPECT_TRUE(counterName(0x0FFF).empty());
+}
