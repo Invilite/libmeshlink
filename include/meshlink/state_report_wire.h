@@ -64,6 +64,7 @@ namespace invilite::Mesh {
             MissingMessagesTracked  = 0x010B,
             EagerLinks              = 0x010C,
             LazyLinks               = 0x010D,
+            PinnedLinks             = 0x010E,                                       // eager for good after oscillating
             // E. Delivery
             FullMessagesSent        = 0x0200,
             Delivered               = 0x0201,
@@ -117,6 +118,7 @@ namespace invilite::Mesh {
             PeerId      peerId{};
             bool        inbound          = false;                                   // the neighbor dialed us
             bool        eager            = false;                                   // we send it full broadcasts (Plumtree); false = only IHAVE
+            bool        pinned           = false;                                   // eager for good: the link oscillated (docs/router.md 4.3)
             uint32_t    connectedSeconds = 0;
             uint64_t    bytesSent        = 0;
             uint64_t    bytesReceived    = 0;

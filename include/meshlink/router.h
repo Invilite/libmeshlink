@@ -85,6 +85,7 @@ namespace invilite::Mesh {
         uint64_t    graftsForMissing   = 0;                                         // GRAFTs asking for announced messages that never came
         uint64_t    unknownModeReportsSent = 0;
         uint64_t    clockWindowRejections = 0;                                      // routed messages with a timestamp outside maxClockSkew
+        uint64_t    pinnedLinks        = 0;                                         // Plumtree links pinned eager after oscillating (current, not a sum)
     };
 
     struct SendOptions {
@@ -299,6 +300,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       graftsForMissing{0};
         std::atomic<uint64_t>                       unknownModeReportsSent{0};
         std::atomic<uint64_t>                       clockWindowRejections{0};
+        std::atomic<uint64_t>                       pinnedLinks{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

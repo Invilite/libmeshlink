@@ -256,7 +256,7 @@ RouterStatistics Router::getStatistics() const {
              this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load(),
              this->stateRepliesSent.load(), this->delivered.load(), this->unicastForwarded.load(), this->acksReceived.load(), this->routeErrorsReceived.load(),
              this->ihaveKeysReceived.load(), this->graftsReceived.load(), this->prunesReceived.load(), this->graftsForMissing.load(), this->unknownModeReportsSent.load(),
-             this->clockWindowRejections.load() };
+             this->clockWindowRejections.load(), this->pinnedLinks.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -476,7 +476,7 @@ void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
         return;
     }
     ++this->graftsReceived;
-    this->plumtree.onGraft(from);
+    this->plumtree.onGraft(from, !keys.empty(), std::chrono::steady_clock::now());
     for (const RoutedMessageKey& key : keys) {
         // TTL 0: it ended here and was never announced — serving it would carry it a hop past its TTL
         const RoutedMessage* held = this->broadcastCache.find(key);
@@ -510,6 +510,7 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
     this->dropExpiredAwaitedReplies(now);
+    this->pinnedLinks = this->plumtree.pinnedLinkCount();
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages

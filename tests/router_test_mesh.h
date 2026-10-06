@@ -106,9 +106,11 @@ struct RouterMesh {
     std::vector<std::unique_ptr<Router>>            routers;
     std::vector<std::shared_ptr<DeliveryRecorder>>  recorders;
     bool                                            ready = false;
+    size_t                                          edgeCount = 0;
 
     RouterMesh(size_t count, const std::vector<Edge>& edges, const std::function<void(size_t, RouterConfig&)>& adjustRouter = {},
                const std::function<void(NetworkConfig&)>& adjustNetwork = {}) {
+        this->edgeCount = edges.size();
         std::vector<uint16_t> outDegree(count, 0);
         std::vector<size_t>   degree(count, 0);
         for (const auto& [dialer, listener] : edges) { ++outDegree[dialer]; ++degree[dialer]; ++degree[listener]; }

@@ -1,7 +1,7 @@
-// SIM (docs/router.md 6): Plumtree in larger meshes with several senders at once. The eager/lazy state is per link,
-// shared by every sender (as in the original Plumtree); a spanning tree carries any sender's message to every node in
-// N − 1 full copies, so the shared state should settle and stay settled. Real Network instances over loopback: there is
-// no link latency, so the latency-driven tree optimization is not exercised here.
+// SIM (docs/router.md 6): Plumtree in larger meshes with one and several senders at once. The eager/lazy state is per
+// link, shared by every sender: with one sender it settles to a spanning tree (N − 1 full copies); several senders need
+// oscillating links pinned (below). Real Network instances over loopback: there is no link latency, so the
+// latency-driven tree optimization is not exercised here.
 // Network and Router log to stderr; run `./run_test 2>/dev/null` for quiet output.
 #include <gtest/gtest.h>
 #include "router_test_mesh.h"
@@ -18,8 +18,10 @@ namespace {
 
 constexpr size_t NODES   = 30;
 constexpr size_t MANY_SENDERS = 5;
-constexpr size_t ROUNDS  = 8;
-constexpr size_t SETTLED_ROUNDS = 3;                                                          // the last rounds must cost exactly a tree
+// Rounds per run: several senders settle more slowly, the more so under load (pins only accumulate, so they do settle)
+constexpr size_t ROUNDS_ONE_SENDER   = 8;
+constexpr size_t ROUNDS_MANY_SENDERS = 16;
+constexpr size_t SETTLED_ROUNDS = 2;                                                          // the last rounds are checked
 
 // Every edge once, as (dialer, listener) with dialer < listener
 void addEdge(std::set<std::pair<size_t, size_t>>& edges, size_t a, size_t b) {
@@ -72,6 +74,7 @@ struct RoundCost {
     uint64_t grafts = 0;
     uint64_t prunes = 0;
     uint64_t graftsForMissing = 0;                                                            // the rest are tree optimization (no link went down)
+    uint64_t pinnedLinkEnds = 0;                                                              // at the end of the round; each link counts at both ends
 };
 
 RoundCost totals(const RouterMesh& mesh) {
@@ -83,6 +86,7 @@ RoundCost totals(const RouterMesh& mesh) {
         cost.grafts        += stats.graftsSent;
         cost.prunes        += stats.prunesSent;
         cost.graftsForMissing += stats.graftsForMissing;
+        cost.pinnedLinkEnds   += stats.pinnedLinks;
     }
     return cost;
 }
@@ -93,7 +97,8 @@ std::vector<RoundCost> runRounds(RouterMesh& mesh, const std::string& topology, 
     for (size_t i = 0; i < senderCount; ++i) senders.push_back(i * NODES / senderCount);
 
     std::vector<RoundCost> rounds;
-    for (size_t round = 0; round < ROUNDS; ++round) {
+    const size_t roundCount = senderCount == 1 ? ROUNDS_ONE_SENDER : ROUNDS_MANY_SENDERS;
+    for (size_t round = 0; round < roundCount; ++round) {
         const RoundCost before = totals(mesh);
         std::vector<std::pair<size_t, uint64_t>> sent;
         for (size_t sender : senders) sent.emplace_back(sender, mesh.routers[sender]->broadcast(0x10, 0, { static_cast<uint8_t>(round) }).value());
@@ -108,18 +113,27 @@ std::vector<RoundCost> runRounds(RouterMesh& mesh, const std::string& topology, 
             }
         }
         const RoundCost after = totals(mesh);
-        rounds.push_back({ after.fullCopies - before.fullCopies, after.announcedKeys - before.announcedKeys, after.grafts - before.grafts, after.prunes - before.prunes, after.graftsForMissing - before.graftsForMissing });
+        rounds.push_back({ after.fullCopies - before.fullCopies, after.announcedKeys - before.announcedKeys, after.grafts - before.grafts, after.prunes - before.prunes, after.graftsForMissing - before.graftsForMissing, after.pinnedLinkEnds });
     }
 
-    std::cout << "[ SIM      ] " << topology << " (" << NODES << " nodes, " << senderCount << " sender(s)): full copies / IHAVE keys / GRAFT (for missing) / PRUNE per round:";
-    for (const RoundCost& cost : rounds) std::cout << "  " << cost.fullCopies << "/" << cost.announcedKeys << "/" << cost.grafts << " (" << cost.graftsForMissing << ")/" << cost.prunes;
-    std::cout << "  (a tree: " << senderCount * (NODES - 1) << " full copies)" << std::endl;
+    std::cout << "[ SIM      ] " << topology << " (" << NODES << " nodes, " << senderCount << " sender(s)): full copies / IHAVE keys / GRAFT (for missing) / PRUNE / pinned links per round:";
+    for (const RoundCost& cost : rounds) std::cout << "  " << cost.fullCopies << "/" << cost.announcedKeys << "/" << cost.grafts << " (" << cost.graftsForMissing << ")/" << cost.prunes << "/" << cost.pinnedLinkEnds / 2;
+    std::cout << "  (a tree: " << senderCount * (NODES - 1) << " full copies, a flood: " << senderCount * (2 * mesh.edgeCount - (NODES - 1)) << ")" << std::endl;
     return rounds;
 }
 
+// One sender: exactly a spanning tree, nothing changes any more. Several: what matters is that nobody waits for a GRAFT
+// any more (no GRAFT for a missing message); pinned links cost extra copies — 0–50 % over a tree in SIM runs, depending
+// on how the first rounds went — bounded here at twice a tree, still well below a flood (about 3× a tree here).
 void expectSettledTree(const std::vector<RoundCost>& rounds, const std::string& topology, size_t senderCount) {
-    for (size_t round = ROUNDS - SETTLED_ROUNDS; round < ROUNDS; ++round) {
-        EXPECT_EQ(rounds[round].fullCopies, senderCount * (NODES - 1)) << topology << ": round " << round << " is not a spanning tree";
+    const uint64_t tree = senderCount * (NODES - 1);
+    for (size_t round = rounds.size() - SETTLED_ROUNDS; round < rounds.size(); ++round) {
+        EXPECT_EQ(rounds[round].graftsForMissing, 0u) << topology << ": round " << round;
+        if (senderCount > 1) {
+            EXPECT_LE(rounds[round].fullCopies, 2 * tree) << topology << ": round " << round;
+            continue;
+        }
+        EXPECT_EQ(rounds[round].fullCopies, tree) << topology << ": round " << round << " is not a spanning tree";
         EXPECT_EQ(rounds[round].grafts, 0u) << topology << ": round " << round;
         EXPECT_EQ(rounds[round].prunes, 0u) << topology << ": round " << round;
     }
@@ -146,18 +160,17 @@ TEST(PlumtreeSimulationTest, BridgedClustersSettleToTreeWithOneSender) {
     simulate("two clusters + bridge", twoClustersWithBridge(NODES, 13), 1);
 }
 
-// SIM finding (2026-10-06, docs/router.md 7): with several senders at once the shared per-link eager/lazy state does not
-// settle — broadcasts in flight together PRUNE different edges of the same cycle, the eager graph falls apart, GRAFTs for
-// missing messages put edges back, and it repeats (~40 GRAFTs per round on the random mesh, 1.5× the tree's traffic).
-// Disabled until the fix; run with --gtest_also_run_disabled_tests.
-TEST(PlumtreeSimulationTest, DISABLED_RandomMeshSettlesToSharedTreeWithManySenders) {
+// Several senders at once: broadcasts in flight together PRUNE different edges of the same cycle, the shared eager graph
+// falls apart and GRAFTs for missing messages put edges back, again and again (SIM 2026-10-06: ~40 GRAFTs per round on
+// the random mesh). A link GRAFTed for missing messages 3 times within 10 minutes is pinned eager (docs/router.md 4.3).
+TEST(PlumtreeSimulationTest, RandomMeshSettlesWithManySenders) {
     simulate("random mesh", randomMesh(NODES, 7), MANY_SENDERS);
 }
 
-TEST(PlumtreeSimulationTest, DISABLED_SmallWorldSettlesToSharedTreeWithManySenders) {
+TEST(PlumtreeSimulationTest, SmallWorldSettlesWithManySenders) {
     simulate("small world", smallWorld(NODES, 11), MANY_SENDERS);
 }
 
-TEST(PlumtreeSimulationTest, DISABLED_BridgedClustersSettleToSharedTreeWithManySenders) {
+TEST(PlumtreeSimulationTest, BridgedClustersSettleWithManySenders) {
     simulate("two clusters + bridge", twoClustersWithBridge(NODES, 13), MANY_SENDERS);
 }

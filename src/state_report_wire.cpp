@@ -21,6 +21,7 @@ namespace {
     constexpr uint8_t  FLAG_TRUNCATED      = 0x01;
     constexpr uint8_t  NEIGHBOR_INBOUND    = 0x01;
     constexpr uint8_t  NEIGHBOR_EAGER      = 0x02;
+    constexpr uint8_t  NEIGHBOR_PINNED     = 0x04;
     constexpr uint32_t RTT_UNKNOWN         = 0xFFFFFFFF;
 
     void writeShortString(std::vector<uint8_t>& out, const std::string& text) {
@@ -87,7 +88,7 @@ namespace {
         for (size_t i = 0; i < count; ++i) {
             const NeighborState& neighbor = neighbors[i];
             writePeerId(out, neighbor.peerId);
-            out.push_back(static_cast<uint8_t>((neighbor.inbound ? NEIGHBOR_INBOUND : 0) | (neighbor.eager ? NEIGHBOR_EAGER : 0)));
+            out.push_back(static_cast<uint8_t>((neighbor.inbound ? NEIGHBOR_INBOUND : 0) | (neighbor.eager ? NEIGHBOR_EAGER : 0) | (neighbor.pinned ? NEIGHBOR_PINNED : 0)));
             writeBE32(out, neighbor.connectedSeconds);
             writeBE64(out, neighbor.bytesSent);
             writeBE64(out, neighbor.bytesReceived);
@@ -107,6 +108,7 @@ namespace {
             reader.readU8(flags);
             neighbor.inbound = (flags & NEIGHBOR_INBOUND) != 0;
             neighbor.eager   = (flags & NEIGHBOR_EAGER) != 0;
+            neighbor.pinned  = (flags & NEIGHBOR_PINNED) != 0;
             readBE(reader, neighbor.connectedSeconds);
             readBE(reader, neighbor.bytesSent);
             readBE(reader, neighbor.bytesReceived);
@@ -203,6 +205,7 @@ std::string_view counterName(uint16_t id) {
         case StateCounter::MissingMessagesTracked: return "missing_messages_tracked";
         case StateCounter::EagerLinks: return "eager_links";
         case StateCounter::LazyLinks: return "lazy_links";
+        case StateCounter::PinnedLinks: return "pinned_links";
         case StateCounter::FullMessagesSent: return "full_messages_sent";
         case StateCounter::Delivered: return "delivered";
         case StateCounter::UnicastForwarded: return "unicast_forwarded";

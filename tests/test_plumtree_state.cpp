@@ -84,7 +84,7 @@ TEST(PlumtreeStateTest, PruneAndGraftFromNeighborSwitchTheLink) {
     PlumtreeState state = withLinks({ A });
     state.onPrune(A);
     EXPECT_FALSE(state.isEager(A));
-    state.onGraft(A);
+    state.onGraft(A, false, T0);
     EXPECT_TRUE(state.isEager(A));
 }
 
@@ -244,4 +244,71 @@ TEST(PlumtreeStateTest, DeadlinesComeOutInOrderAcrossManyMessages) {
     const auto grafts = state.takeDueGrafts(T0 + 550ms);
     EXPECT_EQ(grafts.at(A).size(), 50u);                                                      // only what is due
     EXPECT_EQ(state.nextDeadline(), T0 + 551ms);
+}
+
+// ── Pinning a link that oscillates (docs/router.md 4.3) ─────────────────────────────────────────────────────────────
+
+// Three GRAFTs for missing messages on one link within the window: several senders keep cutting it, so it stays eager
+TEST(PlumtreeStateTest, LinkGraftedForMissingMessagesThreeTimesIsPinnedEager) {
+    PlumtreeState state = withLinks({ A, B });
+    for (int i = 0; i < 2; ++i) {
+        state.onPrune(A);
+        state.onGraft(A, true, T0 + std::chrono::seconds(i));
+        EXPECT_FALSE(state.isPinned(A));
+    }
+    state.onPrune(A);
+    state.onGraft(A, true, T0 + 2s);
+    EXPECT_TRUE(state.isPinned(A));
+    EXPECT_EQ(state.pinnedLinkCount(), 1u);
+
+    EXPECT_FALSE(state.onDuplicate(A, false));                                                // a duplicate no longer PRUNEs it
+    state.onPrune(A);                                                                         // nor does a PRUNE already in flight
+    EXPECT_TRUE(state.isEager(A));
+    EXPECT_TRUE(state.onDuplicate(B, false));                                                 // other links prune as before
+}
+
+// Our own GRAFTs count the same way: both ends of a link count the same GRAFT frames
+TEST(PlumtreeStateTest, GraftsWeSendCountTowardsPinning) {
+    PlumtreeState state = withLinks({ A });
+    for (uint64_t i = 0; i < 3; ++i) {
+        state.onPrune(A);
+        state.onAnnouncement(A, { key(i) }, T0 + std::chrono::seconds(i));
+        EXPECT_EQ(state.takeDueGrafts(T0 + std::chrono::seconds(i) + 600ms).size(), 1u);
+    }
+    EXPECT_TRUE(state.isPinned(A));
+}
+
+// Empty GRAFTs (fast repair after a disconnect, tree optimization) are no sign of oscillation; nor are repairs far apart
+TEST(PlumtreeStateTest, EmptyGraftsAndSporadicRepairsDoNotPin) {
+    PlumtreeState state = withLinks({ A, B });
+    for (int i = 0; i < 5; ++i) {
+        state.onPrune(A);
+        state.onGraft(A, false, T0 + std::chrono::seconds(i));
+    }
+    EXPECT_FALSE(state.isPinned(A));
+
+    for (int i = 0; i < 5; ++i) {
+        state.onPrune(B);
+        state.onGraft(B, true, T0 + std::chrono::minutes(6 * i));                            // 6 min apart: never 3 within 10 min
+    }
+    EXPECT_FALSE(state.isPinned(B));
+}
+
+// A pin lasts until the link closes; the same neighbor connecting again starts unpinned
+TEST(PlumtreeStateTest, PinEndsWithTheLink) {
+    PlumtreeState state = withLinks({ A, B });
+    for (int i = 0; i < 3; ++i) state.onGraft(A, true, T0);
+    ASSERT_TRUE(state.isPinned(A));
+    state.removeLink(A);
+    state.addLink(A);
+    EXPECT_FALSE(state.isPinned(A));
+    EXPECT_TRUE(state.onDuplicate(A, false));
+}
+
+TEST(PlumtreeStateTest, PinningCanBeTurnedOff) {
+    PlumtreeConfig config;
+    config.pinAfterGrafts = 0;
+    PlumtreeState state = withLinks({ A }, config);
+    for (int i = 0; i < 10; ++i) state.onGraft(A, true, T0);
+    EXPECT_FALSE(state.isPinned(A));
 }

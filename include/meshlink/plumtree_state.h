@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace invilite::Mesh {
@@ -23,6 +24,10 @@ namespace invilite::Mesh {
         size_t                      maxMissingMessages        = 4096;              // announced-but-missing messages tracked at once
         size_t                      maxMissingPerLink         = 512;               // share one link's announcements may open — fake keys from one neighbor cannot block repair for the rest
         size_t                      maxAnnouncersPerMessage   = 8;                 // neighbors remembered per missing message, GRAFT tries them in order
+        // A link that GRAFTs for missing messages this often within pinWindow oscillates (several senders' PRUNEs cut the
+        // eager graph apart, docs/router.md 4.3): pinned eager until it closes, duplicates on it no longer PRUNE. 0 = never.
+        size_t                      pinAfterGrafts            = 3;
+        std::chrono::seconds        pinWindow                 = std::chrono::minutes(10);
     };
 
     // Decisions for a message seen for the first time (docs/router.md 4.3)
@@ -58,8 +63,9 @@ namespace invilite::Mesh {
 
         void onPrune(const PeerId& from);
 
-        // `from` is eager from now on; the Router answers the keys it holds
-        void onGraft(const PeerId& from);
+        // `from` is eager from now on; the Router answers the keys it holds. Only a GRAFT that asks for messages counts
+        // towards pinning — an empty one (fast repair, tree optimization) is no sign of oscillation.
+        void onGraft(const PeerId& from, bool asksForMessages, std::chrono::steady_clock::time_point now);
 
         // Keys announced by `from` that we have not seen (the Router filters with its duplicate memory)
         void onAnnouncement(const PeerId& from, const std::vector<RoutedMessageKey>& unseenKeys, std::chrono::steady_clock::time_point now);
@@ -76,6 +82,8 @@ namespace invilite::Mesh {
 
         [[nodiscard]] bool isEager(const PeerId& peer) const;
         [[nodiscard]] bool hasLink(const PeerId& peer) const { return this->eagerByLink.contains(peer); }
+        [[nodiscard]] bool isPinned(const PeerId& peer) const;
+        [[nodiscard]] size_t pinnedLinkCount() const;
         [[nodiscard]] size_t missingCount() const { return this->missing.size(); }
 
     private:
@@ -92,9 +100,12 @@ namespace invilite::Mesh {
         using MissingMessages = std::unordered_map<RoutedMessageKey, MissingMessage, RoutedMessageKeyHash>;
 
         MissingMessages::iterator eraseMissing(MissingMessages::iterator entry);
+        void countGraftForMissing(const PeerId& link, std::chrono::steady_clock::time_point now);   // sent or received — both ends count the same GRAFT
 
         PlumtreeConfig                                                          config;
         std::unordered_map<PeerId, bool, PeerIDHash>                            eagerByLink;
+        std::unordered_map<PeerId, std::deque<std::chrono::steady_clock::time_point>, PeerIDHash> recentGraftsByLink;   // within pinWindow, until pinned
+        std::unordered_set<PeerId, PeerIDHash>                                  pinnedLinks;
         MissingMessages                                                         missing;
         GraftDeadlines                                                          graftDeadlines;     // earliest first: nextDeadline and takeDueGrafts never scan
         std::unordered_map<PeerId, size_t, PeerIDHash>                          missingOpenedByLink;

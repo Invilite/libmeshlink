@@ -16,6 +16,8 @@ std::vector<PeerId> PlumtreeState::removeLink(const PeerId& peer) {
     if (found == this->eagerByLink.end()) return {};
     const bool wasEager = found->second;
     this->eagerByLink.erase(found);
+    this->recentGraftsByLink.erase(peer);
+    this->pinnedLinks.erase(peer);
     this->queuedAnnouncements.erase(peer);
     for (auto& [key, entry] : this->missing) {
         std::erase(entry.announcers, peer);
@@ -46,7 +48,7 @@ PlumtreeNewMessageDecision PlumtreeState::onNewMessage(const RoutedMessageKey& k
         holders.assign(entry.announcers.begin(), entry.announcers.end());
         holders.insert(holders.end(), entry.asked.begin(), entry.asked.end());
         const bool cameEager = receivedFrom && this->isEager(*receivedFrom);
-        if (!entry.graftSent && cameEager && !entry.announcers.empty() && now - entry.firstAnnouncedAt > this->config.treeOptimizationThreshold) {
+        if (!entry.graftSent && cameEager && !this->isPinned(*receivedFrom) && !entry.announcers.empty() && now - entry.firstAnnouncedAt > this->config.treeOptimizationThreshold) {
             const PeerId fasterLink = entry.announcers.front();
             this->eagerByLink[fasterLink] = true;
             this->eagerByLink[*receivedFrom] = false;
@@ -71,17 +73,40 @@ PlumtreeNewMessageDecision PlumtreeState::onNewMessage(const RoutedMessageKey& k
 
 bool PlumtreeState::onDuplicate(const PeerId& receivedFrom, bool higherTtlThanOurs) {
     const auto found = this->eagerByLink.find(receivedFrom);
-    if (found == this->eagerByLink.end() || !found->second || higherTtlThanOurs) return false;
+    if (found == this->eagerByLink.end() || !found->second || higherTtlThanOurs || this->isPinned(receivedFrom)) return false;
     found->second = false;
     return true;
 }
 
+// A pinned link stays eager: the other end pinned it at the same GRAFT, so a PRUNE can only be one already in flight
 void PlumtreeState::onPrune(const PeerId& from) {
-    if (const auto found = this->eagerByLink.find(from); found != this->eagerByLink.end()) found->second = false;
+    if (const auto found = this->eagerByLink.find(from); found != this->eagerByLink.end() && !this->isPinned(from)) found->second = false;
 }
 
-void PlumtreeState::onGraft(const PeerId& from) {
-    if (const auto found = this->eagerByLink.find(from); found != this->eagerByLink.end()) found->second = true;
+void PlumtreeState::onGraft(const PeerId& from, bool asksForMessages, std::chrono::steady_clock::time_point now) {
+    const auto found = this->eagerByLink.find(from);
+    if (found == this->eagerByLink.end()) return;
+    found->second = true;
+    if (asksForMessages) this->countGraftForMissing(from, now);
+}
+
+void PlumtreeState::countGraftForMissing(const PeerId& link, std::chrono::steady_clock::time_point now) {
+    if (this->config.pinAfterGrafts == 0 || this->pinnedLinks.contains(link)) return;
+    auto& recent = this->recentGraftsByLink[link];
+    while (!recent.empty() && now - recent.front() >= this->config.pinWindow) recent.pop_front();
+    recent.push_back(now);
+    if (recent.size() < this->config.pinAfterGrafts) return;
+    this->pinnedLinks.insert(link);
+    this->recentGraftsByLink.erase(link);
+    this->eagerByLink[link] = true;
+}
+
+bool PlumtreeState::isPinned(const PeerId& peer) const {
+    return this->pinnedLinks.contains(peer);
+}
+
+size_t PlumtreeState::pinnedLinkCount() const {
+    return this->pinnedLinks.size();
 }
 
 void PlumtreeState::onAnnouncement(const PeerId& from, const std::vector<RoutedMessageKey>& unseenKeys, std::chrono::steady_clock::time_point now) {
@@ -113,10 +138,16 @@ std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> PlumtreeSt
         entry.announcers.pop_front();
         entry.asked.push_back(announcer);
         this->eagerByLink[announcer] = true;
-        grafts[announcer].push_back(entryIt->first);
+        std::vector<RoutedMessageKey>& keys = grafts[announcer];
+        if (keys.empty()) this->countGraftForMissing(announcer, now);              // one GRAFT frame per announcer
+        keys.push_back(entryIt->first);
         entry.graftSent = true;
         this->graftDeadlines.erase(entry.graftAt);                                  // not answered in time → the next announcer
         entry.graftAt = this->graftDeadlines.emplace(now + this->config.graftTimeout, entryIt->first);
+    }
+    // The Router sends at most 255 keys per GRAFT frame and the other end counts frames: count the extra frames too
+    for (const auto& [announcer, keys] : grafts) {
+        for (size_t sent = 255; sent < keys.size(); sent += 255) this->countGraftForMissing(announcer, now);
     }
     return grafts;
 }
