@@ -104,3 +104,24 @@ TEST(RouteTableTest, BroadcastDoesNotRewriteHopsOfAckConfirmedRoute) {
     table.learn(DEST, A, 2, RouteEvidence::Ack, T0 + 2s, 40ms);                                // a newer ACK does update it
     EXPECT_EQ(table.candidates(DEST)[0].hops, 2);
 }
+
+// Diagnostics page through the table in PeerId order: consecutive pages cover every destination exactly once
+TEST(RouteTableTest, DestinationPagesAreOrderedAndCoverTheTable) {
+    RouteTable table;
+    for (uint8_t fill : { 0x50, 0x10, 0x30, 0x40, 0x20 }) table.learn(peerId(fill), A, 2, RouteEvidence::Broadcast, T0);
+    table.learn(peerId(0x30), B, 3, RouteEvidence::Broadcast, T0);
+
+    const auto first = table.destinationsPage(0, 2);
+    const auto second = table.destinationsPage(2, 2);
+    const auto last = table.destinationsPage(4, 2);
+    ASSERT_EQ(first.size(), 2u);
+    ASSERT_EQ(second.size(), 2u);
+    ASSERT_EQ(last.size(), 1u);
+    EXPECT_EQ(first[0].first, peerId(0x10));
+    EXPECT_EQ(first[1].first, peerId(0x20));
+    EXPECT_EQ(second[0].first, peerId(0x30));
+    EXPECT_EQ(second[0].second.size(), 2u);                                                   // every candidate, best first
+    EXPECT_EQ(second[0].second[0].via, A);
+    EXPECT_EQ(last[0].first, peerId(0x50));
+    EXPECT_TRUE(table.destinationsPage(5, 2).empty());
+}

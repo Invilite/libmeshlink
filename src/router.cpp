@@ -83,8 +83,9 @@ struct Router::Event {
     struct NeighborDisconnected { PeerId peerId; };
     struct FrameReceived        { NetworkMessage message; };
     struct SendRequested        { RoutedMessage message; };                         // built (and signed when required) by broadcast() / send()
+    struct OwnStateRequested    { uint64_t queryMsgId; StateReportWire::StateQuery query; };   // queryState() of this node
 
-    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, SendRequested> content;
+    std::variant<NeighborConnected, NeighborDisconnected, FrameReceived, SendRequested, OwnStateRequested> content;
 };
 
 // The only object Network holds: it owns the queue, so Network may outlive the Router without dangling.
@@ -252,7 +253,10 @@ std::optional<uint64_t> Router::sendAlongRoute(const PeerId& destination, std::v
 
 RouterStatistics Router::getStatistics() const {
     return { this->fullMessagesSent.load(), this->duplicatesDropped.load(), this->announcementsSent.load(), this->graftsSent.load(), this->prunesSent.load(),
-             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load() };
+             this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load(),
+             this->stateRepliesSent.load(), this->delivered.load(), this->unicastForwarded.load(), this->acksReceived.load(), this->routeErrorsReceived.load(),
+             this->ihaveKeysReceived.load(), this->graftsReceived.load(), this->prunesReceived.load(), this->graftsForMissing.load(), this->unknownModeReportsSent.load(),
+             this->clockWindowRejections.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -358,6 +362,19 @@ void Router::announcePresenceWhenDue(std::chrono::steady_clock::time_point now) 
     this->sendOwnBroadcast(presence);
 }
 
+std::optional<uint64_t> Router::queryState(const PeerId& destination, StateReportWire::StateQuery query) {
+    if (!this->running.load() || this->config.unicastTtl == 0) return std::nullopt;
+    if (destination == this->selfIdentity->getPeerId()) {
+        const uint64_t msgId = randomMessageId();
+        this->inbox->events.push({ Event::OwnStateRequested{ msgId, query } });   // the report reads Router-thread state
+        return msgId;
+    }
+    RoutedMessage message = this->buildRouterMessage(destination, RouterWire::SUBTYPE_STATE_QUERY, StateReportWire::encodeQuery(query));
+    const uint64_t msgId = message.msgId;
+    this->inbox->events.push({ Event::SendRequested{ std::move(message) } });     // signed here, off the Router thread
+    return msgId;
+}
+
 void Router::processEvent(Event& event) {
     std::visit([this](auto& content) {
         using T = std::decay_t<decltype(content)>;
@@ -384,11 +401,14 @@ void Router::processEvent(Event& event) {
         } else if constexpr (std::is_same_v<T, Event::FrameReceived>) {
             if (RouterWire::carriesRoutingHeader(content.message.group, content.message.subtype)) this->handleRoutedMessage(content.message);
             else                                                                                  this->handleRouterControl(content.message);
-        } else if (RouterWire::reachesEveryNode(content.message.mode)) {
-            if (content.message.ackRequested) this->awaitReply(content.message.msgId, std::nullopt, true);   // every node answers
-            this->sendOwnBroadcast(content.message);
-        } else {
-            const bool isProbe = content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP && content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE;
+        } else if constexpr (std::is_same_v<T, Event::SendRequested>) {
+            if (RouterWire::reachesEveryNode(content.message.mode)) {
+                if (content.message.ackRequested) this->awaitReply(content.message.msgId, std::nullopt, true);   // every node answers
+                this->sendOwnBroadcast(content.message);
+                return;
+            }
+            const bool isRouterMessage = content.message.group == RouterWire::ROUTER_PROTOCOL_GROUP;
+            const bool isProbe = isRouterMessage && (content.message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE || content.message.subtype == RouterWire::SUBTYPE_STATE_QUERY);
             const bool isRouted = content.message.mode == RoutingMode::Routed;
             if (content.message.ackRequested || isProbe || isRouted) {
                 // A ROUTED message waits for a possible ROUTE_ERROR too — from a relay of its route only
@@ -398,6 +418,10 @@ void Router::processEvent(Event& event) {
             this->rememberSeen(content.message);
             if (isRouted) this->forwardRouted(content.message, std::nullopt);
             else          this->forwardUnicast(content.message, std::nullopt);
+        } else if constexpr (std::is_same_v<T, Event::OwnStateRequested>) {
+            StateReportReceipt receipt{ this->selfIdentity->getPeerId(), content.queryMsgId, std::chrono::milliseconds(0), this->buildStateReport(content.query) };
+            receipt.report.queryMsgId = content.queryMsgId;
+            this->notifyListeners([&](RouterEventListener& listener) { listener.onStateReported(receipt); }, "onStateReported");
         }
     }, event.content);
 }
@@ -407,7 +431,10 @@ void Router::handleRouterControl(const NetworkMessage& message) {
         case RouterWire::SUBTYPE_IHAVE: this->handleAnnouncement(message.source, message.payload); return;
         case RouterWire::SUBTYPE_GRAFT: this->handleGraft(message.source, message.payload); return;
         case RouterWire::SUBTYPE_PRUNE:
-            if (RouterWire::decodePrune(message.payload)) this->plumtree.onPrune(message.source);
+            if (RouterWire::decodePrune(message.payload)) {
+                ++this->prunesReceived;
+                this->plumtree.onPrune(message.source);
+            }
             else this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed PRUNE:" + shortPeerId(message.source), LogLevel::Warning, "malformed PRUNE from {}", shortPeerId(message.source));
             return;
         case RouterWire::SUBTYPE_UNKNOWN_DELIVERY_MODE: {
@@ -434,6 +461,7 @@ void Router::handleAnnouncement(const PeerId& from, std::span<const uint8_t> pay
         this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed IHAVE:" + shortPeerId(from), LogLevel::Warning, "malformed IHAVE from {}", shortPeerId(from));
         return;
     }
+    this->ihaveKeysReceived += keys.size();
     std::erase_if(keys, [this](const RoutedMessageKey& key) {
         return key.sender == this->selfIdentity->getPeerId() || this->seenMessages.contains(key);
     });
@@ -447,6 +475,7 @@ void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
         this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed GRAFT:" + shortPeerId(from), LogLevel::Warning, "malformed GRAFT from {}", shortPeerId(from));
         return;
     }
+    ++this->graftsReceived;
     this->plumtree.onGraft(from);
     for (const RoutedMessageKey& key : keys) {
         // TTL 0: it ended here and was never announced — serving it would carry it a hop past its TTL
@@ -474,7 +503,10 @@ void Router::sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedM
 }
 
 void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
-    for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now))         this->sendGraft(neighbor, keys);
+    for (const auto& [neighbor, keys] : this->plumtree.takeDueGrafts(now)) {
+        if (!keys.empty()) ++this->graftsForMissing;                                // an empty GRAFT only switches the link to eager
+        this->sendGraft(neighbor, keys);
+    }
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
     this->dropExpiredAwaitedReplies(now);
@@ -492,7 +524,7 @@ void Router::reportUnknownMode(const RoutedMessage& message, const PeerId& recei
     auto& lastReport = this->unknownModeReportedAt[receivedFrom][static_cast<uint8_t>(message.mode) & 0x0F];
     if (lastReport && now - *lastReport < this->config.unknownModeReportInterval) return;
     lastReport = now;
-    this->network.sendToPeer(receivedFrom, RouterWire::encodeUnknownDeliveryMode({ static_cast<uint8_t>(message.mode), { message.sender, message.msgId } }));
+    if (this->network.sendToPeer(receivedFrom, RouterWire::encodeUnknownDeliveryMode({ static_cast<uint8_t>(message.mode), { message.sender, message.msgId } })) > 0) ++this->unknownModeReportsSent;
 }
 
 void Router::handleRoutedMessage(const NetworkMessage& message) {
@@ -502,6 +534,7 @@ void Router::handleRoutedMessage(const NetworkMessage& message) {
         this->reportUnknownMode(routed, message.source);
         return;
     }
+    if (status == RoutedMessageStatus::TimestampOutOfWindow) ++this->clockWindowRejections;
     if (status != RoutedMessageStatus::Success) {
         this->log.formatRateLimited(this->routerThreadLogLimiter, "routed message rejected:" + shortPeerId(message.source), LogLevel::Warning, "routed message from {} rejected (status {})", shortPeerId(message.source), static_cast<int>(status));
         return;
@@ -606,13 +639,16 @@ void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId&
 // every hop (D6, signed by the node it leads to — D5); the destination acts on it, relays forward it like any UNICAST —
 // a route probe with this relay added.
 void Router::acceptVerifiedRouterMessage(RoutedMessage message, const PeerId& receivedFrom) {
-    const bool isAnswer = message.subtype == RouterWire::SUBTYPE_ACK || message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT || message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY;
+    const bool isAnswer = message.subtype == RouterWire::SUBTYPE_ACK || message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT || message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY
+                       || message.subtype == RouterWire::SUBTYPE_STATE_REPORT;
     if (message.destination == this->selfIdentity->getPeerId()) {
         if (message.subtype == RouterWire::SUBTYPE_ACK)          this->receiveAckForUs(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_REPORT) this->receiveRouteReportForUs(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_RECORD_ROUTE) this->sendRouteReport(message, receivedFrom);
         if (message.subtype == RouterWire::SUBTYPE_ROUTE_ERROR)  this->receiveRouteErrorForUs(message);
         if (message.subtype == RouterWire::SUBTYPE_PRESENCE_REPLY) this->learnRoute(message.sender, receivedFrom, hopsTraveled(message), RouteEvidence::Broadcast);
+        if (message.subtype == RouterWire::SUBTYPE_STATE_QUERY)  this->answerStateQuery(message, receivedFrom);
+        if (message.subtype == RouterWire::SUBTYPE_STATE_REPORT) this->receiveStateReportForUs(message, receivedFrom);
         return;                                                                     // unknown subtype: nothing
     }
     // Only the addressee measured a round trip; for a relay the answer proves just that its signer reaches the addressee
@@ -645,6 +681,7 @@ void Router::receiveAckForUs(const RoutedMessage& ack, const PeerId& receivedFro
     // A round trip we asked for confirms the route; an unsolicited ACK teaches it like a broadcast
     this->learnRoute(ack.sender, receivedFrom, hopsTraveled(ack), rtt ? RouteEvidence::Ack : RouteEvidence::Broadcast, rtt);
     if (!rtt) return;                                                               // not asked for, not from the addressee, a repeat or too late
+    ++this->acksReceived;
 
     const AckReceipt receipt{ payload.acknowledgedMsgId, ack.sender, *rtt, hopsTraveled(ack) };
     this->notifyListeners([&](RouterEventListener& listener) { listener.onAckReceived(receipt); }, "onAckReceived");
@@ -713,6 +750,7 @@ void Router::sendRouteReport(const RoutedMessage& probe, const PeerId& receivedF
 void Router::receiveRouteErrorForUs(const RoutedMessage& error) {
     RouteErrorPayload payload;
     RouterWire::decodeRouteErrorPayload(error.payload, payload);                   // shape checked by decode
+    ++this->routeErrorsReceived;
     this->concludeRouteFailure(payload.stuckMsgId, error.sender, payload.unreachableDestination, payload.reason);
 }
 
@@ -757,7 +795,7 @@ void Router::sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFr
 // every branch of local flooding ends this way. Only data and probes are reported: nobody waits on an answer's fate.
 void Router::reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receivedFrom) {
     const bool isRouterMessage = stuck.group == RouterWire::ROUTER_PROTOCOL_GROUP;
-    if (isRouterMessage && stuck.subtype != RouterWire::SUBTYPE_RECORD_ROUTE) return;
+    if (isRouterMessage && stuck.subtype != RouterWire::SUBTYPE_RECORD_ROUTE && stuck.subtype != RouterWire::SUBTYPE_STATE_QUERY) return;
     const PeerId& destination = *stuck.destination;
     if (stuck.mode != RoutingMode::Routed && !this->isNeighbor(destination)) {
         std::lock_guard lock(this->routesMutex);
@@ -765,6 +803,39 @@ void Router::reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receiv
         if (std::none_of(nextHops.begin(), nextHops.end(), [&](const PeerId& hop) { return hop != stuck.sender; })) return;
     }
     this->sendRouteError(stuck, receivedFrom, destination, RouteErrorReason::TtlExhausted);
+}
+
+// docs/router.md 4.6. The query is signed by its sender, so it teaches the way back (D6) — over which alone the report
+// goes, never by local flooding. Budgeted per node: queries past it are dropped, the collector asks again.
+void Router::answerStateQuery(const RoutedMessage& query, const PeerId& receivedFrom) {
+    this->learnRoute(query.sender, receivedFrom, hopsTraveled(query), RouteEvidence::Broadcast);
+    StateReportWire::StateQuery wanted;
+    if (!this->config.answerStateQueries || !StateReportWire::decodeQuery(query.payload, wanted) || !this->knowsWayTo(query.sender)) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now - this->stateReplyWindowStart >= std::chrono::seconds(1)) { this->stateReplyWindowStart = now; this->stateRepliesInWindow = 0; }
+    if (this->stateRepliesInWindow >= this->config.stateRepliesPerSecond) return;
+    ++this->stateRepliesInWindow;
+
+    StateReportWire::StateReport report = this->buildStateReport(wanted);
+    report.queryMsgId = query.msgId;
+    ++this->stateRepliesSent;
+    this->sendOwnRouterMessage(this->buildRouterMessage(query.sender, RouterWire::SUBTYPE_STATE_REPORT, StateReportWire::encodeReport(report, this->config.stateReportMaxBytes)));
+}
+
+void Router::receiveStateReportForUs(const RoutedMessage& report, const PeerId& receivedFrom) {
+    StateReportReceipt receipt{ report.sender, 0, {}, {} };
+    if (!StateReportWire::decodeReport(report.payload, receipt.report)) {
+        this->log.formatRateLimited(this->routerThreadLogLimiter, "malformed STATE_REPORT:" + shortPeerId(report.sender), LogLevel::Warning, "malformed STATE_REPORT from {}", shortPeerId(report.sender));
+        return;
+    }
+    // Only a hint about the way to its signer: the report says nothing about how good the route is (docs/router.md 4.4a)
+    this->learnRoute(report.sender, receivedFrom, hopsTraveled(report), RouteEvidence::Broadcast);
+    const auto rtt = this->acceptAnswer(receipt.report.queryMsgId, report.sender);
+    if (!rtt) return;                                                               // not our query, not from its addressee, a repeat or too late
+    receipt.queryMsgId = receipt.report.queryMsgId;
+    receipt.rtt = *rtt;
+    this->notifyListeners([&](RouterEventListener& listener) { listener.onStateReported(receipt); }, "onStateReported");
 }
 
 // Signed UNICAST of the Router's own (Group 0xFE); safe on any thread — signing needs only the identity
@@ -998,7 +1069,10 @@ void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<P
     const PeerId& destination = *outgoing.destination;
     const std::vector<PeerId> neighbors = this->neighborsSnapshot();
 
-    if (std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) return;
+    if (std::find(neighbors.begin(), neighbors.end(), destination) != neighbors.end() && this->sendFullCopy(destination, frame)) {
+        if (receivedFrom) ++this->unicastForwarded;
+        return;
+    }
 
     std::vector<PeerId> nextHops;
     {
@@ -1006,7 +1080,10 @@ void Router::forwardUnicast(const RoutedMessage& outgoing, const std::optional<P
         nextHops = this->routes.nextHops(destination, receivedFrom);
     }
     for (const PeerId& nextHop : nextHops) {
-        if (nextHop != outgoing.sender && this->sendFullCopy(nextHop, frame)) return;
+        if (nextHop != outgoing.sender && this->sendFullCopy(nextHop, frame)) {
+            if (receivedFrom) ++this->unicastForwarded;
+            return;
+        }
     }
 
     ++this->localFloods;
@@ -1025,6 +1102,7 @@ void Router::deliverLocally(const RoutedMessage& message, bool senderAuthenticat
     delivery.hopsTraveled = hopsTraveled(message);
     delivery.senderAuthenticated = senderAuthenticated;
     delivery.payload      = message.payload;
+    ++this->delivered;
     this->notifyListeners([&](RouterEventListener& listener) { listener.onMessageDelivered(delivery); }, "onMessageDelivered");
 }
 

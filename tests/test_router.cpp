@@ -5,6 +5,8 @@
 #include "meshlink/router_wire.h"
 #include "network_test_node.h"
 
+#include <deque>
+#include <map>
 #include <mutex>
 #include <random>
 #include <set>
@@ -86,7 +88,20 @@ struct DeliveryRecorder : RouterEventListener {
         return matching;
     }
 
+    void onStateReported(const StateReportReceipt& receipt) override {
+        std::lock_guard lock(this->mutex);
+        this->stateReports.push_back(receipt);
+    }
+
+    std::vector<StateReportReceipt> stateReportsFrom(const PeerId& node) const {
+        std::lock_guard lock(this->mutex);
+        std::vector<StateReportReceipt> matching;
+        for (const auto& receipt : this->stateReports) if (receipt.from == node) matching.push_back(receipt);
+        return matching;
+    }
+
     mutable std::mutex           mutex;
+    std::vector<StateReportReceipt> stateReports;
     std::vector<RoutedDelivery>  deliveries;
     std::vector<AckReceipt>      acks;
     std::vector<RouteReport>     routeReports;
@@ -1472,6 +1487,143 @@ TEST(RouterTest, AnswerRunningOutOfTtlIsNotReported) {
     const auto nowMs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), signedFromNodeZero(RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ nowMs, {} }))), 0);
     EXPECT_TRUE(waitUntil([&] { return mesh.routers[2]->getStatistics().routeErrorsSent == 1; }, 5s));
+}
+
+// ── DIAG: STATE_QUERY / STATE_REPORT (docs/router.md 4.6) ──────────────────────────────────────────────────────────
+
+using StateReportWire::StateQuery;
+using StateReportWire::StateSection;
+using StateReportWire::sectionBit;
+
+std::optional<StateReportReceipt> awaitStateReport(const DeliveryRecorder& recorder, const PeerId& from, uint64_t queryMsgId) {
+    std::optional<StateReportReceipt> found;
+    waitUntil([&] {
+        for (const auto& receipt : recorder.stateReportsFrom(from)) if (receipt.queryMsgId == queryMsgId) { found = receipt; return true; }
+        return false;
+    }, 5s);
+    return found;
+}
+
+TEST(RouterTest, StateQueryReturnsOnlyRequestedSections) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const StateQuery query{ static_cast<uint16_t>(sectionBit(StateSection::Node) | sectionBit(StateSection::Neighbors)) };
+    const uint64_t queryId = mesh.routers[0]->queryState(mesh.id(1), query).value();
+    const auto receipt = awaitStateReport(*mesh.recorders[0], mesh.id(1), queryId);
+    ASSERT_TRUE(receipt.has_value());
+
+    const auto& report = receipt->report;
+    ASSERT_TRUE(report.node.has_value());
+    EXPECT_EQ(report.node->name, "node1");
+    EXPECT_EQ(report.node->protocolVersion, RouterWire::WIRE_VERSION);
+    ASSERT_TRUE(report.neighbors.has_value());
+    ASSERT_EQ(report.neighbors->size(), 1u);
+    EXPECT_EQ(report.neighbors->front().peerId, mesh.id(0));
+    EXPECT_TRUE(report.neighbors->front().inbound);                                           // node 0 dialed node 1
+    EXPECT_TRUE(report.neighbors->front().eager);                                             // a new Plumtree link is eager
+    EXPECT_FALSE(report.plumtree || report.routes || report.delivery || report.network);
+    EXPECT_FALSE(report.truncated);
+    EXPECT_EQ(mesh.routers[1]->getStatistics().stateRepliesSent, 1u);
+}
+
+// The node asks itself: answered on the Router thread, nothing goes to the network
+TEST(RouterTest, StateQueryToOwnNodeIsAnsweredLocally) {
+    RouterMesh mesh(2, lineEdges(2));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t sentBefore = mesh.routers[0]->getStatistics().fullMessagesSent;
+    const uint64_t queryId = mesh.routers[0]->queryState(mesh.id(0)).value();
+    const auto receipt = awaitStateReport(*mesh.recorders[0], mesh.id(0), queryId);
+    ASSERT_TRUE(receipt.has_value());
+    EXPECT_TRUE(receipt->report.node && receipt->report.neighbors && receipt->report.plumtree && receipt->report.routes && receipt->report.delivery && receipt->report.network);
+    ASSERT_EQ(receipt->report.neighbors->size(), 1u);
+    EXPECT_FALSE(receipt->report.neighbors->front().inbound);
+    EXPECT_EQ(mesh.routers[0]->getStatistics().fullMessagesSent, sentBefore);
+}
+
+// Nobody knows the far end: the query floods locally like any UNICAST, the answer goes back over the way the query taught
+TEST(RouterTest, StateQueryReachesDistantNodeWithoutRoutes) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t queryId = mesh.routers[0]->queryState(mesh.id(3), { sectionBit(StateSection::Node) }).value();
+    ASSERT_TRUE(awaitStateReport(*mesh.recorders[0], mesh.id(3), queryId).has_value());
+    EXPECT_EQ(mesh.routers[3]->getStatistics().localFloods, 0u);                              // the answer did not flood
+}
+
+// Breadth-first over the neighbor lists: every report names more nodes, until the whole graph is known
+TEST(RouterTest, StateQueriesMapWholeNetwork) {
+    RouterMesh mesh(8, ringWithChords());
+    ASSERT_TRUE(mesh.ready);
+    std::map<PeerId, std::set<PeerId>> graph;
+    std::deque<PeerId> toAsk{ mesh.id(0) };
+    while (!toAsk.empty()) {
+        const PeerId node = toAsk.front();
+        toAsk.pop_front();
+        if (graph.contains(node)) continue;
+        const uint64_t queryId = mesh.routers[0]->queryState(node, { sectionBit(StateSection::Neighbors) }).value();
+        const auto receipt = awaitStateReport(*mesh.recorders[0], node, queryId);
+        ASSERT_TRUE(receipt.has_value()) << "no report";
+        for (const auto& neighbor : *receipt->report.neighbors) {
+            graph[node].insert(neighbor.peerId);
+            if (!graph.contains(neighbor.peerId)) toAsk.push_back(neighbor.peerId);
+        }
+    }
+    EXPECT_EQ(graph.size(), 8u);
+    for (const auto& [node, neighbors] : graph) {
+        for (const PeerId& neighbor : neighbors) EXPECT_TRUE(graph[neighbor].contains(node)) << "every link is seen from both ends";
+    }
+    for (const auto& [dialer, listener] : ringWithChords()) EXPECT_TRUE(graph[mesh.id(dialer)].contains(mesh.id(listener)));
+}
+
+TEST(RouterTest, NodeWithDiagnosticsOffStaysSilent) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t i, RouterConfig& c) { if (i == 1) c.answerStateQueries = false; });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t queryId = mesh.routers[0]->queryState(mesh.id(1)).value();
+    std::this_thread::sleep_for(500ms);
+    EXPECT_TRUE(mesh.recorders[0]->stateReportsFrom(mesh.id(1)).empty());
+    EXPECT_EQ(mesh.routers[1]->getStatistics().stateRepliesSent, 0u);
+
+    // Control: node 0 still answers node 1
+    const uint64_t back = mesh.routers[1]->queryState(mesh.id(0), { sectionBit(StateSection::Node) }).value();
+    EXPECT_TRUE(awaitStateReport(*mesh.recorders[1], mesh.id(0), back).has_value());
+    (void)queryId;
+}
+
+// Answers are budgeted per node: queries over the budget are dropped, not queued
+TEST(RouterTest, StateRepliesAreBudgetedPerSecond) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t i, RouterConfig& c) { if (i == 1) c.stateRepliesPerSecond = 1; });
+    ASSERT_TRUE(mesh.ready);
+    for (int i = 0; i < 5; ++i) ASSERT_TRUE(mesh.routers[0]->queryState(mesh.id(1), { sectionBit(StateSection::Node) }).has_value());
+    ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->stateReportsFrom(mesh.id(1)).size() == 1; }, 3s));
+    std::this_thread::sleep_for(1500ms);
+    EXPECT_EQ(mesh.recorders[0]->stateReportsFrom(mesh.id(1)).size(), 1u);
+}
+
+TEST(RouterTest, StateReportPagesRouteTable) {
+    RouterMesh mesh(4, lineEdges(4));
+    ASSERT_TRUE(mesh.ready);
+    for (size_t sender : { size_t{ 2 }, size_t{ 3 } }) {                                      // node 0 learns routes to nodes 2 and 3
+        const uint64_t hello = mesh.routers[sender]->broadcast(0x10, 0, { 'h' }).value();
+        ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(sender), hello) == 1; }, 5s));
+    }
+    const uint64_t queryId = mesh.routers[1]->queryState(mesh.id(0), { sectionBit(StateSection::Routes), 1, 1 }).value();
+    const auto receipt = awaitStateReport(*mesh.recorders[1], mesh.id(0), queryId);
+    ASSERT_TRUE(receipt.has_value());
+    const auto& routes = *receipt->report.routes;
+    EXPECT_GE(routes.destinationCount, 2u);
+    EXPECT_EQ(routes.offset, 1u);
+    ASSERT_EQ(routes.routes.size(), 1u);                                                      // one destination, one candidate (a line)
+    EXPECT_EQ(routes.routes.front().via, mesh.id(1));
+}
+
+TEST(RouterTest, StateReportOverLimitIsMarkedTruncated) {
+    RouterMesh mesh(2, lineEdges(2), [](size_t i, RouterConfig& c) { if (i == 1) c.stateReportMaxBytes = 100; });
+    ASSERT_TRUE(mesh.ready);
+    const uint64_t queryId = mesh.routers[0]->queryState(mesh.id(1)).value();
+    const auto receipt = awaitStateReport(*mesh.recorders[0], mesh.id(1), queryId);
+    ASSERT_TRUE(receipt.has_value());
+    EXPECT_TRUE(receipt->report.truncated);
+    EXPECT_TRUE(receipt->report.node.has_value());                                            // small sections still fit
+    EXPECT_FALSE(receipt->report.neighbors.has_value());                                      // one neighbor entry alone takes 57 B
 }
 
 // ── PRESENCE: the Router's own "I am here" to every other Router ────────────────────────────────────────────────────

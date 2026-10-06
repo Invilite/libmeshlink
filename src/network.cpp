@@ -983,6 +983,7 @@ void Network::handleWakeup() {
                 // The management thread sends greetings and farewells — never this thread (A1 S3/M1). A greeting queued
                 // for a replaced connection is skipped once that peer is Closing.
                 if (dismissedPeer) {
+                    ++this->inboundDismissedForNoSlots;
                     this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Dismissed, dismissedPeer, GoodbyeReason::NoSlots });
                 }
                 if (activatedPeer) {
@@ -1419,6 +1420,33 @@ void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
 std::vector<ObservedSelfAddress> Network::getObservedSelfAddresses() const {
     std::lock_guard lock(this->observedSelfMutex);
     return this->observedSelfAddresses;
+}
+
+NetworkDiagnostics Network::getDiagnostics() const {
+    NetworkDiagnostics diagnostics;
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::shared_lock lock(this->peersMutex);
+        for (const auto& [id, peer] : this->peersById) {
+            if (!peer->isActive()) continue;
+            const std::shared_ptr<Connection> connection = peer->getConnection();
+            diagnostics.links.push_back({ id, !peer->isOutbound(), std::chrono::duration_cast<std::chrono::seconds>(now - peer->getConnectedAt()),
+                                          connection->getBytesSent(), connection->getBytesReceived(), connection->getQueuedSendBytes() });
+            ++(peer->isOutbound() ? diagnostics.activeOutbound : diagnostics.activeInbound);
+        }
+    }
+    diagnostics.nodeName                   = this->config.nodeName;
+    diagnostics.inboundSlotsInUse          = this->connectionSlots.inboundInUse();
+    diagnostics.outboundSlotsInUse         = this->connectionSlots.outboundInUse();
+    diagnostics.limits                     = this->config.connectionLimits;
+    diagnostics.inboundDismissedForNoSlots = this->inboundDismissedForNoSlots.load();
+    for (const KnownPeer& known : this->peerDirectory->listPeers()) {
+        ++diagnostics.knownPeers;
+        const auto availability = static_cast<size_t>(known.availability);
+        if (availability < diagnostics.knownByAvailability.size()) ++diagnostics.knownByAvailability[availability];
+    }
+    for (const ObservedSelfAddress& observed : this->getObservedSelfAddresses()) diagnostics.observedSelfAddresses.push_back(observed.address);
+    return diagnostics;
 }
 
 void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason) {

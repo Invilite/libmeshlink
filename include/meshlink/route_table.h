@@ -58,6 +58,8 @@ namespace invilite::Mesh {
         void forgetRoute(const PeerId& destination, const PeerId& via);             // an error says this one does not work (R-6)
 
         [[nodiscard]] size_t destinationCount() const { return this->byDestination.size(); }
+        // Destinations ordered by PeerId — a stable order, so consecutive pages neither skip nor repeat (diagnostics, 4.6)
+        [[nodiscard]] std::vector<std::pair<PeerId, std::vector<RouteCandidate>>> destinationsPage(size_t offset, size_t count) const;
 
     private:
         struct Destination {

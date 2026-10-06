@@ -12,6 +12,7 @@
 #include "meshlink/router_events.h"
 #include "meshlink/router_wire.h"
 #include "meshlink/seen_message_cache.h"
+#include "meshlink/state_report_wire.h"
 
 #include <atomic>
 #include <chrono>
@@ -52,6 +53,9 @@ namespace invilite::Mesh {
         size_t                      unicastAcksPerNeighborPerSecond = 32;           // ACKs we sign for unsigned UNICASTs one neighbor handed us (review R-5 I4)
         std::chrono::milliseconds   routeErrorInterval      = std::chrono::seconds(1);    // at most one ROUTE_ERROR per neighbor whose messages got stuck here
         bool                        announcePresence        = true;                 // PRESENCE on new neighbors; off only for tests that count traffic
+        bool                        answerStateQueries      = true;                 // STATE_QUERY answered (diagnostics, `meshlink map`, docs/router.md 4.6)
+        size_t                      stateRepliesPerSecond   = 2;                    // all STATE_REPORTs of this node together; more queries are dropped
+        size_t                      stateReportMaxBytes     = StateReportWire::DEFAULT_MAX_REPORT_BYTES;   // sections past it are left out (flagged)
         std::chrono::milliseconds   presenceMinInterval     = std::chrono::seconds(60);   // at most one PRESENCE per interval; a later new neighbor is caught up
         std::chrono::milliseconds   presenceReplySpread     = std::chrono::seconds(5);    // PRESENCE_REPLY after a random delay up to this: a joiner gets answers spread out
         size_t                      presenceRepliesPerSecond = 20;                  // all PRESENCE_REPLYs of this node together; more wait for the next second
@@ -70,6 +74,17 @@ namespace invilite::Mesh {
         uint64_t    routeErrorsSent    = 0;
         uint64_t    presenceSent       = 0;
         uint64_t    presenceRepliesSent = 0;
+        uint64_t    stateRepliesSent   = 0;
+        uint64_t    delivered          = 0;                                         // handed to applications
+        uint64_t    unicastForwarded   = 0;                                         // UNICASTs relayed (own and local floods not counted)
+        uint64_t    acksReceived       = 0;                                         // ACKs we asked for
+        uint64_t    routeErrorsReceived = 0;                                        // ROUTE_ERRORs addressed to us, accepted or not
+        uint64_t    ihaveKeysReceived  = 0;
+        uint64_t    graftsReceived     = 0;
+        uint64_t    prunesReceived     = 0;
+        uint64_t    graftsForMissing   = 0;                                         // GRAFTs asking for announced messages that never came
+        uint64_t    unknownModeReportsSent = 0;
+        uint64_t    clockWindowRejections = 0;                                      // routed messages with a timestamp outside maxClockSkew
     };
 
     struct SendOptions {
@@ -123,6 +138,10 @@ namespace invilite::Mesh {
         // onRouteReported. Travels as UNICAST, so it shows the path messages to that node take now.
         std::optional<uint64_t> recordRoute(const PeerId& destination);
 
+        // Diagnostics (docs/router.md 4.6): ask `destination` for its state; the answer arrives as onStateReported.
+        // Asking this node itself is answered locally. Nothing when the Router is not running or unicastTtl is 0.
+        std::optional<uint64_t> queryState(const PeerId& destination, StateReportWire::StateQuery query = {});
+
         void addListener(std::shared_ptr<RouterEventListener> listener);
         void removeListener(const std::shared_ptr<RouterEventListener>& listener);
 
@@ -167,6 +186,9 @@ namespace invilite::Mesh {
         void concludeRouteFailure(uint64_t msgId, const PeerId& reportedBy, const PeerId& unreachableHop, RouteErrorReason reason);
         void sendRouteError(const RoutedMessage& stuck, const PeerId& receivedFrom, const PeerId& unreachableHop, RouteErrorReason reason);
         void reportTtlExhausted(const RoutedMessage& stuck, const PeerId& receivedFrom);
+        void answerStateQuery(const RoutedMessage& query, const PeerId& receivedFrom);
+        void receiveStateReportForUs(const RoutedMessage& report, const PeerId& receivedFrom);
+        [[nodiscard]] StateReportWire::StateReport buildStateReport(const StateReportWire::StateQuery& query) const;   // router_state_report.cpp
         [[nodiscard]] bool isNeighbor(const PeerId& node) const;
         [[nodiscard]] bool knowsWayTo(const PeerId& node) const;
         // UNICAST, or ROUTED along `relays` when given
@@ -243,6 +265,9 @@ namespace invilite::Mesh {
         std::unordered_map<PeerId, std::pair<std::chrono::steady_clock::time_point, size_t>, PeerIDHash> unicastAcksByNeighbor;
         // Last ROUTE_ERROR caused by each neighbor's messages
         std::unordered_map<PeerId, std::optional<std::chrono::steady_clock::time_point>, PeerIDHash> routeErrorReportedAt;
+        std::chrono::steady_clock::time_point       stateReplyWindowStart{};
+        size_t                                      stateRepliesInWindow = 0;
+        const std::chrono::steady_clock::time_point constructedAt = std::chrono::steady_clock::now();   // counters run from here (uptime)
 
         // Written by the Router thread (and by start()); read by getRouteCandidates()
         mutable std::mutex                          routesMutex;
@@ -263,6 +288,17 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       routeErrorsSent{0};
         std::atomic<uint64_t>                       presenceSent{0};
         std::atomic<uint64_t>                       presenceRepliesSent{0};
+        std::atomic<uint64_t>                       stateRepliesSent{0};
+        std::atomic<uint64_t>                       delivered{0};
+        std::atomic<uint64_t>                       unicastForwarded{0};
+        std::atomic<uint64_t>                       acksReceived{0};
+        std::atomic<uint64_t>                       routeErrorsReceived{0};
+        std::atomic<uint64_t>                       ihaveKeysReceived{0};
+        std::atomic<uint64_t>                       graftsReceived{0};
+        std::atomic<uint64_t>                       prunesReceived{0};
+        std::atomic<uint64_t>                       graftsForMissing{0};
+        std::atomic<uint64_t>                       unknownModeReportsSent{0};
+        std::atomic<uint64_t>                       clockWindowRejections{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

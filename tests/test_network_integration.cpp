@@ -573,6 +573,54 @@ TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
     for (auto* node : { &dismissed, &first, &full }) node->network->stop();
 }
 
+// DIAG b: the snapshot the Router's STATE_REPORT is built from — links, limits, address book
+TEST(NetworkIntegrationTest, DiagnosticsDescribeLinksLimitsAndAddressBook) {
+    const auto secret = makeSecret();
+    TestNode listener(secret, "listener");
+    TestNode dialer(secret, "dialer");
+    for (auto* node : { &listener, &dialer }) node->network->start();
+    dialer.network->connectToPeer("127.0.0.1", listener.port);
+    ASSERT_TRUE(waitUntil([&] { return listener.network->getConnectedPeerCount() == 1 && dialer.network->getConnectedPeerCount() == 1; }, 5s));
+    ASSERT_TRUE(waitUntil([&] { return dialer.knownPeer(listener).has_value() && listener.knownPeer(dialer).has_value(); }, 5s));
+
+    const NetworkDiagnostics atListener = listener.network->getDiagnostics();
+    ASSERT_EQ(atListener.links.size(), 1u);
+    EXPECT_EQ(atListener.links[0].peerId, dialer.identity->getPeerId());
+    EXPECT_TRUE(atListener.links[0].inbound);
+    EXPECT_GT(atListener.links[0].bytesReceived, 0u);                                          // HELLO at least
+    EXPECT_EQ(atListener.activeInbound, 1u);
+    EXPECT_EQ(atListener.activeOutbound, 0u);
+    EXPECT_EQ(atListener.limits.inbound.soft, NetworkConfig{}.connectionLimits.inbound.soft);
+    EXPECT_GE(atListener.knownPeers, 1u);
+
+    const NetworkDiagnostics atDialer = dialer.network->getDiagnostics();
+    ASSERT_EQ(atDialer.links.size(), 1u);
+    EXPECT_FALSE(atDialer.links[0].inbound);
+    EXPECT_GT(atDialer.links[0].bytesSent, 0u);
+    EXPECT_EQ(atDialer.activeOutbound, 1u);
+    EXPECT_EQ(atDialer.knownByAvailability[static_cast<size_t>(AvailabilityState::Available)], 1u);   // a successful dial proves the listener
+    EXPECT_EQ(atDialer.inboundDismissedForNoSlots, 0u);
+
+    for (auto* node : { &dialer, &listener }) node->network->stop();
+}
+
+TEST(NetworkIntegrationTest, DiagnosticsCountNoSlotsDismissals) {
+    const auto secret = makeSecret();
+    TestNode full(secret, "full", [](NetworkConfig& config) { config.connectionLimits.inbound.soft = 1; });
+    TestNode first(secret, "first");
+    TestNode dismissed(secret, "dismissed");
+    for (auto* node : { &full, &first, &dismissed }) node->network->start();
+
+    first.network->connectToPeer("127.0.0.1", full.port);
+    ASSERT_TRUE(waitUntil([&] { return full.network->getConnectedPeerCount() == 1; }, 5s));
+    EXPECT_EQ(full.network->getDiagnostics().inboundDismissedForNoSlots, 0u);
+    dismissed.network->connectToPeer("127.0.0.1", full.port);
+    EXPECT_TRUE(waitUntil([&] { return full.network->getDiagnostics().inboundDismissedForNoSlots == 1; }, 5s));
+    EXPECT_EQ(full.network->getDiagnostics().links.size(), 1u);                               // a departing peer is not a link
+
+    for (auto* node : { &dismissed, &first, &full }) node->network->stop();
+}
+
 // B3: in the departure window only management messages are expected from the departing peer. Application data from it
 // is a protocol violation — it must never reach listeners.
 TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {

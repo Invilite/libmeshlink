@@ -126,6 +126,31 @@ namespace invilite::Mesh {
         PeerId excludePeerId;                                                           // source — we never send back to where we learned it from
     };
 
+    // Read-only snapshot for diagnostics (the Router's STATE_REPORT, docs/router.md 4.6 sections B and F). Taken from
+    // several sources one after another, so the parts may differ by a moment.
+    struct NetworkDiagnostics {
+        struct Link {
+            PeerId                      peerId{};
+            bool                        inbound        = false;                     // the peer dialed us
+            std::chrono::seconds        connectedFor{0};
+            uint64_t                    bytesSent      = 0;                         // application bytes, before encryption
+            uint64_t                    bytesReceived  = 0;
+            size_t                      sendQueueBytes = 0;                         // encrypted frames waiting for the socket
+        };
+
+        std::string                     nodeName;                                   // as announced in handshakes (NetworkConfig::nodeName)
+        std::vector<Link>               links;                                      // Active peers only (not joining, departing or closing)
+        size_t                          activeInbound      = 0;
+        size_t                          activeOutbound     = 0;
+        size_t                          inboundSlotsInUse  = 0;                     // handshakes in flight + Active + Departing (R10)
+        size_t                          outboundSlotsInUse = 0;                     // the same, probes included
+        ConnectionLimits                limits;
+        uint64_t                        inboundDismissedForNoSlots = 0;             // inbound peers sent away with GOODBYE(NoSlots) since start
+        size_t                          knownPeers         = 0;
+        std::array<size_t, 4>           knownByAvailability{};                      // indexed by AvailabilityState
+        std::vector<std::string>        observedSelfAddresses;                      // as getObservedSelfAddresses, addresses only
+    };
+
     class Network {
     public:
         // PeerDirectory is injected so other components (Router, MessageCrypto, NetworkMap)
@@ -176,6 +201,7 @@ namespace invilite::Mesh {
         // not announce means this node is behind NAT — reachable from outside only with port forwarding.
         std::vector<ObservedSelfAddress> getObservedSelfAddresses() const;
         size_t                          getConnectedPeerCount() const;
+        NetworkDiagnostics              getDiagnostics() const;
 
         // Returns snapshot of known peers (learned via HELLO or PEX_ANNOUNCE).
         // Convenience wrapper over peerDirectory — equivalent to projecting `record` from each KnownPeer.
@@ -371,6 +397,7 @@ namespace invilite::Mesh {
 
         // ===== Lifecycle state =====
         std::atomic<bool>                                running{false};
+        std::atomic<uint64_t>                            inboundDismissedForNoSlots{0};   // diagnostics only
         std::atomic<bool>                                stopping{false};               // stop() in its departure window: no new connections, no listener events
         std::mutex                                       stopMutex;                     // a concurrent stop() (e.g. ~Network) waits for the running one
         Transport::Platform::WakeupSignal                ioWakeup;                       // wakes the I/O thread out of its poll

@@ -69,6 +69,17 @@ std::vector<RouteCandidate> RouteTable::candidates(const PeerId& destination) co
     return found == this->byDestination.end() ? std::vector<RouteCandidate>{} : found->second.candidates;
 }
 
+std::vector<std::pair<PeerId, std::vector<RouteCandidate>>> RouteTable::destinationsPage(size_t offset, size_t count) const {
+    std::vector<PeerId> destinations;
+    destinations.reserve(this->byDestination.size());
+    for (const auto& [destination, entry] : this->byDestination) destinations.push_back(destination);
+    std::sort(destinations.begin(), destinations.end());
+
+    std::vector<std::pair<PeerId, std::vector<RouteCandidate>>> page;
+    for (size_t i = offset; i < destinations.size() && page.size() < count; ++i) page.emplace_back(destinations[i], this->byDestination.at(destinations[i]).candidates);
+    return page;
+}
+
 void RouteTable::forgetNeighbor(const PeerId& via) {
     for (auto it = this->byDestination.begin(); it != this->byDestination.end();) {
         std::erase_if(it->second.candidates, [&](const RouteCandidate& c) { return c.via == via; });

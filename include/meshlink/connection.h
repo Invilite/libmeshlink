@@ -103,9 +103,9 @@ protected:
     uint32_t frameLength = 0;
     uint8_t  frameFlags = 0;
 
-	uint64_t bytesReceivedRaw = 0;
+	std::atomic<uint64_t> bytesReceivedRaw = 0;																			// Atomic — read by diagnostics on any thread
 	std::atomic<uint64_t> bytesSentRaw = 0;																				// Atomic — senders run on any thread
-	uint64_t bytesReceived = 0;
+	std::atomic<uint64_t> bytesReceived = 0;
 	std::atomic<uint64_t> bytesSent = 0;
 
 private:

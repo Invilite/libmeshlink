@@ -4,6 +4,7 @@
 #define MESH_ROUTER_EVENTS_H
 
 #include "meshlink/router_wire.h"
+#include "meshlink/state_report_wire.h"
 
 #include <chrono>
 
@@ -57,6 +58,14 @@ namespace invilite::Mesh {
         RouteErrorReason    reason = RouteErrorReason::NextHopNotNeighbor;
     };
 
+    // A node's answer to our STATE_QUERY (docs/router.md 4.6); our own node answers locally with rtt 0
+    struct StateReportReceipt {
+        PeerId                          from{};
+        uint64_t                        queryMsgId = 0;
+        std::chrono::milliseconds       rtt{0};
+        StateReportWire::StateReport    report;
+    };
+
     // Observer for Router deliveries. Callbacks fire on the Router thread, which serves every peer: listeners MUST be
     // fast and non-blocking (enqueue and return), and MUST NOT call Router::stop() (it joins the very thread running the
     // callback). Exceptions are caught per listener. Default implementations are empty.
@@ -68,6 +77,7 @@ namespace invilite::Mesh {
         virtual void onAckReceived(const AckReceipt& receipt) { (void)receipt; }
         virtual void onRouteReported(const RouteReport& report) { (void)report; }
         virtual void onRouteFailed(const RouteFailure& failure) { (void)failure; }
+        virtual void onStateReported(const StateReportReceipt& receipt) { (void)receipt; }
     };
 
 } // namespace invilite::Mesh
