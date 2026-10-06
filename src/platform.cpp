@@ -18,6 +18,19 @@ bool invilite::Transport::Platform::disableNagle(const int socket) {
     return ::setsockopt(socket, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0;
 }
 
+bool invilite::Transport::Platform::enableKeepalive(const int socket, const int idleSeconds, const int intervalSeconds, const int probes) {
+    const int enabled = 1;
+    if (::setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0) return false;
+#if defined(TCP_KEEPIDLE)
+    const int idleOption = TCP_KEEPIDLE;
+#else
+    const int idleOption = TCP_KEEPALIVE;                                                   // macOS name for the idle time
+#endif
+    return ::setsockopt(socket, IPPROTO_TCP, idleOption, &idleSeconds, sizeof(idleSeconds)) == 0
+        && ::setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &intervalSeconds, sizeof(intervalSeconds)) == 0
+        && ::setsockopt(socket, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes)) == 0;
+}
+
 int invilite::Transport::Platform::waitForSockets(pollfd* sockets, const size_t count, const int timeoutMs) {
     return ::poll(sockets, static_cast<nfds_t>(count), timeoutMs);
 }

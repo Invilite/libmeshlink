@@ -86,6 +86,13 @@ namespace invilite::Mesh {
         // hold; once full, sends to that peer fail with SendQueueFull. Also the largest message that can be sent.
         // Minimum 64 KB (validated in the Network constructor).
         size_t                      sendQueueLimitBytes     = Connection::defaultSendQueueLimit;
+        // TCP keepalive on every connection (roadmap F7): NAT mappings of idle links stay open, dead peers are noticed in
+        // about idle + interval × probes. 0 seconds idle = off.
+        struct TcpKeepalive {
+            std::chrono::seconds    idle     = std::chrono::seconds(60);
+            std::chrono::seconds    interval = std::chrono::seconds(15);
+            int                     probes   = 4;
+        }                           tcpKeepalive;
         // A peer whose queued frames made no progress for this long has stopped reading — its connection is closed.
         std::chrono::seconds        sendStallTimeout        = std::chrono::seconds(15);
 
@@ -225,6 +232,9 @@ namespace invilite::Mesh {
         size_t                          importKnownPeers(const std::vector<RememberedPeer>& peers);
 
     private:
+        // Socket options every connection gets before it carries anything (keepalive, F7)
+        void prepareConnectionSocket(int fd) const;
+
         struct Command {
             enum class Type { AddPeer };
             Type                                    type = Type::AddPeer;

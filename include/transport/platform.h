@@ -20,6 +20,11 @@ namespace invilite::Transport::Platform {
     // send queue, so Nagle only adds latency (~40 ms with delayed ACK) to back-to-back small messages. False on failure.
     bool disableNagle(int socket);
 
+    // TCP keepalive: after `idleSeconds` of silence the kernel sends empty probes every `intervalSeconds`, and gives up
+    // the connection after `probes` unanswered ones. Keeps NAT mappings of idle connections alive (a NAT forgets an idle
+    // TCP mapping after minutes) and finds dead peers without our own ping. False when an option is refused.
+    bool enableKeepalive(int socket, int idleSeconds, int intervalSeconds, int probes);
+
     // Waits for readiness on several sockets — poll() on POSIX (WSAPoll() on Windows). Same contract as poll().
     int waitForSockets(pollfd* sockets, size_t count, int timeoutMs);
 

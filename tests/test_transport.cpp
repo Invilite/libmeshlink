@@ -2,12 +2,14 @@
 #include <gtest/gtest.h>
 #include "transport/TcpClient.h"
 #include "transport/TcpServer.h"
+#include "transport/platform.h"
 #include "test_helpers.h"
 
 #include <atomic>
 #include <fcntl.h>
 #include <filesystem>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -176,4 +178,33 @@ TEST(TcpClientTest, ExceptionFromConnectCallbackReachesCaller) {
     TcpClient client;
     client.onConnect([](int, const sockaddr_storage*) { throw std::runtime_error("callback failed"); });
     EXPECT_THROW(client.connect("127.0.0.1", port, 2s), std::runtime_error);
+}
+
+// F7: keepalive is set on a real TCP socket as asked — the kernel then keeps NAT mappings of idle links alive
+TEST(PlatformTest, KeepaliveOptionsAreApplied) {
+    const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_GE(listener, 0);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    ASSERT_EQ(::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    ASSERT_EQ(::listen(listener, 1), 0);
+    socklen_t length = sizeof(address);
+    ASSERT_EQ(::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &length), 0);
+    const int client = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_EQ(::connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+
+    ASSERT_TRUE(invilite::Transport::Platform::enableKeepalive(client, 60, 15, 4));
+    int value = 0;
+    socklen_t size = sizeof(value);
+    ASSERT_EQ(::getsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &value, &size), 0);
+    EXPECT_EQ(value, 1);
+    ASSERT_EQ(::getsockopt(client, IPPROTO_TCP, TCP_KEEPIDLE, &value, &size), 0);
+    EXPECT_EQ(value, 60);
+    ASSERT_EQ(::getsockopt(client, IPPROTO_TCP, TCP_KEEPINTVL, &value, &size), 0);
+    EXPECT_EQ(value, 15);
+    ASSERT_EQ(::getsockopt(client, IPPROTO_TCP, TCP_KEEPCNT, &value, &size), 0);
+    EXPECT_EQ(value, 4);
+    ::close(client);
+    ::close(listener);
 }

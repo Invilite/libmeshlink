@@ -537,6 +537,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 
     std::shared_ptr<Connection> conn;
     try {
+        this->prepareConnectionSocket(fd);
         conn = std::make_shared<Connection>(fd, &addr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
         this->log.format(LogLevel::Error, "incoming Connection construction failed: {}", e.what());
@@ -619,6 +620,7 @@ Network::OutboundConnectionResult Network::establishOutboundConnection(const std
     // ── Transport handshake ───────────────────────────────────────────────────
     std::shared_ptr<Connection> connection;
     try {
+        this->prepareConnectionSocket(fd);
         connection = std::make_shared<Connection>(fd, &remoteAddr, this->networkSecret.get(), this->config.sendQueueLimitBytes);
     } catch (const std::exception& e) {
         this->log.format(LogLevel::Error, "outgoing Connection construction failed: {}", e.what());
@@ -1420,6 +1422,15 @@ void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
 std::vector<ObservedSelfAddress> Network::getObservedSelfAddresses() const {
     std::lock_guard lock(this->observedSelfMutex);
     return this->observedSelfAddresses;
+}
+
+void Network::prepareConnectionSocket(int fd) const {
+    const auto& keepalive = this->config.tcpKeepalive;
+    if (keepalive.idle.count() <= 0) return;
+    // Never fatal: without keepalive the connection still works, it only may die quietly behind a NAT
+    if (!Transport::Platform::enableKeepalive(fd, static_cast<int>(keepalive.idle.count()), static_cast<int>(keepalive.interval.count()), keepalive.probes)) {
+        this->log.format(LogLevel::Warning, "TCP keepalive refused by the socket");
+    }
 }
 
 NetworkDiagnostics Network::getDiagnostics() const {
