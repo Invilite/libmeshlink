@@ -104,7 +104,7 @@ Router::Router(Network& network, std::shared_ptr<PeerDirectory> peerDirectory, s
     : network(network), peerDirectory(std::move(peerDirectory)), selfIdentity(std::move(selfIdentity)), config(config),
       log(logger ? std::move(logger) : network.getLogger(), "Router"),
       inbox(std::make_shared<EventInbox>()), seenMessages(config.duplicateWindow, config.duplicateCacheCapacity), unsignedSeenMessages(config.duplicateWindow, config.duplicateCacheCapacity),
-      plumtree(config.plumtree), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
+      plumtree(config.plumtree), treeRootElection(this->selfIdentity->getPeerId(), config.treeRoot), broadcastCache(config.graftCacheRetention, config.graftCacheByteLimit), routes(config.routes) {}
 
 Router::~Router() {
     this->stop();
@@ -122,6 +122,11 @@ void Router::start() {
     this->awaitedReplies.clear();
     this->awaitedReplyOrder.clear();
     this->plumtree       = PlumtreeState(this->config.plumtree);
+    if (this->config.treeRoot.enabled) this->treeRootElection.start(std::chrono::steady_clock::now(), this->treeRootListeningTime());
+    {
+        std::lock_guard lock(this->treeRootMutex);
+        this->publishedTreeRoot.reset();
+    }
     this->broadcastCache = BroadcastCache(this->config.graftCacheRetention, this->config.graftCacheByteLimit);
     {
         std::lock_guard lock(this->routesMutex);
@@ -256,7 +261,7 @@ RouterStatistics Router::getStatistics() const {
              this->localFloods.load(), this->acksSent.load(), this->routedForwarded.load(), this->routeErrorsSent.load(), this->presenceSent.load(), this->presenceRepliesSent.load(),
              this->stateRepliesSent.load(), this->delivered.load(), this->unicastForwarded.load(), this->acksReceived.load(), this->routeErrorsReceived.load(),
              this->ihaveKeysReceived.load(), this->graftsReceived.load(), this->prunesReceived.load(), this->graftsForMissing.load(), this->unknownModeReportsSent.load(),
-             this->clockWindowRejections.load(), this->pinnedLinks.load() };
+             this->clockWindowRejections.load(), this->treeBeaconsSent.load() };
 }
 
 std::vector<RouteCandidate> Router::getRouteCandidates(const PeerId& destination) const {
@@ -275,9 +280,10 @@ void Router::routerLoop() {
     while (this->running.load()) {
         // Wake for the next Plumtree deadline (IHAVE batch, GRAFT) — not only for events
         auto wait = EVENT_WAIT;
-        if (const auto deadline = this->plumtree.nextDeadline()) {
+        for (const auto deadline : { this->plumtree.nextDeadline(), this->treeRootElection.nextDeadline() }) {
+            if (!deadline) continue;
             const auto untilDeadline = std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now());
-            wait = std::clamp(untilDeadline, std::chrono::milliseconds(0), EVENT_WAIT);
+            wait = std::min(wait, std::clamp(untilDeadline, std::chrono::milliseconds(0), EVENT_WAIT));
         }
         auto event = this->inbox->events.waitPop(wait);
         if (event) this->processEvent(*event);
@@ -289,7 +295,62 @@ void Router::routerLoop() {
         }
         this->announcePresenceWhenDue(std::chrono::steady_clock::now());
         this->sendDuePresenceReplies(std::chrono::steady_clock::now());
+        this->runTreeRootTimers(std::chrono::steady_clock::now());
     }
+}
+
+// docs/router.md 4.3, "Korzeń drzewa": the root's beacon is an empty signed BROADCAST, like PRESENCE
+void Router::runTreeRootTimers(std::chrono::steady_clock::time_point now) {
+    const TreeRootElection::TickResult result = this->treeRootElection.tick(now, this->treeRootListeningTime());
+    this->applyTreeRootChanges(result.changes);
+    if (!result.sendBeacon || this->config.broadcastTtl == 0) return;
+
+    RoutedMessage beacon;
+    beacon.group             = RouterWire::ROUTER_PROTOCOL_GROUP;
+    beacon.subtype           = RouterWire::SUBTYPE_TREE_BEACON;
+    beacon.mode              = RoutingMode::Broadcast;
+    beacon.ttlInitial        = this->config.broadcastTtl;
+    beacon.ttlRemaining      = this->config.broadcastTtl;
+    beacon.msgId             = randomMessageId();
+    beacon.sentAtUnixSeconds = currentUnixSeconds();
+    beacon.sender            = this->selfIdentity->getPeerId();
+    beacon.signature         = this->selfIdentity->sign(RouterWire::bytesToSign(beacon));   // once per beaconInterval: fine on this thread
+    ++this->treeBeaconsSent;
+    this->sendOwnBroadcast(beacon);
+}
+
+// Random listening before claiming the root, ½–2 beacon intervals: after a loss only about ln N nodes claim at once
+std::chrono::milliseconds Router::treeRootListeningTime() const {
+    const auto interval = this->config.treeRoot.beaconInterval;
+    return interval / 2 + randomDelayUpTo(interval * 3 / 2);
+}
+
+void Router::applyTreeRootChanges(const std::vector<TreeRootChange>& changes) {
+    if (changes.empty()) return;
+    for (const TreeRootChange& change : changes) {
+        const std::string previous = change.previous ? shortPeerId(*change.previous) : std::string("none");
+        switch (change.kind) {
+            case TreeRootChange::Kind::Claimed: this->log.format(LogLevel::Notice, "tree root: this node (no beacon from a smaller node id; was {})", previous); break;
+            case TreeRootChange::Kind::Adopted: this->log.format(LogLevel::Notice, "tree root: {} (beacon heard; was {})", shortPeerId(*change.root), previous); break;
+            case TreeRootChange::Kind::Lost:    this->log.format(LogLevel::Notice, "tree root: {} silent for {} beacon intervals, forgotten", previous, this->config.treeRoot.missedBeaconsToLose); break;
+            case TreeRootChange::Kind::Yielded: this->log.format(LogLevel::Notice, "tree root: yielding to {} (smaller node id)", shortPeerId(*change.root)); break;
+        }
+    }
+    std::lock_guard lock(this->treeRootMutex);
+    this->publishedTreeRoot = this->treeRootElection.root();
+}
+
+std::optional<PeerId> Router::getTreeRoot() const {
+    std::lock_guard lock(this->treeRootMutex);
+    return this->publishedTreeRoot;
+}
+
+// Only the root's wave shapes the shared tree: duplicates of anyone else's broadcast are dropped without a PRUNE. Without
+// a root nobody prunes (flooding) — predictable, and no oscillation.
+bool Router::shapesTree(const RoutedMessage& message) const {
+    if (!this->config.treeRoot.enabled) return true;
+    const std::optional<PeerId> root = this->treeRootElection.root();
+    return root && message.sender == *root;
 }
 
 // PRESENCE (docs/router.md 3.3): our Router tells every other Router "I am here" when a neighbor appears — every node then
@@ -476,7 +537,7 @@ void Router::handleGraft(const PeerId& from, std::span<const uint8_t> payload) {
         return;
     }
     ++this->graftsReceived;
-    this->plumtree.onGraft(from, !keys.empty(), std::chrono::steady_clock::now());
+    this->plumtree.onGraft(from);
     for (const RoutedMessageKey& key : keys) {
         // TTL 0: it ended here and was never announced — serving it would carry it a hop past its TTL
         const RoutedMessage* held = this->broadcastCache.find(key);
@@ -510,7 +571,6 @@ void Router::runPlumtreeTimers(std::chrono::steady_clock::time_point now) {
     for (const auto& [neighbor, keys] : this->plumtree.takeDueAnnouncements(now))  this->sendAnnouncements(neighbor, keys);
     this->broadcastCache.dropExpired(now);
     this->dropExpiredAwaitedReplies(now);
-    this->pinnedLinks = this->plumtree.pinnedLinkCount();
 }
 
 // Tell the neighbor its message went no further here. Bounded per neighbor and mode: a flood of unknown-mode messages
@@ -632,6 +692,9 @@ void Router::acceptVerifiedBroadcast(const RoutedMessage& message, const PeerId&
         if (message.ackRequested) this->sendAck(message);                           // every node is an addressee
     } else if (message.subtype == RouterWire::SUBTYPE_PRESENCE) {
         this->answerPresence(message.sender);
+    } else if (message.subtype == RouterWire::SUBTYPE_TREE_BEACON && message.ttlInitial >= this->config.broadcastTtl) {
+        // A beacon with a smaller TTL than ours would leave the far part of the network without a root: not counted
+        this->applyTreeRootChanges(this->treeRootElection.onBeacon(message.sender, std::chrono::steady_clock::now()));
     }
     this->spreadNewMessage(message, receivedFrom);
 }
@@ -916,7 +979,7 @@ void Router::reactToBroadcastDuplicate(const RoutedMessage& message, const PeerI
     // ttlInitial, so ttlInitial − 1 after our hop) is capped, or a forged frame could leave us a copy nobody can encode
     const int offeredTtl = held ? std::min(message.ttlRemaining - 1, held->ttlInitial - 1) : -1;
     const bool higherTtl = held && offeredTtl > held->ttlRemaining;
-    if (this->plumtree.onDuplicate(receivedFrom, higherTtl)) {
+    if (this->shapesTree(message) && this->plumtree.onDuplicate(receivedFrom, higherTtl)) {
         if (this->network.sendToPeer(receivedFrom, RouterWire::encodePrune()) > 0) ++this->prunesSent;
     }
     if (!higherTtl || held->ttlRemaining > 0) return;
@@ -974,7 +1037,7 @@ void Router::spreadNewMessage(const RoutedMessage& message, const std::optional<
 
 void Router::spreadByPlumtree(const RoutedMessage& outgoing, const std::optional<PeerId>& receivedFrom, bool forwarding) {
     const RoutedMessageKey key{ outgoing.sender, outgoing.msgId };
-    const PlumtreeNewMessageDecision decision = this->plumtree.onNewMessage(key, receivedFrom, forwarding, std::chrono::steady_clock::now());
+    const PlumtreeNewMessageDecision decision = this->plumtree.onNewMessage(key, receivedFrom, forwarding, std::chrono::steady_clock::now(), this->shapesTree(outgoing));
     if (decision.graftTo) this->sendGraft(*decision.graftTo, {});
     if (decision.pruneTo && this->network.sendToPeer(*decision.pruneTo, RouterWire::encodePrune()) > 0) ++this->prunesSent;
     if (decision.fullCopyTo.empty()) return;

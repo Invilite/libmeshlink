@@ -13,10 +13,10 @@ uint16_t counterId(StateCounter counter) { return static_cast<uint16_t>(counter)
 StateReport fullReport() {
     StateReport report;
     report.queryMsgId = 0x1122334455667788ULL;
-    report.node       = NodeState{ "node-a", 1, 3'600'000, 1'800'000'000'123ULL, 7 };
+    report.node       = NodeState{ "node-a", 1, 3'600'000, 1'800'000'000'123ULL, 7, peerId(0x05) };
     report.neighbors  = std::vector<NeighborState>{
-        { peerId(0x01), true,  true,  true,  120, 10'000, 20'000, 0 },
-        { peerId(0x02), false, false, false, 5,   300,    400,    1'500 },
+        { peerId(0x01), true,  true,  120, 10'000, 20'000, 0 },
+        { peerId(0x02), false, false, 5,   300,    400,    1'500 },
     };
     report.plumtree   = Counters{ { counterId(StateCounter::GraftsSent), 3 }, { counterId(StateCounter::EagerLinks), 1 } };
     report.routes     = RoutesState{ 2, 0, {

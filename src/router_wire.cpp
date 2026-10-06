@@ -67,7 +67,7 @@ namespace {
     bool isEncodable(const RoutedMessage& message) {
         if (!carriesRoutingHeader(message.group, message.subtype))                  return false;
         if (static_cast<uint8_t>(message.mode) > HIGHEST_MODE)                      return false;
-        if (message.group == ROUTER_PROTOCOL_GROUP && reachesEveryNode(message.mode) != (message.subtype == SUBTYPE_PRESENCE)) return false;
+        if (message.group == ROUTER_PROTOCOL_GROUP && reachesEveryNode(message.mode) != travelsToEveryNode(message.subtype)) return false;
         if ((message.reservedFlagBits & ~FLAG_RESERVED_MASK) != 0)                  return false;
         if (message.ttlInitial == 0 || message.ttlRemaining > message.ttlInitial)   return false;
         if (message.destination.has_value() == reachesEveryNode(message.mode))      return false;
@@ -125,7 +125,7 @@ namespace {
         if (message.subtype == SUBTYPE_ROUTE_ERROR) { RouteErrorPayload error; return decodeRouteErrorPayload(message.payload, error); }
         if (message.subtype == SUBTYPE_RECORD_ROUTE)  { RecordRoutePayload probe; return decodeRecordRoutePayload(message.payload, probe); }
         if (message.subtype == SUBTYPE_ROUTE_REPORT)  { RouteReportPayload report; return decodeRouteReportPayload(message.payload, report); }
-        if (message.subtype == SUBTYPE_PRESENCE || message.subtype == SUBTYPE_PRESENCE_REPLY) return message.payload.empty();
+        if (message.subtype == SUBTYPE_PRESENCE || message.subtype == SUBTYPE_PRESENCE_REPLY || message.subtype == SUBTYPE_TREE_BEACON) return message.payload.empty();
         return true;
     }
 }
@@ -209,7 +209,7 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
     out.ackRequested     = (flags & FLAG_ACK_REQUESTED) != 0;
     out.reservedFlagBits = flags & FLAG_RESERVED_MASK;
     if ((versionAndMode & 0x0F) > HIGHEST_MODE)                                     return RoutedMessageStatus::UnknownMode;
-    if (group == ROUTER_PROTOCOL_GROUP && subtype == SUBTYPE_PRESENCE) {
+    if (group == ROUTER_PROTOCOL_GROUP && travelsToEveryNode(subtype)) {
         if (!reachesEveryNode(out.mode))                                            return RoutedMessageStatus::PresenceToOneNode;
     } else if (group == ROUTER_PROTOCOL_GROUP && reachesEveryNode(out.mode))        return RoutedMessageStatus::RouterMessageToEveryNode;
     if (out.ttlInitial == 0 || out.ttlRemaining > out.ttlInitial)                   return RoutedMessageStatus::InvalidTtl;

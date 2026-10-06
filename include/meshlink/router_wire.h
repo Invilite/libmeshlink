@@ -147,7 +147,7 @@ namespace invilite::Mesh {
         SourceRouteIndexOutOfRange =  -7,
         TimestampOutOfWindow       =  -8,
         UnknownCriticalExtension   =  -9,
-        PresenceToOneNode          = -10,                                           // PRESENCE outside FLOOD / BROADCAST
+        PresenceToOneNode          = -10,                                           // PRESENCE or TREE_BEACON outside FLOOD / BROADCAST
     };
 
     namespace RouterWire {
@@ -177,6 +177,10 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender, empty — teaches it the way back to us
         constexpr uint16_t SUBTYPE_STATE_QUERY           = 0x0106;                  // "show me your state" — diagnostics, `meshlink map` (state_report_wire.h)
         constexpr uint16_t SUBTYPE_STATE_REPORT          = 0x0107;                  // answer to STATE_QUERY, to its sender
+        constexpr uint16_t SUBTYPE_TREE_BEACON           = 0x0108;                  // "I shape the broadcast tree": the tree root to every Router, empty (docs/router.md 4.3)
+
+        // The Router messages that travel to every node — and only so (FLOOD / BROADCAST)
+        constexpr bool travelsToEveryNode(uint16_t subtype) { return subtype == SUBTYPE_PRESENCE || subtype == SUBTYPE_TREE_BEACON; }
 
         // FLOOD and BROADCAST: to every node, no destination
         bool reachesEveryNode(RoutingMode mode);

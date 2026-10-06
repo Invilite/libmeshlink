@@ -41,7 +41,7 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
             network.nodeName, RouterWire::WIRE_VERSION,
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - this->constructedAt).count()),
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()),
-            this->clockWindowRejections.load() };
+            this->clockWindowRejections.load(), this->treeRootElection.root() };
     }
 
     size_t eagerLinks = 0;
@@ -50,7 +50,7 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
     for (const NetworkDiagnostics::Link& link : network.links) {
         const bool eager = this->plumtree.hasLink(link.peerId) && this->plumtree.isEager(link.peerId);
         ++(eager ? eagerLinks : lazyLinks);
-        neighbors.push_back({ link.peerId, link.inbound, eager, this->plumtree.isPinned(link.peerId), static_cast<uint32_t>(std::min<int64_t>(link.connectedFor.count(), UINT32_MAX)),
+        neighbors.push_back({ link.peerId, link.inbound, eager, static_cast<uint32_t>(std::min<int64_t>(link.connectedFor.count(), UINT32_MAX)),
                               link.bytesSent, link.bytesReceived, static_cast<uint32_t>(std::min<size_t>(link.sendQueueBytes, UINT32_MAX)) });
     }
     if (wants(query, StateSection::Neighbors)) report.neighbors = std::move(neighbors);
@@ -67,7 +67,6 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         addCounter(counters, StateCounter::GraftsForMissing, this->graftsForMissing.load());
         addCounter(counters, StateCounter::BroadcastCacheEntries, this->broadcastCache.size());
         addCounter(counters, StateCounter::MissingMessagesTracked, this->plumtree.missingCount());
-        addCounter(counters, StateCounter::PinnedLinks, this->plumtree.pinnedLinkCount());
         if (needsNetwork) {                                                         // link states come from the Network snapshot
             addCounter(counters, StateCounter::EagerLinks, eagerLinks);
             addCounter(counters, StateCounter::LazyLinks, lazyLinks);

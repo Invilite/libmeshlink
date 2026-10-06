@@ -13,6 +13,7 @@
 #include "meshlink/router_wire.h"
 #include "meshlink/seen_message_cache.h"
 #include "meshlink/state_report_wire.h"
+#include "meshlink/tree_root_election.h"
 
 #include <atomic>
 #include <chrono>
@@ -35,7 +36,10 @@ namespace invilite::Mesh {
 
     // Router parameters (docs/router.md 5, initial values)
     struct RouterConfig {
-        uint8_t                     broadcastTtl            = 16;                   // hops a broadcast may travel; 1 = direct neighbors only
+        // Hops a broadcast may travel; 1 = direct neighbors only. Broadcasts follow the shared tree, whose paths can be up to
+        // twice its depth — longer than the shortest — so this must cover the tree, not the network's diameter (SIM: 16
+        // lost messages in a sparse 60-node mesh). Loops are stopped by duplicates, not by TTL.
+        uint8_t                     broadcastTtl            = 64;
         uint8_t                     unicastTtl              = 16;                   // hops a message to one node may travel (local flooding included)
         std::chrono::seconds        maxClockSkew            = std::chrono::minutes(5);    // accepted sentAt distance from local time
         std::chrono::seconds        duplicateWindow         = std::chrono::minutes(10);   // > 2 × maxClockSkew: a replay is remembered or too old
@@ -45,6 +49,7 @@ namespace invilite::Mesh {
         size_t                      pendingVerificationPerNeighbor = 32;            // share of one neighbor — it cannot starve the others
         std::chrono::seconds        unknownModeReportInterval = std::chrono::seconds(60);   // at most one UNKNOWN_DELIVERY_MODE per neighbor and mode
         PlumtreeConfig              plumtree;                                       // BROADCAST mode (docs/router.md 4.3)
+        TreeRootConfig              treeRoot;                                       // who shapes the shared broadcast tree (4.3, TREE_BEACON)
         std::chrono::seconds        graftCacheRetention     = std::chrono::seconds(30);   // how long a BROADCAST can be served on GRAFT
         size_t                      graftCacheByteLimit     = 8 * 1024 * 1024;
         RouteTableConfig            routes;                                         // point-to-point routes learned from traffic (4.4)
@@ -85,7 +90,7 @@ namespace invilite::Mesh {
         uint64_t    graftsForMissing   = 0;                                         // GRAFTs asking for announced messages that never came
         uint64_t    unknownModeReportsSent = 0;
         uint64_t    clockWindowRejections = 0;                                      // routed messages with a timestamp outside maxClockSkew
-        uint64_t    pinnedLinks        = 0;                                         // Plumtree links pinned eager after oscillating (current, not a sum)
+        uint64_t    treeBeaconsSent    = 0;
     };
 
     struct SendOptions {
@@ -151,6 +156,10 @@ namespace invilite::Mesh {
 
         RouterStatistics getStatistics() const;
 
+        // The node whose broadcasts shape the shared Plumtree tree, as this node sees it (this node when it is the root);
+        // nothing before any TREE_BEACON was heard or sent (docs/router.md 4.3)
+        std::optional<PeerId> getTreeRoot() const;
+
         // Routes to `destination` as learned so far, best first — diagnostics and tests
         std::vector<RouteCandidate> getRouteCandidates(const PeerId& destination) const;
 
@@ -212,6 +221,10 @@ namespace invilite::Mesh {
         void sendAnnouncements(const PeerId& neighbor, const std::vector<RoutedMessageKey>& keys);
         void runPlumtreeTimers(std::chrono::steady_clock::time_point now);
         void announcePresenceWhenDue(std::chrono::steady_clock::time_point now);
+        void runTreeRootTimers(std::chrono::steady_clock::time_point now);
+        void applyTreeRootChanges(const std::vector<TreeRootChange>& changes);
+        [[nodiscard]] bool shapesTree(const RoutedMessage& message) const;         // from the tree root: may PRUNE / swap links
+        [[nodiscard]] std::chrono::milliseconds treeRootListeningTime() const;
         void answerPresence(const PeerId& sender);
         void sendDuePresenceReplies(std::chrono::steady_clock::time_point now);
         void rememberPresenceReply(const PeerId& sender, std::chrono::steady_clock::time_point now);
@@ -238,6 +251,7 @@ namespace invilite::Mesh {
         SeenMessageCache                            seenMessages;                   // signed messages
         SeenMessageCache                            unsignedSeenMessages;           // unsigned UNICAST data — kept apart (review R-5 C1)
         PlumtreeState                               plumtree;
+        TreeRootElection                            treeRootElection;
         BroadcastCache                              broadcastCache;                 // BROADCAST copies as we forward them, for GRAFT answers
         std::vector<PendingVerification>            pendingVerifications;
         std::chrono::steady_clock::time_point       nextPendingRetryAt{};
@@ -274,6 +288,10 @@ namespace invilite::Mesh {
         mutable std::mutex                          routesMutex;
         RouteTable                                  routes;
 
+        // Written by the Router thread on every root change; read by getTreeRoot()
+        mutable std::mutex                          treeRootMutex;
+        std::optional<PeerId>                       publishedTreeRoot;
+
         // Written by the Router thread (and by start() before the thread runs); read by getNeighbors()
         mutable std::mutex                          neighborsMutex;
         std::unordered_set<PeerId, PeerIDHash>      neighbors;
@@ -300,7 +318,7 @@ namespace invilite::Mesh {
         std::atomic<uint64_t>                       graftsForMissing{0};
         std::atomic<uint64_t>                       unknownModeReportsSent{0};
         std::atomic<uint64_t>                       clockWindowRejections{0};
-        std::atomic<uint64_t>                       pinnedLinks{0};
+        std::atomic<uint64_t>                       treeBeaconsSent{0};
 
         mutable std::shared_mutex                   listenersMutex;
         std::vector<std::shared_ptr<RouterEventListener>> listeners;

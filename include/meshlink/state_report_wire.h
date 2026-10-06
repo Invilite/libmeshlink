@@ -64,7 +64,7 @@ namespace invilite::Mesh {
             MissingMessagesTracked  = 0x010B,
             EagerLinks              = 0x010C,
             LazyLinks               = 0x010D,
-            PinnedLinks             = 0x010E,                                       // eager for good after oscillating
+            // 0x010E: was PinnedLinks (link pinning, withdrawn for the tree root) — not reused
             // E. Delivery
             FullMessagesSent        = 0x0200,
             Delivered               = 0x0201,
@@ -110,6 +110,7 @@ namespace invilite::Mesh {
             uint64_t    uptimeMs              = 0;                                  // counters are since the start: a restart resets them
             uint64_t    unixTimeMs            = 0;                                  // the node's clock when it wrote the report
             uint64_t    clockWindowRejections = 0;                                  // messages dropped for a timestamp outside ±5 min
+            std::optional<PeerId> treeRoot;                                         // whom it takes for the broadcast tree root (itself when it is)
 
             bool operator==(const NodeState&) const = default;
         };
@@ -118,7 +119,6 @@ namespace invilite::Mesh {
             PeerId      peerId{};
             bool        inbound          = false;                                   // the neighbor dialed us
             bool        eager            = false;                                   // we send it full broadcasts (Plumtree); false = only IHAVE
-            bool        pinned           = false;                                   // eager for good: the link oscillated (docs/router.md 4.3)
             uint32_t    connectedSeconds = 0;
             uint64_t    bytesSent        = 0;
             uint64_t    bytesReceived    = 0;
