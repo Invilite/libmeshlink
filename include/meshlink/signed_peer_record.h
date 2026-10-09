@@ -59,7 +59,6 @@ struct SignedPeerRecord {
 enum class SignedRecordStatus : int {
     Success                = 0,
     MalformedEncoding      = -1,                                                    // truncated, bad addrType, etc.
-    PeerIdMismatch         = -2,                                                    // derived PeerId differs from sender's claim
     SignatureInvalid       = -3,                                                    // signature verification failed
     TimestampOutOfRange    = -4,                                                    // createdAt too far in the future (records never expire)
 };

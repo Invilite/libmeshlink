@@ -46,9 +46,6 @@ namespace invilite::Mesh {
         uint8_t                                     announceCount         = 0;
         std::chrono::steady_clock::time_point       lastAnnouncedAt{};
 
-        // True until first PEX_ANNOUNCE flood. Distinguishes fresh arrivals from records already in circulation.
-        bool                                        pendingPexBroadcast   = true;
-
         // Persistent flag — has any address in this record's address set ever yielded a successful connection
         // or probe? Once true, stays true until replaced by a newer record version (createdAt >), which
         // resets it because the address set may have changed.

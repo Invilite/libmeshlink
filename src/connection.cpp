@@ -18,8 +18,6 @@
 #include <poll.h>
 #include <climits>
 #include <memory>
-#include <iomanip>
-#include <iostream>
 
 // Never raise SIGPIPE when the remote is gone — sends run on any thread, including application threads whose signal mask
 // we do not control. Linux/BSD suppress it per call (MSG_NOSIGNAL); macOS has no such flag and uses SO_NOSIGPIPE per socket.
@@ -54,43 +52,6 @@ static const uint16_t crc16Table[256] = {
     0xFD2E, 0xED0F, 0xDD6C, 0xCD4D, 0xBDAA, 0xAD8B, 0x9DE8, 0x8DC9, 0x7C26, 0x6C07, 0x5C64, 0x4C45, 0x3CA2, 0x2C83, 0x1CE0, 0x0CC1,
     0xEF1F, 0xFF3E, 0xCF5D, 0xDF7C, 0xAF9B, 0xBFBA, 0x8FD9, 0x9FF8, 0x6E17, 0x7E36, 0x4E55, 0x5E74, 0x2E93, 0x3EB2, 0x0ED1, 0x1EF0
 };
-
-// Only for debugging during development
-// static void PrintBuffer(const char* buffer, int length, int headerLen, int pubKeyLen, int signatureLen) {
-//     printf("\u001b[0m0x00: ");
-//     for (int i = 0; i < length; i++) {
-//         if (i < headerLen) {
-//             printf("\u001b[38;5;212m");
-//         } else if (i < headerLen + pubKeyLen) {
-//             printf("\u001b[38;5;118m");
-//         } else if (i < headerLen + pubKeyLen + signatureLen) {
-//             printf("\u001b[38;5;80m");
-//         } else {
-//             printf("\u001b[0m");
-//         }
-//
-//         // Print every byte as hexadecimal value
-//         printf("0x%02x ", (unsigned char)buffer[i]);
-//
-//         // New line every 8 bytes
-//         if ((i + 1) % 8 == 0) {
-//             printf("\n\u001b[0m0x%02x: ", (i)+1);
-//             //printf("\n");
-//         }
-//     }
-//     printf("\u001b[0m\n");
-// }
-
-// Only for debugging during development
-template<typename Container> static void printHex(const Container& data) {
-    size_t i = 0;
-    for (const uint8_t byte : data) {
-        if (i % 16 == 0 && i != 0) std::cout << "\n";
-        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte) << ' ';
-        ++i;
-    }
-    std::cout << std::dec << std::endl;
-}
 
 invilite::Mesh::Connection::Connection(const int clientSocket, const sockaddr_storage* clientAddress, const std::array<uint8_t, 64>* networkSecret, const size_t sendQueueLimit): clientAddress(*clientAddress), clientSocket(clientSocket), sendQueueLimit(sendQueueLimit), networkSecret(networkSecret) {
     // Verify if socket has correct descriptor

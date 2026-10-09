@@ -1696,7 +1696,6 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
         if (isNewEntry) {
             // First time we see this peer.
             entry.record               = std::move(record);
-            entry.pendingPexBroadcast  = true;
             entry.hasEverConnected     = outboundMatch;
             entry.availability         = newAvailability;
             // Backoff counters default to zero — fresh peer, no history.
@@ -1710,7 +1709,6 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             // Only the gossip bookkeeping restarts, so the fresher version spreads like any new record.
             entry.record              = std::move(record);
             entry.announceCount       = 0;
-            entry.pendingPexBroadcast = true;
             entry.lastAnnouncedAt     = {};
             if (outboundMatch) {
                 entry.hasEverConnected              = true;
@@ -1731,7 +1729,6 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             // it tries to commit its result and skip the write.
             entry.record                          = std::move(record);
             entry.announceCount                   = 0;
-            entry.pendingPexBroadcast             = true;
             entry.lastAnnouncedAt                 = {};
             entry.hasEverConnected                = outboundMatch;
             entry.availability                    = newAvailability;
@@ -1873,13 +1870,11 @@ void Network::sendPendingPexBroadcasts() {
         return;
     }
 
-    // Mark as announced — also counts toward anti-entropy ordering. Clear pendingPexBroadcast
-    // since this is the first broadcast for the record.
+    // Mark as announced — also counts toward anti-entropy ordering.
     const auto now = std::chrono::steady_clock::now();
     this->peerDirectory->mutatePeer(pending.recordPeerId, [now](KnownPeer& kp) {
         kp.lastAnnouncedAt     = now;
         ++kp.announceCount;
-        kp.pendingPexBroadcast = false;
     });
 
     this->log.format(LogLevel::Debug, "broadcasted PEX_ANNOUNCE for {} to {}/{} peer(s)", peerIdShort(pending.recordPeerId), sent, targets.size());

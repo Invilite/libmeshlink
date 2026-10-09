@@ -1,9 +1,13 @@
 *.o
+*.d
 *.a
 *.so
-.idea/
+*.so.*
 *.pid
 *.log
 run_test
-*.d
+run_test_tsan
 run_bench
+build/
+.idea/
+.vscode/
