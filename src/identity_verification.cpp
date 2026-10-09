@@ -128,7 +128,7 @@ VerificationOutcome IdentityVerification::runAsInitiator(
     std::vector<uint8_t> msg1;
     msg1.reserve(MSG1_SIZE);
     msg1.insert(msg1.end(), nonceI.begin(),                         nonceI.end());
-    msg1.push_back(flagsSelf.raw);                                                  // NEW: our intent for this session
+    msg1.push_back(flagsSelf.raw);                                                  // our intent for this session
     msg1.insert(msg1.end(), selfIdentity.getEd25519Pub().begin(),   selfIdentity.getEd25519Pub().end());
     msg1.insert(msg1.end(), selfIdentity.getX25519Pub().begin(),    selfIdentity.getX25519Pub().end());
     msg1.insert(msg1.end(), packedName.begin(),                     packedName.end());
@@ -150,7 +150,7 @@ VerificationOutcome IdentityVerification::runAsInitiator(
 
     const uint8_t* ptr = msg2.data();
     std::span<const uint8_t> nonceR      (ptr, NONCE_SIZE);      ptr += NONCE_SIZE;
-    const IdentityFlags      flagsR{ *ptr };                     ptr += FLAGS_SIZE; // NEW
+    const IdentityFlags      flagsR{ *ptr };                     ptr += FLAGS_SIZE;
     std::span<const uint8_t> ed25519PubR (ptr, PUBKEY_SIZE);     ptr += PUBKEY_SIZE;
     std::span<const uint8_t> x25519PubR  (ptr, PUBKEY_SIZE);     ptr += PUBKEY_SIZE;
     std::span<const uint8_t> sigR        (ptr, SIGNATURE_SIZE);  ptr += SIGNATURE_SIZE;
