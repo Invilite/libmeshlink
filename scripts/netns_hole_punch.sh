@@ -19,8 +19,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-MESHLINKD="${MESHLINKD:-$SCRIPT_DIR/../../meshlinkd/meshlinkd}"
-MESHLINK="${MESHLINK:-$SCRIPT_DIR/../../meshlinkd/meshlink}"
+# The meshlink checkout next to this one (cloned as meshlink; MESHLINK_DIR to point elsewhere)
+MESHLINK_DIR="${MESHLINK_DIR:-$SCRIPT_DIR/../../meshlink}"
+[[ -d "$MESHLINK_DIR" ]] || MESHLINK_DIR="$SCRIPT_DIR/../../meshlinkd"
+MESHLINKD="${MESHLINKD:-$MESHLINK_DIR/meshlinkd}"
+MESHLINK="${MESHLINK:-$MESHLINK_DIR/meshlink}"
 TIMEOUT="${TIMEOUT:-150}"
 SYMMETRIC=0
 [[ "${1:-}" == "--symmetric" ]] && SYMMETRIC=1
