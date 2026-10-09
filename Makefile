@@ -34,9 +34,8 @@ TEST_SOURCES = $(wildcard tests/*.cpp)
 TEST_OBJECTS = $(TEST_SOURCES:.cpp=.o)
 TEST_BINARY = run_test
 
-# Fat LTO objects: libmeshlink.a also links with another compiler version or without -flto
-all: CXXFLAGS += -O2 -flto -ffat-lto-objects
-all: LDFLAGS += -flto
+# No -flto: libmeshlink.a holds plain machine code, so any compiler (or version) can link it
+all: CXXFLAGS += -O2
 all: $(STATIC_LIB) $(SHARED_LIB)
 
 dev: CXXFLAGS += -g -fsanitize=thread -fsanitize=undefined
