@@ -17,6 +17,7 @@
 
 #include <poll.h>
 #include <climits>
+#include <cstring>
 #include <memory>
 
 // Never raise SIGPIPE when the remote is gone — sends run on any thread, including application threads whose signal mask
@@ -239,8 +240,7 @@ int invilite::Mesh::Connection::validateHandshake(const std::vector<uint8_t>* me
     // -- Client handshake request is now consider valid --
 
     // Load received public key "A"
-    const Botan::AlgorithmIdentifier algorithmId("X448", Botan::AlgorithmIdentifier::USE_NULL_PARAM);
-    const Botan::X448_PublicKey pubKeyA(algorithmId, std::span<const uint8_t>(message->data() + header.size(), 56));
+    const Botan::X448_PublicKey pubKeyA(std::span<const uint8_t>(message->data() + header.size(), 56));
 
     // Generate Elliptic-curve Diffie–Hellman key pair using X448 curve
     Botan::AutoSeeded_RNG rng;
@@ -346,8 +346,7 @@ int invilite::Mesh::Connection::finishHandshake(const std::vector<uint8_t>* mess
     // -- Server handshake response is now consider valid --
 
     // Load received public key "B"
-    const Botan::AlgorithmIdentifier algorithmId("X448", Botan::AlgorithmIdentifier::USE_NULL_PARAM);
-    const Botan::X448_PublicKey pubKeyB(algorithmId, std::span<const uint8_t>(message->data() + header.size(), 56));
+    const Botan::X448_PublicKey pubKeyB(std::span<const uint8_t>(message->data() + header.size(), 56));
 
     // Calculate shared secret
     Botan::AutoSeeded_RNG rng;
