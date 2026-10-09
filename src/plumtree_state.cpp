@@ -38,9 +38,9 @@ PlumtreeNewMessageDecision PlumtreeState::onNewMessage(const RoutedMessageKey& k
     PlumtreeNewMessageDecision decision;
 
     // It was announced before it arrived: if the eager copy came clearly later than the lazy announcement, the lazy link
-    // is the faster path — swap them, so the tree follows changing delays. Not once we asked by GRAFT: then the copy
+    // is the faster path: swap them, so the tree follows changing delays. Not once we asked by GRAFT: then the copy
     // answers us and the GRAFT already made the announcer eager.
-    std::vector<PeerId> holders;                                                    // links that announced it to us: they have it
+    std::vector<PeerId> holders;                                                    // announcers already have it
     if (auto found = this->missing.find(key); found != this->missing.end()) {
         const MissingMessage& entry = found->second;
         holders.assign(entry.announcers.begin(), entry.announcers.end());
@@ -107,7 +107,7 @@ std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> PlumtreeSt
     while (!this->graftDeadlines.empty() && this->graftDeadlines.begin()->first <= now) {
         const auto entryIt = this->missing.find(this->graftDeadlines.begin()->second);
         MissingMessage& entry = entryIt->second;
-        if (entry.announcers.empty()) { this->eraseMissing(entryIt); continue; }    // nobody left to ask: given up
+        if (entry.announcers.empty()) { this->eraseMissing(entryIt); continue; }
 
         const PeerId announcer = entry.announcers.front();
         entry.announcers.pop_front();
@@ -115,7 +115,7 @@ std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash> PlumtreeSt
         this->eagerByLink[announcer] = true;
         grafts[announcer].push_back(entryIt->first);
         entry.graftSent = true;
-        this->graftDeadlines.erase(entry.graftAt);                                  // not answered in time → the next announcer
+        this->graftDeadlines.erase(entry.graftAt);                                  // not answered in time: the next announcer
         entry.graftAt = this->graftDeadlines.emplace(now + this->config.graftTimeout, entryIt->first);
     }
     return grafts;

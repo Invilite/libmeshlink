@@ -67,7 +67,7 @@ TEST(PeerDirectoryTest, RemoveDeletesEntry) {
     EXPECT_FALSE(directory.findPeer(peerIdOf(1)).has_value());
 }
 
-// Run under `make dev` (ThreadSanitizer) to detect data races; under a normal build it checks lost updates.
+// Meant for ThreadSanitizer builds (data races); a normal build only checks for lost updates.
 TEST(PeerDirectoryTest, ConcurrentMutationsAreNotLost) {
     PeerDirectory directory;
     directory.upsertPeer(peerIdOf(1), [](KnownPeer&, bool) {});
@@ -78,7 +78,7 @@ TEST(PeerDirectoryTest, ConcurrentMutationsAreNotLost) {
     for (int t = 0; t < threadCount; ++t) {
         threads.emplace_back([&] {
             for (int i = 0; i < incrementsPerThread; ++i) {
-                directory.mutatePeer(peerIdOf(1), [](KnownPeer& entry) { ++entry.consecutiveProbeFailures; });   // uint8_t — wraps, checked modulo 256
+                directory.mutatePeer(peerIdOf(1), [](KnownPeer& entry) { ++entry.consecutiveProbeFailures; });   // uint8_t wraps, so the total is checked modulo 256
                 (void)directory.listPeers();
             }
         });

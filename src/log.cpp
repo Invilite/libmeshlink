@@ -33,7 +33,7 @@ void Logger::write(LogLevel level, std::string_view component, std::string_view 
     try {
         this->sink->write(LogRecord{level, isDebug, component, text});
     } catch (...) {
-        // Nowhere left to report it — a failing sink must not kill the I/O, management or Router thread
+        // Nowhere left to report it; a failing sink must not kill the I/O, management or Router thread
     }
 }
 

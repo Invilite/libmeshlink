@@ -25,21 +25,21 @@ namespace invilite::Mesh {
 
     namespace {
         constexpr int    POLL_TIMEOUT_MS          = 100;
-        // Per-peer receive budget for one poll() round (R5): a peer that keeps sending must not starve the others.
+        // Per-peer receive budget for one poll() round: a peer that keeps sending must not starve the others.
         // Whole frames are counted, so a frame is never cut in half; the rest waits for the next round.
         constexpr size_t RECEIVE_BUDGET_FRAMES    = 64;
         constexpr size_t RECEIVE_BUDGET_BYTES     = 256 * 1024;
         constexpr size_t MIN_SEND_QUEUE_LIMIT     = 64 * 1024;                     // Fits the largest 0xFF message (PEX batch of MAX_RECORDS_PER_BATCH records) with room to spare
         constexpr int    OUTBOUND_CONNECT_TIMEOUT = 5;
         // Upper bound of one outbound attempt: TCP connect (5 s) + transport handshake (3 s) + identity verification
-        // (2 × 3 s receive) + registration, with margin. Topology does not redial a peer within this window (R9).
+        // (2 x 3 s receive) + registration, with margin. Topology does not redial a peer within this window.
         constexpr std::chrono::seconds OUTBOUND_ATTEMPT_MAX_DURATION{20};
-        // Departure window (B3): the remote normally closes within milliseconds of our GOODBYE; this only bounds a
+        // Departure window: the remote normally closes within milliseconds of our GOODBYE; this only bounds a
         // remote that never does. stop() waits at most this long as well.
         constexpr std::chrono::seconds DEPARTURE_TIMEOUT{5};
         // An outbound connection still Active after this was not dismissed (NoSlots arrives within milliseconds).
         constexpr std::chrono::seconds OUTBOUND_SETTLED_AFTER{5};
-        // Hard bound of an inbound handshake counted from accept() (R1) — not reset by slowly trickling bytes.
+        // Hard bound of an inbound handshake counted from accept(): not reset by slowly trickling bytes.
         constexpr std::chrono::seconds INBOUND_HANDSHAKE_DEADLINE{5};
         // Identity verification waits at most this long per message (also bounded by the remaining deadline).
         constexpr std::chrono::milliseconds IDENTITY_STEP_TIMEOUT{3000};
@@ -55,9 +55,9 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_GOODBYE        = 0x0040;
 
         // Shared backoff schedule for both probe and connection attempt retries.
-        // Index = consecutive failure count (clamped to last entry). Caps at 20 minutes — past that
+        // Index = consecutive failure count (clamped to last entry). Caps at 20 minutes: past that
         // we are not learning anything new by retrying faster, and offline peers shouldn't generate
-        // constant traffic. Array index 0 is used after the FIRST failure (1 failure → 10s wait).
+        // constant traffic. Array index 0 is used after the FIRST failure (1 failure -> 10s wait).
         constexpr std::chrono::seconds BACKOFF_SCHEDULE[] = {
         std::chrono::seconds(10),
         std::chrono::seconds(30),
@@ -69,7 +69,7 @@ namespace invilite::Mesh {
     };
     constexpr size_t BACKOFF_SCHEDULE_LEN = sizeof(BACKOFF_SCHEDULE) / sizeof(BACKOFF_SCHEDULE[0]);
 
-    // Map a failure count to a wait duration. failureCount of 0 means "never failed" — caller
+    // Map a failure count to a wait duration. failureCount of 0 means "never failed": caller
     // shouldn't be calling us in that case, but defensively returns the first interval.
     std::chrono::seconds computeBackoffInterval(uint8_t failureCount) {
     if (failureCount == 0) return BACKOFF_SCHEDULE[0];
@@ -77,7 +77,7 @@ namespace invilite::Mesh {
     return BACKOFF_SCHEDULE[idx];
 }
 
-// "addr:port, addr:port" — the full address list for debug-detail records
+// "addr:port, addr:port": the full address list for debug-detail records
 std::string describeAddresses(const std::vector<PeerAddress>& addresses) {
     std::string out;
     for (const PeerAddress& a : addresses) out += (out.empty() ? "" : ", ") + a.address + ":" + std::to_string(a.port);
@@ -101,12 +101,12 @@ std::vector<uint8_t> buildFrame(uint8_t group, uint16_t subtype, const std::vect
     return out;
 }
 
-// Order-insensitive comparison — a peer may list the same endpoints in a different order after re-signing.
+// Order-insensitive comparison: a peer may list the same endpoints in a different order after re-signing.
 bool hasSameAddressSet(const std::vector<PeerAddress>& a, const std::vector<PeerAddress>& b) {
     return a.size() == b.size() && std::is_permutation(a.begin(), a.end(), b.begin());
 }
 
-// Key for the per-address inbound limit: the IPv4 address, or the /64 prefix for IPv6 — one IPv6 host usually holds a
+// Key for the per-address inbound limit: the IPv4 address, or the /64 prefix for IPv6, since one IPv6 host usually holds a
 // whole /64 and could otherwise pick a fresh address per connection. IPv4 clients of a dual-stack socket (::ffff:a.b.c.d)
 // are keyed by their IPv4 address.
 std::string addressLimitKeyOf(const sockaddr_storage& address) {
@@ -129,7 +129,7 @@ std::string addressLimitKeyOf(const sockaddr_storage& address) {
 
 // Reachability evidence: we dialed this peer and reached it at an IP its own record announces.
 bool recordAnnouncesDialedAddress(const SignedPeerRecord& record, const std::string& dialedAddress) {
-    if (dialedAddress.empty()) return false;                                        // inbound connection — no evidence about its addresses
+    if (dialedAddress.empty()) return false;                                        // inbound connection: no evidence about its addresses
     return std::any_of(record.addresses.begin(), record.addresses.end(), [&](const PeerAddress& a) { return a.address == dialedAddress; });
 }
 }
@@ -195,7 +195,7 @@ void Network::start() {
         this->acceptingHandshakeWorkers = true;
     }
 
-    // Build self-attested record — needed before any peer connects.
+    // Build self-attested record: needed before any peer connects.
     // LocalIdentity owns the signing logic; we cache the serialized bytes here for fast HELLO sends.
     {
         const SignedPeerRecord rec = this->selfIdentity->buildSelfRecord(this->config.announcedAddresses);
@@ -220,10 +220,10 @@ void Network::start() {
         this->tcpServer->onConnect([this](int fd, const sockaddr_storage* addr) {
             this->onIncomingConnection(fd, addr);
         });
-        // Runs on the TcpServer thread — it uses its own limiter (accept failures repeat every 100 ms when out of descriptors)
+        // Runs on the TcpServer thread: it uses its own limiter (accept failures repeat every 100 ms when out of descriptors)
         this->tcpServer->onListenerFailure([this](Transport::ListenerFailure failure, int errorNumber) {
             if (failure == Transport::ListenerFailure::PollFailed) {
-                this->log.format(LogLevel::Alert, "listener poll() failed: {} — no inbound connections are accepted any more", std::strerror(errorNumber));
+                this->log.format(LogLevel::Alert, "listener poll() failed: {}; no inbound connections are accepted any more", std::strerror(errorNumber));
             } else {
                 this->log.formatRateLimited(this->listenerThreadLogLimiter, "accept", LogLevel::Error, "cannot accept inbound connection: {}", std::strerror(errorNumber));
             }
@@ -254,7 +254,7 @@ void Network::stop() {
         this->tcpServer->stop();                                                    // no new inbound; stopping blocks new dials and probes
     }
 
-    // Departure window (B3) for every connected peer: GOODBYE(Shutdown), half-close, and let the remote close first.
+    // Departure window for every connected peer: GOODBYE(Shutdown), half-close, and let the remote close first.
     // Closing right away with unread data in our receive buffer would send RST, which can discard our GOODBYE at the
     // remote before it is read. The I/O and management threads keep running meanwhile; listeners get no events.
     for (const auto& peer : this->activePeersSnapshot()) {
@@ -277,13 +277,13 @@ void Network::stop() {
 
     if (this->ioThread.joinable()) this->ioThread.join();
 
-    // Now wake Management — I/O no longer produces messages
+    // Now wake Management: I/O no longer produces messages
     this->messageProtocolQueue.shutdown();
     this->peerLifecycleEvents.shutdown();
 
     if (this->managementThread.joinable()) this->managementThread.join();
 
-    for (auto& worker : this->probeWorkers) {                                       // management thread has exited — safe to touch
+    for (auto& worker : this->probeWorkers) {                                       // management thread has exited: safe to touch
         if (worker->thread.joinable()) worker->thread.join();
     }
     this->probeWorkers.clear();
@@ -334,10 +334,10 @@ void Network::dialAddresses(std::vector<PeerAddress> addresses) {
     const std::string& address = addresses.front().address;
     const uint16_t     port    = addresses.front().port;
 
-    // Outbound hard limit (R10) — counts established outbound peers, dials and probes in progress alike
+    // Outbound hard limit: counts established outbound peers, dials and probes in progress alike
     auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
     if (!slot) {
-        this->log.format(LogLevel::Info, "not dialing {}:{} — outbound hard limit reached", address, port);
+        this->log.format(LogLevel::Info, "not dialing {}:{}; outbound hard limit reached", address, port);
         return;
     }
 
@@ -440,7 +440,7 @@ std::vector<SignedPeerRecord> Network::getKnownPeers() const {
 // ============================================================
 
 void Network::notifyPeerConnected(const PeerIdentity& identity) {
-    // Snapshot listener vector under shared lock — release before invoking, so a listener
+    // Snapshot listener vector under shared lock: release before invoking, so a listener
     // that calls back into add/removeListener can't deadlock. shared_ptr copies bump refcounts
     // so listeners stay alive even if removed mid-iteration.
     std::vector<std::shared_ptr<NetworkEventListener>> snapshot;
@@ -506,7 +506,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
         return;
     }
 
-    // Admission (R10/R1). Above the inbound hard limit the connection is closed right away with nothing allocated —
+    // Admission. Above the inbound hard limit the connection is closed right away with nothing allocated:
     // no thread, no Connection, no crypto; the cheap total check comes before formatting the address.
     const ConnectionLimits::Inbound& inbound = this->config.connectionLimits.inbound;
     if (!this->connectionSlots.inboundHasRoom(inbound.effectiveHard())) {
@@ -516,7 +516,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
     const std::string remoteAddress = addressLimitKeyOf(*addr);
     auto slot = this->connectionSlots.tryTakeInbound(remoteAddress, inbound.effectiveHard(), inbound.perAddress);
     if (!slot) {
-        this->log.format(LogLevel::Info, "refused inbound from {} — inbound hard or per-address limit reached", remoteAddress);
+        this->log.format(LogLevel::Info, "refused inbound from {}; inbound hard or per-address limit reached", remoteAddress);
         ::close(fd);
         return;
     }
@@ -535,7 +535,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
             this->runIncomingHandshake(fd, addrCopy, std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
-        // Out of threads: refuse this one instead of letting the exception terminate the process (R1)
+        // Out of threads: refuse this one instead of letting the exception terminate the process
         this->log.format(LogLevel::Critical, "cannot start handshake worker: {}", e.what());
         ::close(fd);
         return;
@@ -546,7 +546,7 @@ void Network::onIncomingConnection(int fd, const sockaddr_storage* addr) {
 void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
-    // Hard deadline from accept (R1): a client trickling bytes cannot keep this worker alive past it
+    // Hard deadline from accept: a client trickling bytes cannot keep this worker alive past it
     const auto deadline = std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE;
 
     std::shared_ptr<Connection> conn;
@@ -562,7 +562,7 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 
     HandshakeResult result = this->completeHandshakeAsResponder(conn, deadline);
     if (result.verification != VerificationResult::Success) {
-        // A failed transport handshake is usually a scanner without the network secret — not worth a warning
+        // A failed transport handshake is usually a scanner without the network secret: not worth a warning
         this->log.format(result.transportFailed ? LogLevel::Info : LogLevel::Warning, "incoming {}", result.failure);
         self->done.store(true, std::memory_order_release);
         return;
@@ -571,10 +571,10 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
     IdentityFlags remoteFlags    = result.remoteFlags;
 
     // If the initiator declared this is a probe, they want to validate our reachability
-    // without joining our peer pool. We respond by closing — they've already verified us
+    // without joining our peer pool. We respond by closing: they've already verified us
     // through the IdentityVerification handshake itself.
     if (remoteFlags.probe()) {
-        this->log.format(LogLevel::Debug, "incoming probe from {} — identity verified, closing connection", peerIdShort(remoteIdentity.getPeerId()));
+        this->log.format(LogLevel::Debug, "incoming probe from {}: identity verified, closing connection", peerIdShort(remoteIdentity.getPeerId()));
         conn->close();
         self->done.store(true, std::memory_order_release);
         return;
@@ -593,13 +593,13 @@ void Network::runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlot
 }
 
 // ============================================================
-// Outbound connection establishment — shared by normal connect and probe
+// Outbound connection establishment: shared by normal connect and probe
 // ============================================================
 
 Network::HandshakeResult Network::establishOutboundConnection(const std::string& address, const uint16_t port, const IdentityFlags flagsSelf) const {
     HandshakeResult result;
 
-    // ── TCP connect ───────────────────────────────────────────────────────────
+    // -- TCP connect -----------------------------------------------------------
     Transport::TcpClient client;
     sockaddr_storage     remoteAddr{};
 
@@ -619,7 +619,7 @@ Network::HandshakeResult Network::establishOutboundConnection(const std::string&
         return result;
     }
 
-    // ── Transport handshake ───────────────────────────────────────────────────
+    // -- Transport handshake ---------------------------------------------------
     std::shared_ptr<Connection> connection;
     try {
         this->prepareConnectionSocket(fd);
@@ -636,7 +636,7 @@ Network::HandshakeResult Network::establishOutboundConnection(const std::string&
 Network::HandshakeResult Network::completeHandshakeAsInitiator(const std::shared_ptr<Connection>& connection, const IdentityFlags flagsSelf) const {
     HandshakeResult result;
 
-    // ── Transport handshake ───────────────────────────────────────────────────
+    // -- Transport handshake ---------------------------------------------------
     if (connection->initHandshake() != 0) {
         result.failure         = "transport handshake could not start";
         result.transportFailed = true;
@@ -652,7 +652,7 @@ Network::HandshakeResult Network::completeHandshakeAsInitiator(const std::shared
         return result;
     }
 
-    // ── Identity verification ─────────────────────────────────────────────────
+    // -- Identity verification -------------------------------------------------
     PeerIdentity  remoteIdentity;
     IdentityFlags remoteFlags;
     const VerificationOutcome verification = IdentityVerification::runAsInitiator(
@@ -667,7 +667,7 @@ Network::HandshakeResult Network::completeHandshakeAsInitiator(const std::shared
         return result;
     }
 
-    // ── Success — populate result ─────────────────────────────────────────────
+    // -- Success: populate result ---------------------------------------------
     result.verification   = VerificationResult::Success;
     result.connection     = connection;
     result.remoteIdentity = std::move(remoteIdentity);
@@ -713,7 +713,7 @@ Network::HandshakeResult Network::completeHandshakeAsResponder(const std::shared
 void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
-    // Normal connect — no probe, no special flags. The addresses in order, until one answers (F4).
+    // Normal connect: no probe, no special flags. The addresses in order, until one answers.
     HandshakeResult result;
     for (const PeerAddress& address : addresses) {
         result = this->establishOutboundConnection(address.address, address.port, IdentityFlags{});
@@ -723,7 +723,7 @@ void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, Connectio
 
     if (result.verification != VerificationResult::Success) {
         // Notify the per-peer backoff tracker so TopologyPlanner won't redial this peer immediately.
-        // Address-based lookup — we may not know the peerId if establishOutboundConnection failed
+        // Address-based lookup: we may not know the peerId if establishOutboundConnection failed
         // before identity verification (every address belongs to the same record, so the first one finds it).
         this->recordConnectionAttemptFailure(addresses.front().address, addresses.front().port);
         self->done.store(true, std::memory_order_release);
@@ -744,7 +744,7 @@ void Network::runOutgoingHandshake(std::vector<PeerAddress> addresses, Connectio
 }
 
 void Network::recordConnectionAttemptFailure(const std::string& address, uint16_t port) {
-    // Find peer by address+port match. We can't key by PeerId — failure may have happened
+    // Find peer by address+port match. We can't key by PeerId: failure may have happened
     // before identity verification revealed the remote's PeerId.
     // Two-step approach: snapshot directory under shared lock to find the match, then mutate
     // the matched entry under exclusive lock. A concurrent record update in between is harmless:
@@ -791,9 +791,9 @@ void Network::demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t cons
     if (consecutiveFailures < this->config.connectionFailuresBeforeUnavailable) return;
 
     // Only Available is demoted: Unknown/Unavailable already belong to the probe, and a Probing peer gets its state from
-    // the probe result. The probe backoff is left as is — the probe channel stays independent of the dial channel, and a
+    // the probe result. The probe backoff is left as is: the probe channel stays independent of the dial channel, and a
     // later probe success does not reset dial backoff either (a peer that accepts probes but rejects connections must not
-    // cycle Available ↔ Unavailable every few seconds).
+    // cycle Available <-> Unavailable every few seconds).
     bool demoted = false;
     this->peerDirectory->mutatePeer(peerId, [&](KnownPeer& entry) {
         if (entry.availability != AvailabilityState::Available) return;
@@ -860,17 +860,17 @@ void Network::ioLoop() {
     fds.reserve(64);
 
     // Connection-side events that mean "something happened, handle it":
-    //   POLLIN    — data available (or EOF, which recv() returns as 0)
-    //   POLLHUP   — remote closed the connection (may arrive without POLLIN if recv buffer is already drained)
-    //   POLLERR   — socket error condition
-    //   POLLNVAL  — fd is not open (should not happen, but if it does we must not busy-loop on it)
+    //   POLLIN   : data available (or EOF, which recv() returns as 0)
+    //   POLLHUP  : remote closed the connection (may arrive without POLLIN if recv buffer is already drained)
+    //   POLLERR  : socket error condition
+    //   POLLNVAL : fd is not open (should not happen, but if it does we must not busy-loop on it)
     //
     // Without handling POLLHUP here, a half-closed socket causes a tight 100% CPU loop: poll() keeps
     // returning the fd as ready, but we only reacted to POLLIN, so the peer never gets marked for close.
     constexpr short CONN_READY_FLAGS = POLLIN | POLLHUP | POLLERR | POLLNVAL;
 
     // Peers whose receive budget ran out with frames left in their Connection buffer. poll() only sees the socket, so
-    // these are served in the next round even without an event — and that round must not sleep in poll().
+    // these are served in the next round even without an event: and that round must not sleep in poll().
     std::vector<int> socketsWithBufferedFrames;
     std::vector<int> stillBuffered;
 
@@ -883,9 +883,9 @@ void Network::ioLoop() {
             std::shared_lock lock(this->peersMutex);
             fds.reserve(fds.size() + this->peersBySocket.size());
             for (const auto& [fd, peer] : this->peersBySocket) {
-                if (peer->getState() == PeerState::Closing) continue;               // let cleanClosedPeers reap — no need to poll further
+                if (peer->getState() == PeerState::Closing) continue;               // let cleanClosedPeers reap: no need to poll further
 
-                // Departure window bound (B3): the remote normally closes right after our GOODBYE; one that does not is
+                // Departure window bound: the remote normally closes right after our GOODBYE; one that does not is
                 // closed by us. wasEverDeparting guards the instant between the state change and its timestamp.
                 if (peer->isDeparting() && peer->wasEverDeparting() && now - peer->getDepartingSince() > DEPARTURE_TIMEOUT) {
                     this->log.format(LogLevel::Warning, "peer {} did not close within the departure window, closing", peerIdShort(peer->getPeerId()));
@@ -893,9 +893,9 @@ void Network::ioLoop() {
                     continue;
                 }
 
-                // A peer that has not read any of our queued frames for sendStallTimeout is gone or hostile — it would
+                // A peer that has not read any of our queued frames for sendStallTimeout is gone or hostile: it would
                 // otherwise pin its full send queue in memory for as long as TCP keeps the connection open.
-                const auto sendIdle = peer->timeSinceSendProgress();                // nullopt — nothing queued
+                const auto sendIdle = peer->timeSinceSendProgress();                // nullopt: nothing queued
                 if (sendIdle && *sendIdle > this->config.sendStallTimeout) {
                     this->log.format(LogLevel::Warning, "peer {} stopped reading (send stalled), closing", peerIdShort(peer->getPeerId()));
                     peer->markForClose();
@@ -911,7 +911,7 @@ void Network::ioLoop() {
         const int ready = Transport::Platform::waitForSockets(fds.data(), fds.size(), pollTimeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
-            this->log.format(LogLevel::Alert, "I/O loop poll() failed: {} — no peer traffic is handled any more", std::strerror(errno));
+            this->log.format(LogLevel::Alert, "I/O loop poll() failed: {}; no peer traffic is handled any more", std::strerror(errno));
             break;
         }
 
@@ -923,7 +923,7 @@ void Network::ioLoop() {
                 } else {
                     if (pfd.revents & POLLOUT) this->handleConnectionWritable(pfd.fd);
 
-                    // For connection fds, treat POLLIN/HUP/ERR/NVAL uniformly — all imply
+                    // For connection fds, treat POLLIN/HUP/ERR/NVAL uniformly: all imply
                     // either incoming data or a terminal state we must react to.
                     const bool socketEvent = (pfd.revents & CONN_READY_FLAGS) != 0;
                     const bool carriedOver = std::find(socketsWithBufferedFrames.begin(), socketsWithBufferedFrames.end(), pfd.fd) != socketsWithBufferedFrames.end();
@@ -949,7 +949,7 @@ void Network::handleWakeup() {
                 if (!cmd.peer) break;
                 // Every early exit below closes the connection; cmd.slot then returns its place with cmd.
 
-                if (this->stopping.load()) {                                        // stop() is in its departure window — no new peers
+                if (this->stopping.load()) {                                        // stop() is in its departure window: no new peers
                     cmd.peer->markForClose();
                     cmd.peer->closeConnection();
                     break;
@@ -968,9 +968,9 @@ void Network::handleWakeup() {
                     break;
                 }
 
-                std::shared_ptr<Peer> activatedPeer;                                // became Active → greeting + listener event
-                std::shared_ptr<Peer> dismissedPeer;                                // above inbound.soft → departure window (NoSlots)
-                std::shared_ptr<Peer> replacedPeer;                                 // tie-break swapped connections → close after unlock
+                std::shared_ptr<Peer> activatedPeer;                                // became Active -> greeting + listener event
+                std::shared_ptr<Peer> dismissedPeer;                                // above inbound.soft -> departure window (NoSlots)
+                std::shared_ptr<Peer> replacedPeer;                                 // tie-break swapped connections -> close after unlock
                 bool                  rejectedDuplicate = false;
                 {
                     std::unique_lock lock(this->peersMutex);
@@ -993,8 +993,8 @@ void Network::handleWakeup() {
                             rejectedDuplicate = true;
                         }
                     } else {
-                        // Inbound soft limit (R10): above it the peer is still registered — it must be read during the
-                        // departure window — but as Departing: invisible to listeners and Topology, and it gets only a
+                        // Inbound soft limit: above it the peer is still registered, since it must be read during the
+                        // departure window, but as Departing: invisible to listeners and Topology, and it gets only a
                         // farewell (HELLO + PEX + GOODBYE(NoSlots)) sent by the management thread.
                         const size_t activeInbound = static_cast<size_t>(std::count_if(this->peersById.begin(), this->peersById.end(),
                                 [](const auto& entry) { return !entry.second->isOutbound() && entry.second->isActive(); }));
@@ -1022,13 +1022,13 @@ void Network::handleWakeup() {
 
                 if (cmd.slot) this->peerSlots.emplace(cmd.peer.get(), std::move(*cmd.slot));   // held until the peer is reaped
 
-                // The replaced peer is no longer in any map, so cleanClosedPeers will never see it — close it here.
+                // The replaced peer is no longer in any map, so cleanClosedPeers will never see it: close it here.
                 if (replacedPeer) {
                     replacedPeer->closeConnection();
                     this->peerSlots.erase(replacedPeer.get());
                 }
 
-                // The management thread sends greetings and farewells — never this thread (A1 S3/M1). A greeting queued
+                // The management thread sends greetings and farewells: never this thread. A greeting queued
                 // for a replaced connection is skipped once that peer is Closing.
                 if (dismissedPeer) {
                     ++this->inboundDismissedForNoSlots;
@@ -1037,7 +1037,7 @@ void Network::handleWakeup() {
                 if (activatedPeer) {
                     const std::string connectedFrom = activatedPeer->isOutbound() ? std::string() : activatedPeer->getConnection()->getRemoteClientAddress();
                     this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Activated, activatedPeer, GoodbyeReason::Shutdown, connectedFrom });
-                    // Listener event after Network-internal state is consistent. A replacement is transparent to listeners —
+                    // Listener event after Network-internal state is consistent. A replacement is transparent to listeners:
                     // the peer stays connected, only the underlying connection changed.
                     if (!replacedPeer) this->notifyPeerConnected(activatedPeer->getIdentity());
                 }
@@ -1056,12 +1056,12 @@ bool Network::handleConnectionReadable(int fd, short revents) {
         peer = it->second;
     }
 
-    if (!peer->isActive() && !peer->isDeparting()) return false;                    // Departing peers are still read (B3)
+    if (!peer->isActive() && !peer->isDeparting()) return false;                    // Departing peers are still read
 
-    // Terminal socket conditions — remote peer closed, socket error, or fd became invalid.
+    // Terminal socket conditions: remote peer closed, socket error, or fd became invalid.
     // We still want to drain any remaining decoded frames from Connection's internal buffer before
     // closing (peer may have sent final frames just before FIN), but we must close afterwards
-    // regardless — no more data will ever arrive on this socket.
+    // regardless: no more data will ever arrive on this socket.
     const bool terminalEvent = (revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
 
     size_t framesThisRound = 0;
@@ -1074,7 +1074,7 @@ bool Network::handleConnectionReadable(int fd, short revents) {
 
         // Budget spent: yield to the other peers. Data still in the socket makes poll() report us again; frames already
         // in the Connection buffer are invisible to poll(), so tell the loop to come back. A terminal event is handled
-        // once the buffer is drained — poll() keeps reporting it until then.
+        // once the buffer is drained: poll() keeps reporting it until then.
         if (framesThisRound >= RECEIVE_BUDGET_FRAMES || bytesThisRound >= RECEIVE_BUDGET_BYTES) {
             return peer->getConnection()->hasBufferedFrameData();
         }
@@ -1107,7 +1107,7 @@ bool Network::handleConnectionReadable(int fd, short revents) {
             return false;
         }
 
-        // n == 0 — no complete frame available right now. Two sub-cases:
+        // n == 0: no complete frame available right now. Two sub-cases:
         //   - normal case (POLLIN only): peer is still alive, return to poll and wait for more
         //   - terminal event (POLLHUP/ERR/NVAL) without new data: the socket is done. If we don't
         //     close now, poll() will keep firing this revent forever and busy-loop the I/O thread.
@@ -1197,12 +1197,12 @@ void Network::cleanClosedPeers() {
         this->peerLifecycleEvents.push({ PeerLifecycleEvent::Type::Closed, peer, GoodbyeReason::Shutdown, std::string() });
     }
 
-    // Fire disconnect events outside the peersMutex. Skip while stopping — Network::stop()
+    // Fire disconnect events outside the peersMutex. Skip while stopping: Network::stop()
     // tears down all peers without per-peer events; listeners treat shutdown as implicit
     // disconnection. This makes the event stream predictable: either the peer leaves while
     // Network is alive (event fires) or Network itself shuts down (no events).
     // A peer that went through the departure window was never announced (NoSlots) or stopped being visible when it
-    // entered the window — no event for it here.
+    // entered the window: no event for it here.
     if (this->running.load() && !this->stopping.load()) {
         for (const auto& peer : toClose) {
             if (!peer->wasEverDeparting()) this->notifyPeerDisconnected(peer->getPeerId());
@@ -1248,7 +1248,7 @@ void Network::managementLoop() {
             }
         }
 
-        // Hole punching (F7): asked punches, finished workers
+        // Hole punching: asked punches, finished workers
         PeerId punchTarget;
         while (this->holePunchRequests.tryPop(punchTarget)) {
             if (!this->stopping.load()) this->beginHolePunch(punchTarget);
@@ -1261,7 +1261,7 @@ void Network::managementLoop() {
             topologyNextTick = now + this->tickTopology();
         }
 
-        // Periodic PEX broadcast — one announcement per second max, to spread load over time
+        // Periodic PEX broadcast: one announcement per second max, to spread load over time
         if (now - lastBroadcastTick >= BROADCAST_TICK_INTERVAL) {
             this->sendPendingPexBroadcasts();
             this->holePunchCoordinator->expire(now);
@@ -1278,7 +1278,7 @@ void Network::managementLoop() {
             holePunchPolicyNextTick = now + this->pickHolePunchPolicyInterval();
         }
 
-        // Probe scheduling — at most one in flight, throttled internally
+        // Probe scheduling: at most one in flight, throttled internally
         if (!this->stopping.load()) this->runPeerProbe();
 
         // Wait for internal (0xFF) messages with short timeout so periodic tasks aren't starved
@@ -1292,7 +1292,7 @@ void Network::managementLoop() {
 }
 
 void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
-    // No state check (B9): messages a peer sent right before closing — its farewell PEX, its GOODBYE — are processed
+    // No state check: messages a peer sent right before closing (its farewell PEX, its GOODBYE) are processed
     // even when the I/O thread has already seen EOF and marked it for close. Records are signed, so they are
     // trustworthy whatever the connection state; replies to a closed peer simply fail.
     if (!msg.peer) return;
@@ -1330,15 +1330,15 @@ void Network::dispatchProtocolMessage(const ProtocolMessage& msg) {
 }
 
 std::vector<SignedPeerRecord> Network::collectDialCandidates(const std::vector<PeerId>& registered) const {
-    // Snapshot directory once and filter locally — directory release happens before TopologyPlanner runs.
+    // Snapshot directory once and filter locally: directory release happens before TopologyPlanner runs.
     const PeerId& selfId = this->selfIdentity->getPeerId();
     const auto    now    = std::chrono::steady_clock::now();
     std::vector<SignedPeerRecord> candidates;
     for (const auto& entry : this->peerDirectory->listPeers()) {
         // TopologyPlanner only dials peers we have evidence are currently reachable.
-        // hasEverConnected alone is not enough — a peer may have gone offline since.
+        // hasEverConnected alone is not enough: a peer may have gone offline since.
         if (entry.availability != AvailabilityState::Available) continue;
-        // Connection-attempt backoff — skip peers we just failed to dial. The cooldown grows
+        // Connection-attempt backoff: skip peers we just failed to dial. The cooldown grows
         // with consecutiveConnectionFailures (see computeBackoffInterval).
         if (now < entry.nextConnectionAttemptAt) continue;
         const PeerId& id = entry.record.peerId;
@@ -1353,7 +1353,7 @@ std::vector<SignedPeerRecord> Network::collectDialCandidates(const std::vector<P
 }
 
 std::chrono::milliseconds Network::tickTopology() {
-    // Planner sees established connections only; candidates exclude every registered peer, departing ones included —
+    // Planner sees established connections only; candidates exclude every registered peer, departing ones included:
     // we are still connected to those, dialing them again would only collide.
     std::vector<ConnectedPeerInfo> connected;
     std::vector<PeerId>            registered;
@@ -1371,16 +1371,16 @@ std::chrono::milliseconds Network::tickTopology() {
     const TopologyDecision decision = this->topologyPlanner.evaluate(connected, candidates, this->config);
 
     if (decision.connectTo) {
-        // Take the peer out of the candidate list for as long as the attempt can last (R9) — otherwise the next ticks
+        // Take the peer out of the candidate list for as long as the attempt can last: otherwise the next ticks
         // (every 3 s) pick it again while the first handshake is still running. A failure overwrites this with the
         // backoff; a success makes it connected (excluded anyway) and its HELLO clears the field.
-        // One worker tries every address in turn, so the attempt can last that many times longer (F4)
+        // One worker tries every address in turn, so the attempt can last that many times longer
         const auto attemptDuration = OUTBOUND_ATTEMPT_MAX_DURATION * static_cast<int>(decision.connectTo->addresses.size());
         this->peerDirectory->mutatePeer(decision.connectTo->peerId, [&](KnownPeer& entry) {
             entry.nextConnectionAttemptAt = std::max(entry.nextConnectionAttemptAt, std::chrono::steady_clock::now() + attemptDuration);
         });
 
-        this->log.format(LogLevel::Info, "topology — dialing {} at {} address(es)", peerIdShort(decision.connectTo->peerId), decision.connectTo->addresses.size());
+        this->log.format(LogLevel::Info, "topology: dialing {} at {} address(es)", peerIdShort(decision.connectTo->peerId), decision.connectTo->addresses.size());
         this->log.formatDebugDetail("topology dial addresses for {}: {}", peerIdShort(decision.connectTo->peerId), describeAddresses(decision.connectTo->addresses));
         this->dialAddresses(decision.connectTo->addresses);
     }
@@ -1393,7 +1393,7 @@ std::chrono::milliseconds Network::tickTopology() {
 // ============================================================
 
 std::vector<uint8_t> Network::buildHelloFrame() const {
-    if (this->selfRecordSerialized.empty()) return {};                              // defensive — start() builds this
+    if (this->selfRecordSerialized.empty()) return {};                              // defensive: start() builds this
     return buildFrame(GROUP_INTERNAL, SUBTYPE_HELLO, this->selfRecordSerialized);
 }
 
@@ -1404,7 +1404,7 @@ void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::s
         this->log.format(LogLevel::Debug, "HELLO to {} {}", peerIdShort(peer->getPeerId()), sent > 0 ? std::string("sent") : "failed, code=" + std::to_string(sent));
     }
 
-    // It dialed us: tell it where it comes from — behind NAT it cannot know (F7, first step)
+    // It dialed us: tell it where it comes from, since behind NAT it cannot know
     if (const auto observed = ObservedAddressCodec::encode(connectedFromAddress); !observed.empty()) {
         this->sendFrameTo(peer, buildFrame(GROUP_INTERNAL, SUBTYPE_OBSERVED_ADDRESS, observed));
     }
@@ -1417,7 +1417,7 @@ void Network::greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::s
 }
 
 void Network::sendFarewellAndDepart(const std::shared_ptr<Peer>& peer, const GoodbyeReason reason) {
-    if (!peer->isDeparting()) return;                                               // already closing — nothing to say
+    if (!peer->isDeparting()) return;                                               // already closing: nothing to say
 
     // A dismissed peer (NoSlots) has never heard from us: tell it who we are and where else to go before leaving
     if (reason == GoodbyeReason::NoSlots) {
@@ -1447,14 +1447,14 @@ void Network::processHelloMessage(const ProtocolMessage& msg) {
         return;
     }
 
-    // Reachability check — same logic as before, delegated to the shared upsert helper.
+    // Reachability check: same logic as before, delegated to the shared upsert helper.
     const bool outboundMatch = recordAnnouncesDialedAddress(record, msg.dialedAddress);
 
     const PeerId peerId          = record.peerId;                                   // save before move
     const bool   shouldBroadcast = this->upsertKnownPeer(std::move(record), outboundMatch);
 
     // Where we meet this peer decides which of its addresses we may dial (dialableAddresses): from a public address it
-    // is behind NAT relative to us; over a private one — in its dialing direction or ours — its private addresses work
+    // is behind NAT relative to us; over a private one, in its dialing direction or ours, its private addresses work
     if (const auto overPublic = observedReachedUsOverPublicInternet(msg.connectedFromAddress, msg.dialedAddress, outboundMatch)) {
         this->peerDirectory->mutatePeer(peerId, [&](KnownPeer& entry) { entry.reachedUsOverPublicInternet = *overPublic; });
     }
@@ -1488,7 +1488,7 @@ void Network::processObservedAddressMessage(const ProtocolMessage& msg) {
 
     const bool announced = std::any_of(this->config.announcedAddresses.begin(), this->config.announcedAddresses.end(), [&](const PeerAddress& a) { return a.address == *address; });
     if (firstTime && !announced && !isPrivateAddress(*address)) {
-        this->log.format(LogLevel::Warning, "peers see this node as {}, which it does not announce — it is behind NAT and cannot be dialed from outside; with port forwarding, announce {} (reported by {})",
+        this->log.format(LogLevel::Warning, "peers see this node as {}, which it does not announce; it is behind NAT and cannot be dialed from outside; with port forwarding, announce {} (reported by {})",
                  *address, *address, peerIdShort(msg.peer->getPeerId()));
     }
 }
@@ -1546,14 +1546,14 @@ NetworkDiagnostics Network::getDiagnostics() const {
 void Network::sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason) {
     const std::vector<uint8_t> payload{ static_cast<uint8_t>(reason) };
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_GOODBYE, payload);
-    peer->sendFarewell(frame);  // best-effort — we're leaving anyway, ignore send errors
+    peer->sendFarewell(frame);  // best-effort: we're leaving anyway, ignore send errors
     this->log.format(LogLevel::Notice, "sent GOODBYE to {} reason={}", peerIdShort(peer->getPeerId()), static_cast<int>(reason));
 }
 
 void Network::processGoodbyeMessage(const ProtocolMessage& msg) {
     const GoodbyeReason reason = msg.payload.size() >= 1
                                  ? static_cast<GoodbyeReason>(msg.payload[0])
-                                 : GoodbyeReason::Shutdown;  // malformed frame — treat as shutdown, close gracefully
+                                 : GoodbyeReason::Shutdown;  // malformed frame: treat as shutdown, close gracefully
 
     this->log.format(LogLevel::Notice, "received GOODBYE from {} reason={}", peerIdShort(msg.peer->getPeerId()), static_cast<int>(reason));
 
@@ -1563,7 +1563,7 @@ void Network::processGoodbyeMessage(const ProtocolMessage& msg) {
         this->recordNoSlotsRejection(msg.peer->getPeerId());
     }
 
-    // Every message the peer sent before GOODBYE has been processed (same queue, in order) — close our side now.
+    // Every message the peer sent before GOODBYE has been processed (same queue, in order): close our side now.
     msg.peer->markForClose();
 }
 
@@ -1591,7 +1591,7 @@ void Network::recordNoSlotsRejection(const PeerId& peerId) {
 
 std::optional<Network::InitialPexBatch> Network::buildInitialPexFor(const PeerId& targetId) const {
     // Snapshot the verified pool, excluding the target itself (no point in telling a peer about itself).
-    // PEX promotes peers we have evidence ever worked — hasEverConnected is the gate.
+    // PEX promotes peers we have evidence ever worked: hasEverConnected is the gate.
     std::vector<SignedPeerRecord> verifiedPool;
     {
         const auto allPeers = this->peerDirectory->listPeers();
@@ -1653,7 +1653,7 @@ size_t Network::importKnownPeers(const std::vector<RememberedPeer>& peers) {
         SignedPeerRecord verified;
         if (SignedPeerRecordCodec::deserialize(SignedPeerRecordCodec::serialize(peer.record), verified) != SignedRecordStatus::Success || verified.peerId != peer.record.peerId) continue;
         const PeerId peerId = verified.peerId;
-        // "Ever worked" is the evidence an outbound match gives: hasEverConnected, Available — dialed right away
+        // "Ever worked" is the evidence an outbound match gives: hasEverConnected, Available, dialed right away
         this->upsertKnownPeer(std::move(verified), peer.hasEverConnected);
         if (this->peerDirectory->findPeer(peerId)) ++taken;
     }
@@ -1668,12 +1668,12 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
     // outboundMatch == true means we just successfully connected to one of this record's
     // announced addresses, which is direct evidence that this peer is reachable RIGHT NOW.
     // It also counts as evidence that the peer has ever worked (hasEverConnected = true).
-    // outboundMatch == false means we have no fresh evidence either way — availability stays
+    // outboundMatch == false means we have no fresh evidence either way: availability stays
     // Unknown and a probe may upgrade it later.
     const PeerId peerId          = record.peerId;                                   // capture before move
     bool         shouldBroadcast = false;
 
-    // Full address book (R2): a new record needs room — the least valuable entry goes, or the record is dropped.
+    // Full address book: a new record needs room, so the least valuable entry goes, or the record is dropped.
     // Only this thread adds entries, so the check and the insert below cannot be interleaved by another insert.
     if (!this->peerDirectory->findPeer(peerId) && this->peerDirectory->size() >= this->config.maxKnownPeers) {
         std::vector<PeerId> connected;
@@ -1698,7 +1698,7 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             entry.record               = std::move(record);
             entry.hasEverConnected     = outboundMatch;
             entry.availability         = newAvailability;
-            // Backoff counters default to zero — fresh peer, no history.
+            // Backoff counters default to zero: fresh peer, no history.
             shouldBroadcast = outboundMatch;                                        // broadcast only if we have evidence it works
             return;
         }
@@ -1723,7 +1723,7 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
         }
 
         if (record.createdAt > entry.record.createdAt) {
-            // Newer record with a changed address set — previous reachability evidence and backoff
+            // Newer record with a changed address set: previous reachability evidence and backoff
             // history were about other addresses and no longer apply. Reset everything to whatever
             // evidence this update brings. A Probing observer will detect the state change when
             // it tries to commit its result and skip the write.
@@ -1741,7 +1741,7 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             return;
         }
 
-        // Same or older record — only allow upgrades. Never demote.
+        // Same or older record: only allow upgrades. Never demote.
         // outboundMatch is fresh evidence both that the peer has ever worked AND is available now.
         if (outboundMatch) {
             const bool wasNotEverConnected = !entry.hasEverConnected;
@@ -1749,7 +1749,7 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
 
             entry.hasEverConnected = true;
             entry.availability     = AvailabilityState::Available;
-            // Reset both backoff counters — peer just successfully accepted a connection from us,
+            // Reset both backoff counters: peer just successfully accepted a connection from us,
             // any history of failures (probe or connect) is no longer relevant.
             entry.consecutiveConnectionFailures = 0;
             entry.nextConnectionAttemptAt       = {};
@@ -1757,11 +1757,11 @@ bool Network::upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch) {
             entry.nextProbeAllowedAt            = {};
 
             // Broadcast if this is the first time we have evidence the peer ever worked.
-            // A pure availability flip (was-Available → Available, hasEverConnected unchanged) is
-            // not newsworthy for PEX — the record itself has not changed.
+            // A pure availability flip (was-Available -> Available, hasEverConnected unchanged) is
+            // not newsworthy for PEX: the record itself has not changed.
             shouldBroadcast = wasNotEverConnected || wasNotAvailable;
         }
-        // else: same/older record without outboundMatch — no new information, no broadcast.
+        // else: same/older record without outboundMatch, no new information, no broadcast.
     });
 
     return shouldBroadcast;
@@ -1772,7 +1772,7 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
     const PexAnnounceStatus status = PexAnnounceCodec::deserialize(msg.payload, records);
 
     if (status != PexAnnounceStatus::Success) {
-        // Framing error — peer is broken or malicious. Drop the connection.
+        // Framing error: peer is broken or malicious. Drop the connection.
         // (Individual record verification failures are silently dropped by the codec and do not reach here.)
         this->log.formatRateLimited(this->managementThreadLogLimiter, "malformed PEX_ANNOUNCE:" + peerIdShort(msg.peer->getPeerId()), LogLevel::Warning, "PEX_ANNOUNCE from {} malformed, closing connection", peerIdShort(msg.peer->getPeerId()));
         msg.peer->markForClose();
@@ -1784,12 +1784,12 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
     size_t        broadcastCount = 0;
 
     for (auto& record : records) {
-        // Skip our own record — peer shouldn't announce us back to us
+        // Skip our own record: peer shouldn't announce us back to us
         if (record.peerId == selfId) continue;
 
         // If the announced record describes the sender itself, treat it like a HELLO update:
         // outbound match on the actual connection IP is valid evidence of reachability.
-        // For records about other peers, we have no direct evidence — outboundMatch stays false
+        // For records about other peers, we have no direct evidence: outboundMatch stays false
         // until a probe verifies reachability.
         const bool outboundMatch = record.peerId == senderId && recordAnnouncesDialedAddress(record, msg.dialedAddress);
 
@@ -1802,7 +1802,7 @@ void Network::processPexAnnounceMessage(const ProtocolMessage& msg) {
         }
     }
 
-    this->log.format(LogLevel::Debug, "PEX_ANNOUNCE from {} — {} record(s), {} broadcasted, knownPeers={}", peerIdShort(senderId), records.size(), broadcastCount, this->peerDirectory->size());
+    this->log.format(LogLevel::Debug, "PEX_ANNOUNCE from {}: {} record(s), {} broadcasted, knownPeers={}", peerIdShort(senderId), records.size(), broadcastCount, this->peerDirectory->size());
 }
 
 void Network::processPexRequestMessage(const ProtocolMessage& msg) {
@@ -1814,7 +1814,7 @@ void Network::processPexRequestMessage(const ProtocolMessage& msg) {
     }
 
     // Any record we hold, reachable or not: the requester needs the signed keys, not an address it could dial. Our own
-    // record is not in the directory — a neighbor got it in HELLO. A reply is not gossip, so nothing is marked announced.
+    // record is not in the directory: a neighbor got it in HELLO. A reply is not gossip, so nothing is marked announced.
     std::vector<SignedPeerRecord> found;
     for (const PeerId& id : wanted) {
         if (const auto entry = this->peerDirectory->findPeer(id)) found.push_back(entry->record);
@@ -1835,18 +1835,18 @@ void Network::enqueuePexBroadcast(const PeerId& recordPeerId, const PeerId& excl
 }
 
 void Network::sendPendingPexBroadcasts() {
-    // One announcement per tick — the caller's 1-second cadence provides rate limiting.
+    // One announcement per tick: the caller's 1-second cadence provides rate limiting.
     PendingPexBroadcast pending;
     if (!this->pexBroadcastQueue.tryPop(pending)) return;
 
     // Fetch the current record. It may have been superseded by a newer version since
     // enqueuePexBroadcast was called; in that case we send the fresher one. Defensive
-    // hasEverConnected check — the flag could have been cleared by a concurrent newer-record
+    // hasEverConnected check: the flag could have been cleared by a concurrent newer-record
     // update.
     const auto entry = this->peerDirectory->findPeer(pending.recordPeerId);
     if (!entry || !entry->hasEverConnected) return;
 
-    // Serialize as a single-record batch — reuses the same codec as initial exchange and periodic tick
+    // Serialize as a single-record batch: reuses the same codec as initial exchange and periodic tick
     const std::vector<SignedPeerRecord> batch{ entry->record };
     const std::vector<uint8_t> payload = PexAnnounceCodec::serialize(batch);
     if (payload.empty()) return;
@@ -1854,7 +1854,7 @@ void Network::sendPendingPexBroadcasts() {
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
 
     // Snapshot connected peers under lock, then send outside the lock
-    // Connected peers come from the connection layer's service, not its map (A1 S2)
+    // Connected peers come from the connection layer's service, not its map
     std::vector<std::shared_ptr<Peer>> targets = this->activePeersSnapshot();
     std::erase_if(targets, [&](const std::shared_ptr<Peer>& peer) { return peer->getPeerId() == pending.excludePeerId; });
 
@@ -1863,14 +1863,14 @@ void Network::sendPendingPexBroadcasts() {
         if (this->sendFrameTo(peer, frame) > 0) ++sent;
     }
 
-    // Nobody got it (no targets, or every send refused, e.g. SendQueueFull): leave the record unannounced (B10). Its
-    // empty lastAnnouncedAt puts it first in line for the next anti-entropy tick — no separate retry loop needed.
+    // Nobody got it (no targets, or every send refused, e.g. SendQueueFull): leave the record unannounced. Its
+    // empty lastAnnouncedAt puts it first in line for the next anti-entropy tick: no separate retry loop needed.
     if (sent == 0) {
         this->log.format(LogLevel::Debug, "PEX_ANNOUNCE for {} reached nobody, left for anti-entropy", peerIdShort(pending.recordPeerId));
         return;
     }
 
-    // Mark as announced — also counts toward anti-entropy ordering.
+    // Mark as announced: also counts toward anti-entropy ordering.
     const auto now = std::chrono::steady_clock::now();
     this->peerDirectory->mutatePeer(pending.recordPeerId, [now](KnownPeer& kp) {
         kp.lastAnnouncedAt     = now;
@@ -1904,7 +1904,7 @@ void Network::tickPeriodicPex() {
 
     if (pool.empty()) return;                                                       // nothing to gossip
 
-    // Pick N oldest-announced records — partial_sort is O(n log k), negligible here.
+    // Pick N oldest-announced records: partial_sort is O(n log k), negligible here.
     const size_t batchSize = std::min<size_t>(this->config.periodicPexBatchSize, pool.size());
     std::partial_sort(pool.begin(), pool.begin() + batchSize, pool.end(),
                       [](const Candidate& a, const Candidate& b) { return a.lastAnnouncedAt < b.lastAnnouncedAt; });
@@ -1919,18 +1919,18 @@ void Network::tickPeriodicPex() {
     const std::vector<uint8_t> frame = buildFrame(GROUP_INTERNAL, SUBTYPE_PEX_ANNOUNCE, payload);
 
     // Snapshot connected peers, send outside the lock
-    const std::vector<std::shared_ptr<Peer>> targets = this->activePeersSnapshot();   // connection layer's service (A1 S2)
+    const std::vector<std::shared_ptr<Peer>> targets = this->activePeersSnapshot();   // connection layer's service
 
-    if (targets.empty()) return;                                                    // no one connected — skip the update too
+    if (targets.empty()) return;                                                    // no one connected: skip the update too
 
     size_t sent = 0;
     for (const auto& peer : targets) {
         if (this->sendFrameTo(peer, frame) > 0) ++sent;
     }
 
-    // Every send refused: the batch keeps its place at the front of the anti-entropy order (B10)
+    // Every send refused: the batch keeps its place at the front of the anti-entropy order
     if (sent == 0) {
-        this->log.format(LogLevel::Debug, "anti-entropy PEX tick — {} record(s) reached nobody", batch.size());
+        this->log.format(LogLevel::Debug, "anti-entropy PEX tick: {} record(s) reached nobody", batch.size());
         return;
     }
 
@@ -1944,14 +1944,14 @@ void Network::tickPeriodicPex() {
         });
     }
 
-    this->log.format(LogLevel::Debug, "anti-entropy PEX tick — {} record(s) to {}/{} peer(s)", batch.size(), sent, targets.size());
+    this->log.format(LogLevel::Debug, "anti-entropy PEX tick: {} record(s) to {}/{} peer(s)", batch.size(), sent, targets.size());
 }
 
 std::chrono::seconds Network::pickRandomPexInterval() {
     const auto minS = this->config.periodicPexMinInterval.count();
     const auto maxS = this->config.periodicPexMaxInterval.count();
 
-    if (maxS <= minS) return std::chrono::seconds(minS);                            // degenerate config — fall back to min
+    if (maxS <= minS) return std::chrono::seconds(minS);                            // degenerate config: fall back to min
 
     static thread_local std::mt19937 rng(std::random_device{}());
     std::uniform_int_distribution<std::chrono::seconds::rep> dist(minS, maxS);
@@ -1959,11 +1959,11 @@ std::chrono::seconds Network::pickRandomPexInterval() {
 }
 
 // ============================================================
-// Probe — reachability verification via one-shot outbound connection
+// Probe: reachability verification via one-shot outbound connection
 // ============================================================
 
 void Network::runPeerProbe() {
-    // Single probe in flight at a time — prevents overlapping probe workers when many peers
+    // Single probe in flight at a time: prevents overlapping probe workers when many peers
     // are due. Per-peer cooldowns (nextProbeAllowedAt) prevent re-probing the same dead peer.
     if (this->probeInFlight.load(std::memory_order_acquire)) return;
 
@@ -1973,7 +1973,7 @@ void Network::runPeerProbe() {
     //   - has at least one announced address
     //   - is not us
     // Note: we do not skip peers we are already connected to. A connection we have does not
-    // prove that the peer's announced address is reachable — they may be inbound-only (behind NAT)
+    // prove that the peer's announced address is reachable: they may be inbound-only (behind NAT)
     // or have announced a different address than the one they connected from. The probe bit in
     // IdentityVerification ensures a duplicate connection for probe purposes is rejected cleanly
     // by the remote without joining their peer pool, so there is no tie-break conflict.
@@ -1996,7 +1996,7 @@ void Network::runPeerProbe() {
         if (entry.record.peerId == selfId)                      continue;
 
         // Re-validate under exclusive lock and atomically transition to Probing.
-        // Race-safe: state may have changed since listPeers() — mutator re-checks every condition
+        // Race-safe: state may have changed since listPeers(), so the mutator re-checks every condition
         // and only flips availability if still eligible. mutatePeer returns false if the peer was
         // removed in the meantime; we just continue to the next candidate.
         bool transitioned = false;
@@ -2020,7 +2020,7 @@ void Network::runPeerProbe() {
 
     if (!picked) return;
 
-    // A probe is an outbound connection too — it counts against the outbound hard limit (R10)
+    // A probe is an outbound connection too: it counts against the outbound hard limit
     auto slot = this->connectionSlots.tryTakeOutbound(this->config.connectionLimits.outbound.effectiveHard());
     if (!slot) {
         this->peerDirectory->mutatePeer(pickedId, [&](KnownPeer& kp) {
@@ -2029,7 +2029,7 @@ void Network::runPeerProbe() {
         return;                                                                     // retried on a later tick
     }
 
-    // Launch probe worker — discovery's own worker list (A1 S1)
+    // Launch probe worker: discovery's own worker list
     auto  worker    = std::make_unique<HandshakeWorker>();
     auto* workerPtr = worker.get();
 
@@ -2043,7 +2043,7 @@ void Network::runPeerProbe() {
             this->runProbeWorker(pickedId, std::move(addresses), std::move(slot), workerPtr);
         });
     } catch (const std::system_error& e) {
-        // Thread creation failed (resource exhaustion) — undo the Probing transition so the peer stays eligible.
+        // Thread creation failed (resource exhaustion): undo the Probing transition so the peer stays eligible.
         this->peerDirectory->mutatePeer(pickedId, [&](KnownPeer& kp) {
             if (kp.availability == AvailabilityState::Probing) kp.availability = pickedPreviousAvailability;
         });
@@ -2052,7 +2052,7 @@ void Network::runPeerProbe() {
         return;
     }
 
-    this->probeWorkers.push_back(std::move(worker));                                 // management thread only (A1 S1)
+    this->probeWorkers.push_back(std::move(worker));                                 // management thread only
 
     this->log.format(LogLevel::Debug, "launched probe for {} at {} address(es)", peerIdShort(pickedId), pickedAddresses.size());
     this->log.formatDebugDetail("probe addresses for {}: {}", peerIdShort(pickedId), describeAddresses(pickedAddresses));
@@ -2061,8 +2061,8 @@ void Network::runPeerProbe() {
 void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self) {
     blockSigpipeInCurrentThread();
 
-    // Establish outbound connection with probe flag set — remote will close after verification. Every dialable address
-    // in order (F4): one that answers with the expected identity is enough.
+    // Establish outbound connection with probe flag set: remote will close after verification. Every dialable address
+    // in order: one that answers with the expected identity is enough.
     IdentityFlags flags;
     flags.setProbe(true);
 
@@ -2075,23 +2075,23 @@ void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses
         if (result.verification != VerificationResult::Success) {
             this->log.format(LogLevel::Info, "probe to {} at {}:{} failed: {}", peerIdShort(expected), address, port, result.failure.empty() ? verificationResultName(result.verification) : result.failure);
         } else if (result.remoteIdentity.getPeerId() != expected) {
-            // Someone else on that address — don't trust the address for the expected peer.
+            // Someone else on that address: don't trust the address for the expected peer.
             // We don't record anything for the actual remote: our probe flag caused it to close without
             // sending HELLO, so we have no announced addresses to outbound-match against.
             this->log.format(LogLevel::Info, "probe to {} at {}:{} got PeerId mismatch (actual={}), treating as probe failure", peerIdShort(expected), address, port, peerIdShort(result.remoteIdentity.getPeerId()));
         } else {
-            // Identity verified, PeerId matches expected — the announced address is reachable.
+            // Identity verified, PeerId matches expected: the announced address is reachable.
             success = true;
             this->log.format(LogLevel::Info, "probe to {} at {}:{} succeeded", peerIdShort(expected), address, port);
         }
 
-        // Always close the connection — probe is one-shot.
+        // Always close the connection: probe is one-shot.
         if (result.connection) result.connection->close();
         if (success) break;
     }
-    { auto released = std::move(slot); }                                            // the probe connection is gone — free its outbound slot now
+    { auto released = std::move(slot); }                                            // the probe connection is gone: free its outbound slot now
 
-    // Commit result to peerDirectory — this also updates the per-peer cooldown.
+    // Commit result to peerDirectory: this also updates the per-peer cooldown.
     this->commitProbeResult(expected, success);
 
     this->probeInFlight.store(false, std::memory_order_release);
@@ -2101,10 +2101,10 @@ void Network::runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses
 
 void Network::commitProbeResult(const PeerId& expected, bool success) {
     // Three possible outcomes after the mutation attempt:
-    //   StateChanged — peer not found, OR availability is no longer Probing (newer record arrived
+    //   StateChanged: peer not found, OR availability is no longer Probing (newer record arrived
     //                  during probe and reset state). Don't overwrite.
-    //   Success      — probe succeeded; mark Available, reset probe backoff, broadcast.
-    //   Failed       — probe failed; mark Unavailable, increment counter, schedule next attempt.
+    //   Success     : probe succeeded; mark Available, reset probe backoff, broadcast.
+    //   Failed      : probe failed; mark Unavailable, increment counter, schedule next attempt.
     enum class Outcome { StateChanged, Success, Failed };
     Outcome              outcome       = Outcome::StateChanged;
     uint8_t              failureCount  = 0;
@@ -2114,19 +2114,19 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
         if (entry.availability != AvailabilityState::Probing) return;               // outcome stays StateChanged
 
         if (success) {
-            // Probe succeeded — mark Available AND record that we've ever had a working connection.
+            // Probe succeeded: mark Available AND record that we've ever had a working connection.
             // hasEverConnected may have been false (peer learned via PEX gossip with no direct
             // evidence yet); this probe is precisely that direct evidence.
             entry.availability              = AvailabilityState::Available;
             entry.hasEverConnected          = true;
-            // Reset probe backoff — peer is back, history of past failures no longer matters.
+            // Reset probe backoff: peer is back, history of past failures no longer matters.
             entry.consecutiveProbeFailures  = 0;
             entry.nextProbeAllowedAt        = {};
             outcome = Outcome::Success;
         } else {
-            // Probe failed — increment counter, schedule next attempt according to backoff.
+            // Probe failed: increment counter, schedule next attempt according to backoff.
             // After the cooldown elapses, runPeerProbe will pick this peer up again
-            // (Unavailable + nextProbeAllowedAt elapsed → eligible).
+            // (Unavailable + nextProbeAllowedAt elapsed -> eligible).
             entry.availability = AvailabilityState::Unavailable;
             if (entry.consecutiveProbeFailures < BACKOFF_SCHEDULE_LEN) {
                 ++entry.consecutiveProbeFailures;
@@ -2141,13 +2141,13 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
     // Logging and PEX-broadcast enqueue happen outside the directory lock.
     switch (outcome) {
         case Outcome::StateChanged:
-            this->log.format(LogLevel::Info, "probe result for {} ignored — state changed during probe", peerIdShort(expected));
+            this->log.format(LogLevel::Info, "probe result for {} ignored; state changed during probe", peerIdShort(expected));
             break;
         case Outcome::Failed:
             this->log.format(LogLevel::Info, "probe failure recorded for {} (failures={}, next probe in {}s)", peerIdShort(expected), static_cast<int>(failureCount), waitDuration.count());
             break;
         case Outcome::Success:
-            // excludePeerId = self — probe doesn't have a "source" peer to exclude; we learned
+            // excludePeerId = self: probe doesn't have a "source" peer to exclude; we learned
             // the record ourselves by verifying it directly.
             this->enqueuePexBroadcast(expected, this->selfIdentity->getPeerId());
             break;
@@ -2159,7 +2159,7 @@ void Network::commitProbeResult(const PeerId& expected, bool success) {
 // ============================================================
 
 // ============================================================
-// NAT hole punching (F7, docs/nat-traversal.md) — coordination over 0xFF, one hop through a common neighbor
+// NAT hole punching: coordination over 0xFF, one hop through a common neighbor
 // ============================================================
 
 void Network::processHolePunchMessage(const ProtocolMessage& msg) {
@@ -2172,7 +2172,7 @@ void Network::processHolePunchMessage(const ProtocolMessage& msg) {
     const auto now = std::chrono::steady_clock::now();
 
     if (const auto* request = std::get_if<HolePunchRequest>(&*body)) {
-        // Role R: both endpoints come from our own connections — what each NAT shows us, never what anyone declares
+        // Role R: both endpoints come from our own connections, what each NAT shows us, never what anyone declares
         const auto target         = this->stopping.load() ? nullptr : this->findActivePeer(request->target);
         const auto targetEndpoint = target ? this->observedEndpointOf(*target) : std::nullopt;
         const auto messages       = this->holePunchCoordinator->onRequest(from, this->observedEndpointOf(*msg.peer), *request, targetEndpoint, now);
@@ -2196,7 +2196,7 @@ void Network::processHolePunchMessage(const ProtocolMessage& msg) {
         if (!messages.empty()) ++this->holePunchCounters.coordinated;
         this->sendHolePunchMessages(messages);
     } else if (const auto* decline = std::get_if<HolePunchDecline>(&*body)) {
-        // Either B's answer to us as R (forwarded to A), or R's word to us as A or B — the nonce tells which
+        // Either B's answer to us as R (forwarded to A), or R's word to us as A or B: the nonce tells which
         const auto forwarded = this->holePunchCoordinator->onDecline(from, *decline, now);
         if (!forwarded.empty()) this->sendHolePunchMessages(forwarded);
         else if (const auto failure = this->holePunchParticipant->onDecline(from, *decline, now)) this->onHolePunchFailure(*failure);
@@ -2208,9 +2208,9 @@ void Network::processHolePunchMessage(const ProtocolMessage& msg) {
 void Network::sendHolePunchMessages(const std::vector<HolePunchMessage>& messages) {
     for (const HolePunchMessage& message : messages) {
         const auto peer = this->findActivePeer(message.peer);
-        if (!peer) continue;                                                        // left meanwhile — the other side's deadline covers it
+        if (!peer) continue;                                                        // left meanwhile: the other side's deadline covers it
         const auto encoded = HolePunchCodec::encode(message.body);
-        if (encoded.payload.empty()) continue;                                      // an endpoint that is not an IP — nothing sensible to send
+        if (encoded.payload.empty()) continue;                                      // an endpoint that is not an IP: nothing sensible to send
         this->sendFrameTo(peer, buildFrame(GROUP_INTERNAL, encoded.subtype, encoded.payload));
     }
 }
@@ -2233,7 +2233,7 @@ void Network::beginHolePunch(const PeerId& target) {
     if (this->holePunchParticipant->isExchangingWith(target) || this->holePunchParticipant->isResting(target, now)) return;
 
     // Coordinator candidates: neighbors we dialed (they see our NAT mapping). Which of them also has the target is not
-    // known yet (F7-e "reachable via") — ask them in random order until one coordinates.
+    // known yet: ask them in random order until one coordinates.
     std::vector<PeerId> coordinators;
     for (const auto& peer : this->activePeersSnapshot()) {
         if (peer->isOutbound() && peer->getPeerId() != target) coordinators.push_back(peer->getPeerId());
@@ -2278,16 +2278,16 @@ void Network::onHolePunchFailure(const HolePunchFailure& failure) {
     if (!holePunchInitiatesHandshake(this->selfIdentity->getPeerId(), failure.peer)) return;   // B: nothing to retry
     ++this->holePunchCounters.declined;
 
-    // A: the coordinator could not help (not the target's neighbor, busy with us, someone left) — ask the next one
+    // A: the coordinator could not help (not the target's neighbor, busy with us, someone left), so ask the next one
     using Reason = HolePunchDeclineReason;
     if (failure.reason == Reason::SameNetwork) {
-        // One LAN: dial the local addresses instead — the F4 rule (no private addresses of a peer behind NAT relative to
+        // One LAN: dial the local addresses instead, by the usual rule (no private addresses of a peer behind NAT relative to
         // us) does not hold for a pair behind the same NAT. No punching for a while either way.
         this->holePunchCoordinatorsLeft.erase(failure.peer);
         this->holePunchParticipant->recordFailedAttempt(failure.peer, std::chrono::steady_clock::now());
         const auto known = this->peerDirectory->findPeer(failure.peer);
         if (known && !known->record.addresses.empty()) {
-            this->log.format(LogLevel::Info, "{} shares our public address — dialing its own addresses instead of punching", peerIdShort(failure.peer));
+            this->log.format(LogLevel::Info, "{} shares our public address; dialing its own addresses instead of punching", peerIdShort(failure.peer));
             this->dialAddresses(known->record.addresses);
         }
         return;
@@ -2320,7 +2320,7 @@ void Network::startHolePunchWorker(const HolePunchStart& start) {
         return;
     }
 
-    // A punched connection is one we chose — an outbound slot on both sides (R10), from the reserve if private links are short
+    // A punched connection is one we chose: an outbound slot on both sides, from the reserve if private links are short
     auto slot = this->connectionSlots.tryTakeOutbound(this->holePunchOutboundLimit());
     if (!slot) {
         this->log.format(LogLevel::Info, "hole punch with {}: outbound hard limit reached", peerIdShort(start.peer));
@@ -2355,7 +2355,7 @@ void Network::runHolePunchWorker(HolePunchStart start, const uint16_t localPort,
         self->done.store(true, std::memory_order_release);
     };
 
-    // ── Simultaneous open: the other side dials us at the same time; the kernel retransmits a SYN the NAT dropped ──
+    // -- Simultaneous open: the other side dials us at the same time; the kernel retransmits a SYN the NAT dropped --
     Transport::TcpClient client;
     sockaddr_storage     remoteAddr{};
     client.onConnect([&remoteAddr](int /*socket*/, const sockaddr_storage* addr) { if (addr) remoteAddr = *addr; });
@@ -2379,7 +2379,7 @@ void Network::runHolePunchWorker(HolePunchStart start, const uint16_t localPort,
         return;
     }
 
-    // ── Roles follow the PeerIds, not the socket: both sides called connect ──
+    // -- Roles follow the PeerIds, not the socket: both sides called connect --
     HandshakeResult result = start.initiatesHandshake ? this->completeHandshakeAsInitiator(connection, IdentityFlags{})
                                                       : this->completeHandshakeAsResponder(connection, std::chrono::steady_clock::now() + INBOUND_HANDSHAKE_DEADLINE);
     if (result.verification != VerificationResult::Success) {
@@ -2394,8 +2394,8 @@ void Network::runHolePunchWorker(HolePunchStart start, const uint16_t localPort,
         return;
     }
 
-    // Registered like any other connection; a duplicate is settled by the tie-break (B4), whose winning direction —
-    // the smaller PeerId's outbound — is exactly the punch's initiator
+    // Registered like any other connection; a duplicate is settled by the tie-break, whose winning direction:
+    // the smaller PeerId's outbound: is exactly the punch's initiator
     // A punched peer holds an outbound slot on both sides and is never dismissed by the inbound soft limit (we agreed to it)
     auto peer = std::make_shared<Peer>(std::move(result.connection), std::move(result.remoteIdentity), start.initiatesHandshake, true);
     Command cmd;
@@ -2448,12 +2448,12 @@ size_t Network::countPrivateLinks() const {
 uint16_t Network::holePunchOutboundLimit() const {
     const uint16_t hard    = this->config.connectionLimits.outbound.effectiveHard();
     const uint16_t reserve = this->config.holePunching.minPrivateLinks;
-    // Full outbound slots must not block the links that keep the mesh alive without public servers (docs/nat-traversal.md 5)
+    // Full outbound slots must not block the links that keep the mesh alive without public servers
     return this->countPrivateLinks() < reserve ? static_cast<uint16_t>(hard + reserve) : hard;
 }
 
 std::chrono::milliseconds Network::pickHolePunchPolicyInterval() const {
-    // Random 0.5–1.5 × the interval: nodes that start together (network formation) do not punch in step
+    // Random 0.5-1.5 x the interval: nodes that start together (network formation) do not punch in step
     static thread_local std::mt19937 rng(std::random_device{}());
     const auto base = std::chrono::duration_cast<std::chrono::milliseconds>(this->config.holePunching.attemptInterval);
     std::uniform_int_distribution<int64_t> spread(base.count() / 2, std::max<int64_t>(base.count() / 2, base.count() * 3 / 2));
@@ -2484,7 +2484,7 @@ void Network::tickHolePunchPolicy() {
     situation.dialableCandidatesLeft = !this->collectDialCandidates(registered).empty();
 
     // Candidates: larger PeerId (the smaller asks), not connected, not something Topology dials, and nobody can dial
-    // them — no public address, or its public addresses failed
+    // them: no public address, or its public addresses failed
     for (const KnownPeer& known : this->peerDirectory->listPeers()) {
         const PeerId& id = known.record.peerId;
         if (!holePunchInitiatesHandshake(self, id)) continue;
@@ -2496,7 +2496,7 @@ void Network::tickHolePunchPolicy() {
     }
 
     if (const auto target = chooseHolePunchTarget(situation, this->config.holePunching.minPrivateLinks)) {
-        this->log.format(LogLevel::Info, "hole punch policy — {} (private links {}/{}, outbound {}/{})", peerIdShort(*target), situation.privateLinks,
+        this->log.format(LogLevel::Info, "hole punch policy: {} (private links {}/{}, outbound {}/{})", peerIdShort(*target), situation.privateLinks,
                          this->config.holePunching.minPrivateLinks, situation.outboundConnections, situation.outboundTarget);
         this->beginHolePunch(*target);
     }
@@ -2550,7 +2550,7 @@ void Network::finalCleanupAllPeers() {
     for (auto& [fd, peer] : this->peersBySocket) peer->closeConnection();
     this->peersBySocket.clear();
     this->peersById.clear();
-    this->peerSlots.clear();                                                        // I/O thread has exited — safe to touch
+    this->peerSlots.clear();                                                        // I/O thread has exited: safe to touch
 }
 
 } // namespace invilite::Mesh

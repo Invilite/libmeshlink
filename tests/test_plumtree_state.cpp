@@ -123,7 +123,7 @@ TEST(PlumtreeStateTest, ArrivalCancelsPendingGraft) {
 
 TEST(PlumtreeStateTest, SlowEagerLinkIsSwappedForFasterAnnouncer) {
     PlumtreeState state = withLinks({ A, B });
-    state.onPrune(B);                                                                        // A eager, B lazy
+    state.onPrune(B);
 
     state.onAnnouncement(B, { key(1) }, T0);
     const auto slow = state.onNewMessage(key(1), A, true, T0 + 51ms);                        // full copy later than the announcement by > 50 ms
@@ -134,13 +134,13 @@ TEST(PlumtreeStateTest, SlowEagerLinkIsSwappedForFasterAnnouncer) {
     EXPECT_TRUE(slow.fullCopyTo.empty());                                                    // B announced it (has it), A gave it
 
     state.onAnnouncement(A, { key(2) }, T0 + 1s);
-    const auto close = state.onNewMessage(key(2), B, true, T0 + 1s + 50ms);                  // within the threshold
+    const auto close = state.onNewMessage(key(2), B, true, T0 + 1s + 50ms);
     EXPECT_FALSE(close.graftTo.has_value());
     EXPECT_FALSE(close.pruneTo.has_value());
     EXPECT_TRUE(state.isEager(B));
 }
 
-// Once we asked by GRAFT, the copy is the answer — no swap on top of it
+// Once we asked by GRAFT, the copy is the answer, no swap on top of it
 TEST(PlumtreeStateTest, NoSwapAfterGraftWasSent) {
     PlumtreeState state = withLinks({ A, B, C });
     state.onPrune(B);
@@ -242,6 +242,6 @@ TEST(PlumtreeStateTest, DeadlinesComeOutInOrderAcrossManyMessages) {
     for (uint64_t id = 1; id <= 100; ++id) state.onAnnouncement(A, { key(id) }, T0 + std::chrono::milliseconds(id));
     EXPECT_EQ(state.nextDeadline(), T0 + 501ms);
     const auto grafts = state.takeDueGrafts(T0 + 550ms);
-    EXPECT_EQ(grafts.at(A).size(), 50u);                                                      // only what is due
+    EXPECT_EQ(grafts.at(A).size(), 50u);
     EXPECT_EQ(state.nextDeadline(), T0 + 551ms);
 }

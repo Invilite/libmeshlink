@@ -14,20 +14,19 @@ int invilite::Mesh::Peer::getSocket() const {
 }
 
 void invilite::Mesh::Peer::markActive() {
-    // Only Joining → Active: never resurrect a peer that is already departing or closing
+    // Only Joining -> Active: never resurrect a peer that is already departing or closing.
     PeerState expected = PeerState::Joining;
     this->state.compare_exchange_strong(expected, PeerState::Active, std::memory_order_acq_rel);
 }
 
 void invilite::Mesh::Peer::markForClose() {
-    // Store Closing unconditionally — idempotent, covers all prior states
     this->state.store(PeerState::Closing, std::memory_order_release);
 }
 
 ssize_t invilite::Mesh::Peer::send(const std::vector<uint8_t>& data) {
     // The state check and the enqueue are not atomic: a frame may still slip in right after another thread moved the
-    // peer to Departing (e.g. a user send racing stop()). The remote then closes on a non-0xFF frame in its window —
-    // harmless; closing that gap would need protocol knowledge in Connection.
+    // peer to Departing (e.g. a user send racing stop()). The remote then closes on a non-0xFF frame in its window;
+    // harmless: closing that gap would need protocol knowledge in Connection.
     // Joining peers are not driven by the I/O thread yet, Closing ones are being torn down. A close racing with this check
     // is harmless: Connection then reports SocketClosed.
     if (this->getState() != PeerState::Active || !this->connection) {

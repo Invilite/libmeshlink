@@ -28,7 +28,7 @@ invilite::Transport::ListenStartResult invilite::Transport::TcpServer::start() {
     // Stop server if running
     this->stop();
 
-    // Resolve the bind address first — the socket family follows from it
+    // Resolve the bind address first: the socket family follows from it
     sockaddr_storage bindAddress{};
     socklen_t        bindAddressLength = 0;
     bool             bindsEveryIpv6Interface = false;
@@ -74,7 +74,7 @@ invilite::Transport::ListenStartResult invilite::Transport::TcpServer::start() {
         return {ListenError::SocketOption, errno};
     }
 
-    // "::" also accepts IPv4 (dual stack) — the OS default for IPV6_V6ONLY differs between systems, so set it explicitly
+    // "::" also accepts IPv4 (dual stack): the OS default for IPV6_V6ONLY differs between systems, so set it explicitly
     if (bindsEveryIpv6Interface) {
         opt = 0;
         if (setsockopt(this->serverSocket, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
@@ -110,7 +110,7 @@ invilite::Transport::ListenStartResult invilite::Transport::TcpServer::start() {
 }
 
 void invilite::Transport::TcpServer::stop() {
-    // Wake the listener explicitly and wait for it — only then close the socket, so the thread never polls or
+    // Wake the listener explicitly and wait for it: only then close the socket, so the thread never polls or
     // accepts on a closed (or already reused) descriptor.
     this->stopServer = true;
     this->stopSignal.notify();
@@ -133,7 +133,7 @@ void invilite::Transport::TcpServer::serverListener() {
     };
 
     while (!this->stopServer) {
-        const int ready = Platform::waitForSockets(watched, 2, 500);                // timeout is only a safety net — stop() wakes us
+        const int ready = Platform::waitForSockets(watched, 2, 500);                // timeout is only a safety net: stop() wakes us
         if (ready < 0) {
             if (errno == EINTR) continue;
             if (this->onListenerFailureCallback) this->onListenerFailureCallback(ListenerFailure::PollFailed, errno);
@@ -141,7 +141,7 @@ void invilite::Transport::TcpServer::serverListener() {
         }
         if (ready == 0 || !(watched[0].revents & POLLIN)) continue;
 
-        // Accept everything that is pending — one readiness event may cover several connections
+        // Accept everything that is pending: one readiness event may cover several connections
         while (!this->stopServer) {
             sockaddr_storage clientAddress{};
             socklen_t clientAddressLength = sizeof(clientAddress);
@@ -160,7 +160,7 @@ void invilite::Transport::TcpServer::serverListener() {
             if (this->on_connect_callback_) {
                 this->on_connect_callback_(clientSocket, &clientAddress);
             } else {
-                close(clientSocket);                                                // nobody takes ownership — do not leak it
+                close(clientSocket);                                                // nobody takes ownership: do not leak it
             }
         }
     }

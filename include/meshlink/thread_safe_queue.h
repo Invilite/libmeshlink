@@ -12,9 +12,7 @@
 
 namespace invilite::Mesh {
 
-// Thread-safe FIFO queue with optional blocking wait and shutdown support.
-// Designed for single- and multi-producer, single-consumer use patterns,
-// but works correctly under any producer/consumer arrangement.
+// Thread-safe FIFO queue; any number of producers and consumers. waitPop blocks, so call it only from threads that may.
 template<typename T>
 class ThreadSafeQueue {
 public:
@@ -23,7 +21,7 @@ public:
     ThreadSafeQueue(const ThreadSafeQueue&)            = delete;
     ThreadSafeQueue& operator=(const ThreadSafeQueue&) = delete;
 
-    // Non-blocking push. Always succeeds (unbounded).
+    // Never blocks; the queue is unbounded.
     void push(T item) {
         {
             std::lock_guard lock(this->mutex);
@@ -32,7 +30,7 @@ public:
         this->cv.notify_one();
     }
 
-    // Non-blocking pop. Returns false if queue is empty.
+    // Never blocks; false when the queue is empty.
     bool tryPop(T& out) {
         std::lock_guard lock(this->mutex);
         if (this->queue.empty()) return false;
@@ -41,22 +39,21 @@ public:
         return true;
     }
 
-    // Blocking pop with timeout. Returns nullopt on timeout or shutdown.
+    // Blocks up to `timeout`. Returns nullopt on timeout, or on shutdown with nothing queued.
     std::optional<T> waitPop(std::chrono::milliseconds timeout) {
         std::unique_lock lock(this->mutex);
         const bool ready = this->cv.wait_for(lock, timeout, [this] {
             return !this->queue.empty() || this->shuttingDown;
         });
-        if (!ready)                                return std::nullopt;             // timeout
-        if (this->shuttingDown && this->queue.empty()) return std::nullopt;         // woken by shutdown, nothing pending
+        if (!ready)                                return std::nullopt;
+        if (this->shuttingDown && this->queue.empty()) return std::nullopt;
 
         T item = std::move(this->queue.front());
         this->queue.pop();
         return item;
     }
 
-    // Wake all waiters — they will return nullopt if queue is empty.
-    // Does not clear the queue; remaining items can still be tryPop'd.
+    // Wakes all waiters; they return nullopt once the queue is empty. Queued items stay and can still be tryPop'd.
     void shutdown() {
         {
             std::lock_guard lock(this->mutex);
@@ -65,7 +62,7 @@ public:
         this->cv.notify_all();
     }
 
-    // Accept waiters again after shutdown() — Network::start() after stop(). Leftover items are dropped.
+    // Accept waiters again after shutdown() (Network::start() after stop()). Leftover items are dropped.
     void reopen() {
         std::lock_guard lock(this->mutex);
         this->shuttingDown = false;

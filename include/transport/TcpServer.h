@@ -29,7 +29,7 @@ struct ListenStartResult {
     explicit operator bool() const { return this->error == ListenError::None; }
 };
 
-// Failure of the accept thread after a successful start() — reported through onListenerFailure, since that thread
+// Failure of the accept thread after a successful start(): reported through onListenerFailure, since that thread
 // has no caller to return an error to.
 enum class ListenerFailure : uint8_t {
     PollFailed,                                                                         // the accept loop stopped: no more inbound connections
@@ -64,7 +64,7 @@ private:
     int serverSocket;
     std::atomic<bool> stopServer = false;
     std::thread serverThread;
-    Platform::WakeupSignal stopSignal;                                                  // wakes serverListener on stop() — no reliance on shutdown() waking poll()
+    Platform::WakeupSignal stopSignal;                                                  // wakes serverListener on stop(): no reliance on shutdown() waking poll()
 
     OnConnectCallback         on_connect_callback_;
     OnListenerFailureCallback onListenerFailureCallback;

@@ -37,7 +37,7 @@ std::optional<invilite::Mesh::ConnectionSlots::Slot> invilite::Mesh::ConnectionS
 
     uint16_t& fromAddress = this->inboundByAddress[address];
     if (fromAddress >= perAddress) {
-        if (fromAddress == 0) this->inboundByAddress.erase(address);                       // only when perAddress == 0 — keep the map clean
+        if (fromAddress == 0) this->inboundByAddress.erase(address);
         return std::nullopt;
     }
 
@@ -71,5 +71,5 @@ void invilite::Mesh::ConnectionSlots::giveBack(const bool inbound, const std::st
     }
     --this->inboundTotal;
     const auto it = this->inboundByAddress.find(address);
-    if (it != this->inboundByAddress.end() && --it->second == 0) this->inboundByAddress.erase(it);   // no entry per address ever seen — bounded by live connections
+    if (it != this->inboundByAddress.end() && --it->second == 0) this->inboundByAddress.erase(it);
 }

@@ -14,7 +14,7 @@ const uint32_t NOW_SECONDS = 1'800'000'000;
 
 PeerId peerId(uint8_t fill) { PeerId id; id.fill(fill); return id; }
 
-// Network splits Group and Subtype off the frame before the Router sees it — mirror that
+// Network splits Group and Subtype off the frame before the Router sees it; mirror that.
 RoutedMessageStatus decodeFrame(const std::vector<uint8_t>& frame, RoutedMessage& out, std::chrono::system_clock::time_point now = NOW) {
     if (frame.size() < 3) return RoutedMessageStatus::MalformedEncoding;
     const uint16_t subtype = static_cast<uint16_t>(frame[1] << 8 | frame[2]);
@@ -70,8 +70,6 @@ constexpr size_t AFTER_FIXED_OFFSET  = 3 + RouterWire::FIXED_HEADER_SIZE;
 
 } // namespace
 
-// ── Round trip ──────────────────────────────────────────────────────────────
-
 TEST(RouterWireTest, RoundTripEveryModeContentAndFlagCombination) {
     const auto sender = LocalIdentity::generate();
     for (const RoutingMode mode : ALL_MODES) {
@@ -110,7 +108,6 @@ TEST(RouterWireTest, RoundTripMaximalRouteAndExtensionLengths) {
     EXPECT_EQ(roundTrip(m), m);
 }
 
-// Bit and value positions from docs/router.md 3.4
 TEST(RouterWireTest, ModeAndFlagsSitWhereTheDesignSays) {
     const auto sender = LocalIdentity::generate();
     const std::pair<RoutingMode, uint8_t> modes[] = { { RoutingMode::Flood, 0x0 }, { RoutingMode::Broadcast, 0x1 }, { RoutingMode::Routed, 0x2 }, { RoutingMode::Unicast, 0x3 } };
@@ -121,13 +118,13 @@ TEST(RouterWireTest, ModeAndFlagsSitWhereTheDesignSays) {
     RoutedMessage m = makeMessage(sender, RoutingMode::Unicast, Content::Data);
     EXPECT_EQ(RouterWire::encode(m)[FLAGS_OFFSET], 0x00);
     m.ackRequested = true;
-    EXPECT_EQ(RouterWire::encode(m)[FLAGS_OFFSET], 0x01);                                    // bit 0 ACK_REQUESTED
+    EXPECT_EQ(RouterWire::encode(m)[FLAGS_OFFSET], 0x01);
     m.ackRequested = false;
     m.extensions = { { 0x05, { 1 } } };
-    EXPECT_EQ(RouterWire::encode(m)[FLAGS_OFFSET], 0x02);                                    // bit 1 HAS_EXTENSIONS
+    EXPECT_EQ(RouterWire::encode(m)[FLAGS_OFFSET], 0x02);
 }
 
-// Overhead table in docs/router.md 3.5 (Network header + routing header, without the payload)
+// Overhead is the Network header plus the routing header, without the payload.
 TEST(RouterWireTest, EncodedOverheadMatchesDesign) {
     const auto sender = LocalIdentity::generate();
     auto overhead = [](RoutedMessage m) { m.payload.clear(); if (!m.signature.empty()) m.signature.assign(64, 0); return RouterWire::encode(m).size(); };
@@ -140,7 +137,7 @@ TEST(RouterWireTest, EncodedOverheadMatchesDesign) {
     routed.sourceRoute = SourceRoute{ 0, std::vector<PeerId>(5, peerId(0x01)) };
     EXPECT_EQ(overhead(routed), 245u);
 
-    EXPECT_EQ(RouterWire::encode(makeMessage(sender, RoutingMode::Unicast, Content::Ack)).size(), 155u);   // whole ACK frame
+    EXPECT_EQ(RouterWire::encode(makeMessage(sender, RoutingMode::Unicast, Content::Ack)).size(), 155u);
 }
 
 TEST(RouterWireTest, UnknownExtensionsAndReservedFlagBitsSurviveRoundTrip) {
@@ -186,8 +183,6 @@ TEST(RouterWireTest, RouterMessagePayloadDecodersRequireExactLength) {
     EXPECT_FALSE(RouterWire::decodeRouteErrorPayload(error, decodedError));
 }
 
-// ── Encode refuses inconsistent messages ────────────────────────────────────
-
 TEST(RouterWireTest, EncodeRefusesInconsistentMessages) {
     const auto sender = LocalIdentity::generate();
     const RoutedMessage unicast   = makeMessage(sender, RoutingMode::Unicast, Content::Data);
@@ -217,13 +212,11 @@ TEST(RouterWireTest, EncodeRefusesInconsistentMessages) {
     EXPECT_TRUE(refused(routed,    [](RoutedMessage& m) { m.sourceRoute->hops.resize(256); m.sourceRoute->nextHopIndex = 0; }));
     EXPECT_TRUE(refused(unicast,   [](RoutedMessage& m) { m.extensions = { { 1, std::vector<uint8_t>(0x10000) } }; }));
     EXPECT_TRUE(refused(unicast,   [](RoutedMessage& m) { m.extensions = { { 1, std::vector<uint8_t>(0x8000) }, { 2, std::vector<uint8_t>(0x8000) } }; }));
-    EXPECT_TRUE(refused(broadcast, [](RoutedMessage& m) { m.signature.clear(); }));             // signature required
+    EXPECT_TRUE(refused(broadcast, [](RoutedMessage& m) { m.signature.clear(); }));
     EXPECT_TRUE(refused(flood,     [](RoutedMessage& m) { m.signature.clear(); }));
     EXPECT_TRUE(refused(ack,       [](RoutedMessage& m) { m.signature.clear(); }));
     EXPECT_TRUE(refused(unicast,   [](RoutedMessage& m) { m.signature.assign(64, 0); }));       // application UNICAST data carries none
 }
-
-// ── Receive validation (docs/router.md 3.6) — each rule rejects ─────────────
 
 TEST(RouterWireTest, OnlyFramesWithRoutingHeaderAreDecoded) {
     const auto sender = LocalIdentity::generate();
@@ -280,13 +273,13 @@ TEST(RouterWireTest, RejectsTimestampOutsideWindow) {
     RoutedMessage out;
     EXPECT_EQ(decodeFrame(frame, out, NOW + 5min), RoutedMessageStatus::Success);
     EXPECT_EQ(decodeFrame(frame, out, NOW - 5min), RoutedMessageStatus::Success);
-    EXPECT_EQ(decodeFrame(frame, out, NOW + 5min + 1s), RoutedMessageStatus::TimestampOutOfWindow);   // message too old
-    EXPECT_EQ(decodeFrame(frame, out, NOW - 5min - 1s), RoutedMessageStatus::TimestampOutOfWindow);   // message from the future
+    EXPECT_EQ(decodeFrame(frame, out, NOW + 5min + 1s), RoutedMessageStatus::TimestampOutOfWindow);
+    EXPECT_EQ(decodeFrame(frame, out, NOW - 5min - 1s), RoutedMessageStatus::TimestampOutOfWindow);
 }
 
 TEST(RouterWireTest, RejectsSourceRouteIndexPastRoute) {
     auto frame = RouterWire::encode(makeMessage(LocalIdentity::generate(), RoutingMode::Routed, Content::Data));
-    const size_t indexOffset = AFTER_FIXED_OFFSET + 32 + 1;                                  // after destination and hop count (3)
+    const size_t indexOffset = AFTER_FIXED_OFFSET + 32 + 1;                                  // after destination and hop count
     RoutedMessage out;
     frame[indexOffset] = 3;
     EXPECT_EQ(decodeFrame(frame, out), RoutedMessageStatus::Success);                        // route used up, destination is next
@@ -363,13 +356,11 @@ TEST(RouterWireTest, RejectsMalformedRouterMessagePayloads) {
     RoutedMessage out;
     for (const Content content : { Content::Ack, Content::RouteError }) {
         RoutedMessage m = makeMessage(sender, RoutingMode::Unicast, content);
-        m.payload.push_back(0);                                                              // trailing byte
+        m.payload.push_back(0);
         signWith(m, sender);
         EXPECT_EQ(decodeFrame(RouterWire::encode(m), out), RoutedMessageStatus::MalformedEncoding);
     }
 }
-
-// ── Signature: [M] fields may change, [S] fields may not ────────────────────
 
 TEST(RouterWireTest, RelayMutableFieldsDoNotBreakSignature) {
     const auto sender = LocalIdentity::generate();
@@ -381,8 +372,8 @@ TEST(RouterWireTest, RelayMutableFieldsDoNotBreakSignature) {
         [](RoutedMessage& r) { r.ttlRemaining -= 1; },
         [](RoutedMessage& r) { r.sourceRoute->nextHopIndex += 1; },
         [](RoutedMessage& r) { r.extensions[1].value = { 0xBB, 0xCC }; },                   // relay replaces its per-hop SENT_TO
-        [](RoutedMessage& r) { r.extensions.erase(r.extensions.begin() + 1); },              // per-hop removed
-        [](RoutedMessage& r) { r.extensions.push_back({ 0x7A, { 1 } }); },                   // per-hop added
+        [](RoutedMessage& r) { r.extensions.erase(r.extensions.begin() + 1); },
+        [](RoutedMessage& r) { r.extensions.push_back({ 0x7A, { 1 } }); },
     };
     for (size_t i = 0; i < relayChanges.size(); ++i) {
         RoutedMessage relayed = roundTrip(m);
@@ -417,8 +408,8 @@ TEST(RouterWireTest, SignedFieldChangesBreakSignature) {
         [](RoutedMessage& r) { r.sourceRoute->hops[2][0] ^= 1; },
         [](RoutedMessage& r) { r.sourceRoute->hops.push_back(peerId(0xA4)); },
         [](RoutedMessage& r) { r.extensions[0].value[0] ^= 1; },
-        [](RoutedMessage& r) { r.extensions.erase(r.extensions.begin()); },                  // signed extension removed
-        [](RoutedMessage& r) { r.extensions.insert(r.extensions.begin(), { 0x06, { 1 } }); },  // signed extension injected
+        [](RoutedMessage& r) { r.extensions.erase(r.extensions.begin()); },
+        [](RoutedMessage& r) { r.extensions.insert(r.extensions.begin(), { 0x06, { 1 } }); },
         [](RoutedMessage& r) { r.payload.back() ^= 1; },
     };
     for (size_t i = 0; i < forgeries.size(); ++i) {
@@ -469,8 +460,6 @@ TEST(RouterWireTest, SignatureRequiredForEveryNodeModesAndRouterMessages) {
     EXPECT_FALSE(RouterWire::reachesEveryNode(RoutingMode::Unicast));
 }
 
-// ── Neighbor-only control messages (docs/router.md 3.3) ────────────────────
-
 namespace {
 std::vector<RoutedMessageKey> someKeys(size_t count) {
     std::vector<RoutedMessageKey> keys;
@@ -492,7 +481,7 @@ TEST(RouterWireTest, ControlMessagesRoundTrip) {
         ASSERT_TRUE(RouterWire::decodeIhave(payloadOf(frame), decoded));
         EXPECT_EQ(decoded, keys);
     }
-    EXPECT_EQ(RouterWire::encodeIhave(someKeys(10)).size(), 404u);                          // docs/router.md 3.5
+    EXPECT_EQ(RouterWire::encodeIhave(someKeys(10)).size(), 404u);
 
     for (const size_t count : { size_t(0), size_t(3), size_t(255) }) {
         const auto keys = someKeys(count);
@@ -522,7 +511,7 @@ TEST(RouterWireTest, ControlMessagesRoundTrip) {
 }
 
 TEST(RouterWireTest, ControlEncodersRefuseWhatDoesNotFit) {
-    EXPECT_TRUE(RouterWire::encodeIhave({}).empty());                                       // announces nothing
+    EXPECT_TRUE(RouterWire::encodeIhave({}).empty());
     EXPECT_TRUE(RouterWire::encodeIhave(someKeys(256)).empty());
     EXPECT_TRUE(RouterWire::encodeGraft(someKeys(256)).empty());
 }
@@ -571,8 +560,6 @@ TEST(RouterWireTest, EncodedSizeMatchesEncode) {
         }
     }
 }
-
-// ── Route probe (R-5 d) ─────────────────────────────────────────────────────
 
 TEST(RouterWireTest, RouteProbeAndReportPayloadsRoundTrip) {
     const RecordRoutePayload probe{ 1'800'000'000'123ULL, { { peerId(1), 3 }, { peerId(2), 9 } } };
@@ -631,7 +618,7 @@ TEST(RouterWireTest, MalformedProbeIsRejectedOnReceive) {
     EXPECT_EQ(decodeFrame(RouterWire::encode(probe), out), RoutedMessageStatus::MalformedEncoding);
 }
 
-// PRESENCE (0xFE/0x0104): the only Router message that travels to every node — signed, empty, FLOOD / BROADCAST only
+// PRESENCE (0xFE/0x0104): the only Router message that travels to every node: signed, empty, FLOOD / BROADCAST only
 TEST(RouterWireTest, PresenceTravelsToEveryNodeOnly) {
     const auto sender = LocalIdentity::generate();
     RoutedMessage presence;
@@ -661,7 +648,7 @@ TEST(RouterWireTest, PresenceTravelsToEveryNodeOnly) {
     EXPECT_EQ(decodeFrame(ack, out), RoutedMessageStatus::PresenceToOneNode);
 }
 
-// PRESENCE_REPLY carries its sender's record (2026-10-06) — or nothing, from an older node; TREE_BEACON stays empty
+// PRESENCE_REPLY carries its sender's record, or nothing from an older node; TREE_BEACON stays empty.
 TEST(RouterWireTest, PresenceReplyCarriesARecordTreeBeaconIsEmpty) {
     const auto sender = LocalIdentity::generate();
     RoutedMessage reply = makeMessage(sender, RoutingMode::Unicast, Content::Ack);
@@ -681,5 +668,5 @@ TEST(RouterWireTest, PresenceReplyCarriesARecordTreeBeaconIsEmpty) {
     EXPECT_EQ(decodeFrame(RouterWire::encode(beacon), out), RoutedMessageStatus::Success);
     beacon.payload = { 1 };
     beacon.signature = sender.sign(RouterWire::bytesToSign(beacon));
-    EXPECT_EQ(decodeFrame(RouterWire::encode(beacon), out), RoutedMessageStatus::MalformedEncoding);   // a beacon is empty
+    EXPECT_EQ(decodeFrame(RouterWire::encode(beacon), out), RoutedMessageStatus::MalformedEncoding);
 }

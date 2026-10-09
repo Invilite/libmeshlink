@@ -48,14 +48,14 @@ TEST(SignedPeerRecordCodecTest, RejectsTamperedSignature) {
 TEST(SignedPeerRecordCodecTest, RejectsAddressSwappedAfterSigning) {
     const auto identity = LocalIdentity::generate();
     auto record = makeSignedRecord(identity, { ipv4("192.0.2.10", 5000) }, std::chrono::system_clock::now());
-    record.addresses = { ipv4("198.51.100.66", 5000) };                                     // relay tries to redirect traffic
+    record.addresses = { ipv4("198.51.100.66", 5000) };
 
     SignedPeerRecord decoded;
     EXPECT_EQ(roundTrip(record, decoded), SignedRecordStatus::SignatureInvalid);
 }
 
-// Records never expire (decision 2026-10-04, roadmap B1): a node with a static address may never need to re-sign.
-// The signature only proves who may update the record; whether the address still works is decided by connecting.
+// Records never expire: a node with a static address may never need to re-sign. The signature only proves who may
+// update the record; whether the address still works is decided by connecting.
 TEST(SignedPeerRecordCodecTest, AcceptsRecordOfAnyAge) {
     const auto identity = LocalIdentity::generate();
     const auto record   = makeSignedRecord(identity, { ipv4("192.0.2.10", 5000) }, std::chrono::system_clock::now() - 2 * 365 * 24h);

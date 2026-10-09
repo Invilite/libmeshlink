@@ -1,4 +1,3 @@
-// F7-b: hole punching coordination — codec of the 0xFF PUNCH_* messages and the state machines of R and both sides
 #include <gtest/gtest.h>
 #include "meshlink/hole_punch_coordinator.h"
 #include "meshlink/hole_punch_participant.h"
@@ -30,8 +29,6 @@ HolePunchBody roundTrip(const HolePunchBody& body) {
 }
 
 } // namespace
-
-// ── codec ─────────────────────────────────────────────────────────────────────
 
 TEST(HolePunchCodecTest, EveryMessageRoundTrips) {
     const auto request = std::get<HolePunchRequest>(roundTrip(HolePunchRequest{ B, nonceOf(1) }));
@@ -88,8 +85,6 @@ TEST(HolePunchCodecTest, MalformedPayloadsAreRejected) {
     EXPECT_FALSE(HolePunchCodec::decode(0x0065, std::vector<uint8_t>(16)));
     EXPECT_TRUE(HolePunchCodec::encode(HolePunchOffer{ A, nonceOf(1), { "not-an-ip", 1 } }).payload.empty());
 }
-
-// ── coordinator (R) ───────────────────────────────────────────────────────────
 
 TEST(HolePunchCoordinatorTest, RequestBecomesOfferAndAcceptBecomesNowToBothSides) {
     HolePunchCoordinator coordinator;
@@ -173,8 +168,6 @@ TEST(HolePunchCoordinatorTest, LostNeighborEndsItsExchangesWithPeerLeft) {
     EXPECT_EQ(bodyAs<HolePunchDecline>(out[0]).reason, HolePunchDeclineReason::PeerLeft);
     EXPECT_TRUE(coordinator.onAccept(B, { nonceOf(1) }, T0).empty());
 }
-
-// ── participant (A and B) ─────────────────────────────────────────────────────
 
 TEST(HolePunchParticipantTest, FullExchangeStartsOnePunchOnEachSide) {
     HolePunchParticipant a(A), b(B);
@@ -286,8 +279,6 @@ TEST(HolePunchParticipantTest, FailedPunchesRestThePairWithGrowingPauses) {
     EXPECT_EQ(std::get<HolePunchDecline>(answer->body).reason, HolePunchDeclineReason::TooManyAttempts);
 }
 
-// ── policy ────────────────────────────────────────────────────────────────────
-
 TEST(HolePunchPolicyTest, PrivateLinksFirstThenTopologyGapFreshestRecordFirst) {
     const auto now = std::chrono::system_clock::now();
     HolePunchSituation situation;
@@ -295,19 +286,19 @@ TEST(HolePunchPolicyTest, PrivateLinksFirstThenTopologyGapFreshestRecordFirst) {
     situation.outboundTarget = 4;
     situation.candidates     = { { B, now - 1h }, { OTHER, now - 1min }, { R, now - 2h } };
 
-    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // (c): no private link yet
+    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // no private link yet
 
     situation.privateLinks           = 2;
     situation.outboundConnections    = 2;
     situation.dialableCandidatesLeft = true;
     EXPECT_FALSE(chooseHolePunchTarget(situation, 2));                             // Topology can still dial someone
     situation.dialableCandidatesLeft = false;
-    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // (a): below target, nothing dialable
+    EXPECT_EQ(chooseHolePunchTarget(situation, 2), OTHER);                         // below target, nothing dialable
     situation.outboundConnections = 4;
     EXPECT_FALSE(chooseHolePunchTarget(situation, 2));                             // target met
 
     situation.privateLinks = 0;
-    situation.behindNat    = false;                                                 // everyone can dial us — no punching
+    situation.behindNat    = false;                                                 // everyone can dial us, no punching
     EXPECT_FALSE(chooseHolePunchTarget(situation, 2));
     situation.behindNat  = true;
     situation.candidates.clear();

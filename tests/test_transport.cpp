@@ -28,7 +28,7 @@ size_t countOpenFileDescriptors() {
 }
 
 // Loopback listener whose only accept-queue slot is taken: the kernel drops further SYNs, so a connect to it hangs
-// until the caller's timeout — the one case where TcpClient really waits in poll().
+// until the caller's timeout: the one case where TcpClient really waits in poll().
 struct BlackholeListener {
     int      listener = ::socket(AF_INET, SOCK_STREAM, 0);
     int      filler   = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -87,9 +87,8 @@ void makeBlocking(int socket) { ::fcntl(socket, F_SETFL, ::fcntl(socket, F_GETFL
 
 } // namespace
 
-// R8: select() is undefined for descriptors >= FD_SETSIZE (1024) — FD_SET writes past the fd_set and corrupts memory.
-// With poll() a high-numbered socket must behave exactly like a low one: connect succeeds, and a hanging connect
-// times out cleanly.
+// select() is undefined for descriptors at or above FD_SETSIZE (1024): FD_SET writes past the fd_set and corrupts
+// memory. With poll() a high-numbered socket must behave like a low one: connect succeeds, a hanging connect times out.
 TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
     HighDescriptorFloor floor(1100);
     if (floor.held.empty() || floor.held.back() < 1100) GTEST_SKIP() << "cannot open enough descriptors (RLIMIT_NOFILE)";
@@ -115,7 +114,7 @@ TEST(TcpClientTest, WorksWithDescriptorsAboveSelectLimit) {
     listening.stop();
 }
 
-// R8: stop() wakes the listener explicitly instead of relying on shutdown() of the listening socket waking poll()
+// stop() wakes the listener explicitly instead of relying on shutdown() of the listening socket waking poll()
 // (Linux does, macOS/BSD may not). It must return promptly, not after the 500 ms safety timeout.
 TEST(TcpServerTest, StopReturnsPromptly) {
     TcpServer server("127.0.0.1", pickUnusedPort(), 16);
@@ -127,7 +126,7 @@ TEST(TcpServerTest, StopReturnsPromptly) {
     EXPECT_LT(std::chrono::steady_clock::now() - start, 250ms);
 }
 
-// R8: the epoll descriptor used to leak on every start/stop. Restarting the server must not grow the descriptor table.
+// Restarting the server must not grow the descriptor table (the epoll descriptor used to leak).
 TEST(TcpServerTest, RestartDoesNotLeakDescriptors) {
     TcpServer server("127.0.0.1", pickUnusedPort(), 16);
     ASSERT_TRUE(server.start());
@@ -167,7 +166,7 @@ TEST(TcpServerTest, DestructorStopsRunningServer) {
     SUCCEED();
 }
 
-// P7: transport no longer logs — a failed start reports what failed and the errno, the caller decides how to log it.
+// Transport does not log: a failed start reports what failed and the errno, the caller decides how to log it.
 TEST(TcpServerTest, StartOnTakenPortReportsBind) {
     const uint16_t port = pickUnusedPort();
     TcpServer first("127.0.0.1", port, 16);
@@ -204,7 +203,7 @@ TEST(TcpClientTest, ExceptionFromConnectCallbackReachesCaller) {
     EXPECT_THROW(client.connect("127.0.0.1", port, 2s), std::runtime_error);
 }
 
-// F7-a: hole punching dials from the local port of an existing connection (to the coordinating neighbor). A and B open
+// Hole punching dials from the local port of an existing connection (to the coordinating neighbor). A and B open
 // towards each other at once; both get one connection between the same two ports, and A's existing connection keeps
 // working (different four-tuple).
 TEST(TcpClientTest, SimultaneousOpenFromPortOfExistingConnection) {
@@ -247,7 +246,7 @@ TEST(TcpClientTest, SimultaneousOpenFromPortOfExistingConnection) {
     for (const int fd : { socketA, socketB, existingSocket, neighborSide, listener }) ::close(fd);
 }
 
-// A port held by a socket that did not opt into reuse cannot be borrowed — reported, not hidden
+// A port held by a socket that did not opt into reuse cannot be borrowed: reported, not hidden
 TEST(TcpClientTest, SimultaneousOpenFromPortWithoutReuseReportsBind) {
     const int holder = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address{};
@@ -267,7 +266,7 @@ TEST(TcpClientTest, SimultaneousOpenRejectsHostName) {
     EXPECT_EQ(client.connectSimultaneous(pickUnusedPort(), "localhost", 1, 1s), ConnectError::ResolveFailed);
 }
 
-// F7: keepalive is set on a real TCP socket as asked — the kernel then keeps NAT mappings of idle links alive
+// Keepalive is set on a real TCP socket as asked, so the kernel keeps NAT mappings of idle links alive
 TEST(PlatformTest, KeepaliveOptionsAreApplied) {
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_GE(listener, 0);

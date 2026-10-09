@@ -8,16 +8,9 @@
 
 namespace invilite::Mesh {
 
-    // Block SIGPIPE in the current thread.
-    // A ::write() to a pipe whose read end has been closed (e.g. during shutdown races)
-    // would otherwise raise SIGPIPE and terminate the whole process. By blocking it only
-    // within libmeshlink's threads, the host application's signal handling is unaffected.
-    //
-    // Intended to be called as the first statement of every thread body we launch
-    // (ioLoop, managementLoop, handshake workers, probe workers).
-    //
-    // TODO: consider centralising this via a small "start a Network thread" helper
-    // once the probe worker lands — by then we'll have 5+ thread-entry points.
+    // Blocks SIGPIPE in the calling thread, so a write to a closed pipe or socket cannot terminate the host process.
+    // Done per thread, so the host application's own signal handling is unaffected.
+    // Call it first in every thread body the library launches.
     inline void blockSigpipeInCurrentThread() {
         sigset_t mask;
         sigemptyset(&mask);

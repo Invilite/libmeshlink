@@ -39,7 +39,7 @@ TEST(KnownPeerEvictionTest, NeverEvictsAvailableProbingOrConnected) {
     EXPECT_EQ(chooseEvictionVictim(book, { id(3) }, true), std::nullopt);
 }
 
-// An unverified newcomer must not push out an entry that once worked — that is what a flood of fake identities would
+// An unverified newcomer must not push out an entry that once worked: that is what a flood of fake identities would
 // do. A proven newcomer may, as a last resort, and then the proven entries are ordered like the rest.
 TEST(KnownPeerEvictionTest, EverConnectedEntriesYieldOnlyToProvenRecords) {
     const std::vector<KnownPeer> book = { entry(1, AvailabilityState::Unavailable, true, 7), entry(2, AvailabilityState::Unknown, true, 0, 3h) };

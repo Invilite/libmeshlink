@@ -35,21 +35,21 @@ namespace invilite::Mesh {
 
     class Connection;
 
-    // Connection limits (roadmap R10). Soft = target, may be exceeded briefly. Hard = never exceeded.
-    // A hard limit left empty is derived from its soft limit — no "magic zero".
+    // Connection limits. Soft = target, may be exceeded briefly. Hard = never exceeded.
+    // A hard limit left empty is derived from its soft limit: no "magic zero".
     struct ConnectionLimits {
-        // Healthy number of established connections in both directions — a target, not a limit.
+        // Healthy number of established connections in both directions: a target, not a limit.
         uint16_t total = 24;
 
         struct Inbound {
-            uint16_t                soft = 16;                                          // accepted normally up to here; above → dismissed with GOODBYE(NoSlots)
-            std::optional<uint16_t> hard;                                               // above → closed right after accept(), nothing allocated; default 2 × soft
+            uint16_t                soft = 16;                                          // accepted normally up to here; above -> dismissed with GOODBYE(NoSlots)
+            std::optional<uint16_t> hard;                                               // above -> closed right after accept(), nothing allocated; default 2 x soft
             uint16_t                perAddress = 5;                                     // inbound connections (handshakes + established) from one IP
             [[nodiscard]] uint16_t effectiveHard() const { return this->hard.value_or(static_cast<uint16_t>(2 * this->soft)); }
         } inbound;
 
         struct Outbound {
-            uint16_t                min  = 2;                                           // kept even when inbound is full — we pick these ourselves (eclipse protection)
+            uint16_t                min  = 2;                                           // kept even when inbound is full: we pick these ourselves (eclipse protection)
             uint16_t                soft = 12;                                          // upper bound of Topology's target
             std::optional<uint16_t> hard;                                               // never exceeded, probes included; default soft + 3
             [[nodiscard]] uint16_t effectiveHard() const { return this->hard.value_or(static_cast<uint16_t>(this->soft + 3)); }
@@ -69,15 +69,15 @@ namespace invilite::Mesh {
         ConnectionLimits            connectionLimits;
         int                         backlog           = 16;
 
-        // PEX_ANNOUNCE — number of verified peers to share on each new connection right after HELLO.
+        // PEX_ANNOUNCE: number of verified peers to share on each new connection right after HELLO.
         // Actual batch may be smaller if our verified pool is smaller.
         uint8_t                     initialPexBatchSize = 5;
 
-        // Address book bound (R2): identities are free to mint, so gossip must not grow the book without limit. When full,
-        // a new record replaces the least valuable entry or is dropped — see chooseEvictionVictim.
+        // Address book bound: identities are free to mint, so gossip must not grow the book without limit. When full,
+        // a new record replaces the least valuable entry or is dropped: see chooseEvictionVictim.
         size_t                      maxKnownPeers       = 500;
 
-        // Periodic anti-entropy PEX tick — slow systematic gossip to fill gaps left by flood + initial exchange.
+        // Periodic anti-entropy PEX tick: slow systematic gossip to fill gaps left by flood + initial exchange.
         // At each tick, a random interval in [min, max] is picked; up to batchSize verified records with the
         // oldest lastAnnouncedAt are broadcast to all connected peers.
         uint8_t                     periodicPexBatchSize    = 3;
@@ -88,24 +88,24 @@ namespace invilite::Mesh {
         // hold; once full, sends to that peer fail with SendQueueFull. Also the largest message that can be sent.
         // Minimum 64 KB (validated in the Network constructor).
         size_t                      sendQueueLimitBytes     = Connection::defaultSendQueueLimit;
-        // TCP keepalive on every connection (roadmap F7): NAT mappings of idle links stay open, dead peers are noticed in
-        // about idle + interval × probes. 0 seconds idle = off.
+        // TCP keepalive on every connection: NAT mappings of idle links stay open, dead peers are noticed in
+        // about idle + interval x probes. 0 seconds idle = off.
         struct TcpKeepalive {
             std::chrono::seconds    idle     = std::chrono::seconds(60);
             std::chrono::seconds    interval = std::chrono::seconds(15);
             int                     probes   = 4;
         }                           tcpKeepalive;
-        // NAT hole punching (F7, docs/nat-traversal.md). Only a node behind NAT punches on its own; every node coordinates
+        // NAT hole punching. Only a node behind NAT punches on its own; every node coordinates
         // for its neighbors and answers offers.
         struct HolePunching {
             bool                    enabled         = true;                         // off: no punches of our own (requestHolePunch still works)
             uint16_t                minPrivateLinks = 2;                            // direct links to nodes nobody can dial; also the slot reserve for them
-            std::chrono::seconds    attemptInterval = std::chrono::seconds(20);     // average pause between our own attempts (0.5–1.5×, spread over the mesh)
-            // R answers SameNetwork when both sides come from one public address (docs/nat-traversal.md 6). Off only in
+            std::chrono::seconds    attemptInterval = std::chrono::seconds(20);     // average pause between our own attempts (0.5-1.5x, spread over the mesh)
+            // R answers SameNetwork when both sides come from one public address. Off only in
             // loopback tests, where every node is 127.0.0.1.
             bool                    sameNetworkShortcut = true;
         }                           holePunching;
-        // A peer whose queued frames made no progress for this long has stopped reading — its connection is closed.
+        // A peer whose queued frames made no progress for this long has stopped reading: its connection is closed.
         std::chrono::seconds        sendStallTimeout        = std::chrono::seconds(15);
 
         // After this many consecutive failed dials an Available peer becomes Unavailable and is handed to the probe,
@@ -114,7 +114,7 @@ namespace invilite::Mesh {
 
         // Probe backoff and connection attempt backoff are tracked per-peer in KnownPeer
         // (consecutiveProbeFailures + nextProbeAllowedAt, consecutiveConnectionFailures + nextConnectionAttemptAt).
-        // The schedule is shared between both — see computeBackoffInterval() in network.cpp.
+        // The schedule is shared between both: see computeBackoffInterval() in network.cpp.
     };
 
 // Internal management-protocol message (group 0xFF) consumed by the Management thread.
@@ -123,7 +123,7 @@ namespace invilite::Mesh {
         uint16_t                subtype = 0;
         std::vector<uint8_t>    payload;
         // Fact supplied by the connection layer: the remote IP we dialed when this connection is outbound, empty when
-        // the peer dialed us. Discovery uses it as reachability evidence without reaching into Peer/Connection (A1 M2).
+        // the peer dialed us. Discovery uses it as reachability evidence without reaching into Peer/Connection.
         std::string             dialedAddress;
         // The same for the other direction: the remote IP the peer connected to us from when it dialed us, empty when
         // we dialed it. Discovery uses it to tell a peer behind NAT (public source, private announced addresses).
@@ -137,12 +137,12 @@ namespace invilite::Mesh {
         FoundAnother = 0x02,  // replacing this connection with a better candidate
     };
 
-// Scheduled PEX_ANNOUNCE broadcast — drained one-per-second by the management thread.
+// Scheduled PEX_ANNOUNCE broadcast: drained one-per-second by the management thread.
 // We store PeerId (not the full record), so the drain always reads the latest version from
-// the PeerDirectory — if a newer record arrived in the meantime, we propagate the fresher one.
+// the PeerDirectory: if a newer record arrived in the meantime, we propagate the fresher one.
     struct PendingPexBroadcast {
         PeerId recordPeerId;
-        PeerId excludePeerId;                                                           // source — we never send back to where we learned it from
+        PeerId excludePeerId;                                                           // source: we never send back to where we learned it from
     };
 
     // An address book entry worth keeping across restarts: the peer's signed record and whether it ever worked for us.
@@ -152,7 +152,7 @@ namespace invilite::Mesh {
         bool                hasEverConnected = false;
     };
 
-    // Read-only snapshot for diagnostics (the Router's STATE_REPORT, docs/router.md 4.6 sections B and F). Taken from
+    // Read-only snapshot for diagnostics (the Router's STATE_REPORT). Taken from
     // several sources one after another, so the parts may differ by a moment.
     struct NetworkDiagnostics {
         struct Link {
@@ -162,15 +162,15 @@ namespace invilite::Mesh {
             uint64_t                    bytesSent      = 0;                         // application bytes, before encryption
             uint64_t                    bytesReceived  = 0;
             size_t                      sendQueueBytes = 0;                         // encrypted frames waiting for the socket
-            bool                        holePunched    = false;                     // came from NAT hole punching (F7)
+            bool                        holePunched    = false;                     // came from NAT hole punching
         };
 
-        // NAT hole punching since start (F7); without these a test on a real network says nothing
+        // NAT hole punching since start; without these a test on a real network says nothing
         struct HolePunching {
             bool                        behindNat   = false;                        // peers see us at a public address we do not announce
             size_t                      privateLinks = 0;                           // active links to peers nobody can dial
             uint64_t                    requested   = 0;                            // as A: exchanges started (PUNCH_REQUEST sent)
-            uint64_t                    declined    = 0;                            // as A: ended before NOW — declined or no answer in time
+            uint64_t                    declined    = 0;                            // as A: ended before NOW, declined or no answer in time
             uint64_t                    started     = 0;                            // as A or B: NOW received, simultaneous connect began
             uint64_t                    connected   = 0;                            // ... and ended with a verified connection
             uint64_t                    failed      = 0;                            // ... and ended without one
@@ -181,7 +181,7 @@ namespace invilite::Mesh {
         std::vector<Link>               links;                                      // Active peers only (not joining, departing or closing)
         size_t                          activeInbound      = 0;
         size_t                          activeOutbound     = 0;
-        size_t                          inboundSlotsInUse  = 0;                     // handshakes in flight + Active + Departing (R10)
+        size_t                          inboundSlotsInUse  = 0;                     // handshakes in flight + Active + Departing
         size_t                          outboundSlotsInUse = 0;                     // the same, probes included
         ConnectionLimits                limits;
         uint64_t                        inboundDismissedForNoSlots = 0;             // inbound peers sent away with GOODBYE(NoSlots) since start
@@ -199,7 +199,7 @@ namespace invilite::Mesh {
                 std::shared_ptr<std::array<uint8_t, 64>> networkSecret,
                 std::shared_ptr<PeerDirectory> peerDirectory,
                 NetworkConfig config = {},
-                std::shared_ptr<Logger> logger = {});                                   // null → default Logger (stderr, Info)
+                std::shared_ptr<Logger> logger = {});                                   // null -> default Logger (stderr, Info)
         ~Network();
 
         Network(const Network&)            = delete;
@@ -210,13 +210,13 @@ namespace invilite::Mesh {
 
         // Schedule an outbound connection to the given address. Worker thread performs TCP connect,
         // transport handshake, identity verification, and finally adds the peer to the active peer pool.
-        // Returns immediately — actual connection attempt runs asynchronously.
+        // Returns immediately: actual connection attempt runs asynchronously.
         void connectToPeer(const std::string& address, uint16_t port);
 
-        // The Logger this Network writes to — the Router defaults to the same one
+        // The Logger this Network writes to: the Router defaults to the same one
         [[nodiscard]] const std::shared_ptr<Logger>& getLogger() const { return this->log.getLogger(); }
 
-        // ── Event subscription ──────────────────────────────────────────────────────────────
+        // -- Event subscription --------------------------------------------------------------
         // Register a listener for connection lifecycle and message events. Network keeps the
         // listener alive via shared_ptr until removeListener or destruction. Safe to call
         // before or after start(). See NetworkEventListener for the threading contract.
@@ -225,7 +225,7 @@ namespace invilite::Mesh {
 
         // Send a complete frame (Group | Subtype | payload) to a connected peer. Group 0xFF belongs to Network alone and is
         // refused (-1), as is a frame shorter than the 3-byte header. Group 0xFE (Router control) is reserved for the Router
-        // by convention; the API moves to the Router in C6. Never blocks — see Network::sendFrameTo.
+        // by convention; the API will move to the Router. Never blocks: see Network::sendFrameTo.
         ssize_t sendToPeer(const PeerId& dest, const std::vector<uint8_t>& data);
         size_t  sendToAllConnected(const std::vector<uint8_t>& data);                   // same refusals; returns 0
 
@@ -238,13 +238,13 @@ namespace invilite::Mesh {
         std::vector<PeerId>             getConnectedPeers() const;
 
         // How peers we dialed see us (OBSERVED_ADDRESS), newest last, at most 8 distinct addresses. A public one we do
-        // not announce means this node is behind NAT — reachable from outside only with port forwarding.
+        // not announce means this node is behind NAT: reachable from outside only with port forwarding.
         std::vector<ObservedSelfAddress> getObservedSelfAddresses() const;
 
-        // NAT hole punching (F7, docs/nat-traversal.md): try a direct connection to `target`, a known peer nobody can dial,
+        // NAT hole punching: try a direct connection to `target`, a known peer nobody can dial,
         // through a neighbor we dialed that also has `target` as a neighbor (each such neighbor in turn until one
-        // coordinates). Asynchronous; a success shows as an ordinary onPeerConnected. Network's own policy (F7-d) decides
-        // when to punch — this is the entry point for it, diagnostics and tests. Ignored when already connected, when a
+        // coordinates). Asynchronous; a success shows as an ordinary onPeerConnected. Network's own policy decides
+        // when to punch: this is the entry point for it, diagnostics and tests. Ignored when already connected, when a
         // punch with `target` is running or the pair rests after failed punches, and from the node with the larger PeerId
         // (only the smaller one asks).
         void requestHolePunch(const PeerId& target);
@@ -254,30 +254,30 @@ namespace invilite::Mesh {
         std::vector<uint8_t>            getSelfRecord() const { return this->selfRecordSerialized; }
 
         // Returns snapshot of known peers (learned via HELLO or PEX_ANNOUNCE).
-        // Convenience wrapper over peerDirectory — equivalent to projecting `record` from each KnownPeer.
+        // Convenience wrapper over peerDirectory: equivalent to projecting `record` from each KnownPeer.
         std::vector<SignedPeerRecord>   getKnownPeers() const;
 
         // The address book to keep across restarts (every entry; bounded by maxKnownPeers)
         std::vector<RememberedPeer>     exportKnownPeers() const;
         // Before start() only (the address book is the management thread's afterwards): takes remembered peers back. Each
         // record's signature and PeerId are checked again (a file can be tampered with), our own is skipped, the address
-        // book limit (R2) applies. A peer that ever worked starts Available — Topology dials it at once; one that does not
-        // answer goes to the probe after connectionFailuresBeforeUnavailable dials (B8). Returns how many were taken.
+        // book limit applies. A peer that ever worked starts Available: Topology dials it at once; one that does not
+        // answer goes to the probe after connectionFailuresBeforeUnavailable dials. Returns how many were taken.
         size_t                          importKnownPeers(const std::vector<RememberedPeer>& peers);
 
     private:
-        // Socket options every connection gets before it carries anything (keepalive, F7)
+        // Socket options every connection gets before it carries anything (keepalive)
         void prepareConnectionSocket(int fd) const;
 
         struct Command {
             enum class Type { AddPeer };
             Type                                    type = Type::AddPeer;
             std::shared_ptr<Peer>                   peer;
-            std::optional<ConnectionSlots::Slot>    slot;                               // resources the connection holds — kept until it closes (R10)
+            std::optional<ConnectionSlots::Slot>    slot;                               // resources the connection holds: kept until it closes
         };
 
-        // Connection-layer fact handed to the management thread (I/O → Management). Replaces the old "send HELLO"
-        // queue (A1 S3): the I/O thread reports what happened, the management thread decides what to send.
+        // Connection-layer fact handed to the management thread (I/O -> Management). Replaces the old "send HELLO"
+        // queue: the I/O thread reports what happened, the management thread decides what to send.
         struct PeerLifecycleEvent {
             enum class Type { Activated, Dismissed, Closed };                          // Closed: the peer was reaped (any state)
             Type                    type = Type::Activated;
@@ -297,7 +297,7 @@ namespace invilite::Mesh {
             std::atomic<bool>       done{false};
         };
 
-        // Result of a connection attempt up to and including identity verification — dialed, accepted or punched.
+        // Result of a connection attempt up to and including identity verification: dialed, accepted or punched.
         // On Success, `connection` and `remoteIdentity` are populated; on any other result only
         // `verification` is meaningful and the caller should not touch the other fields.
         struct HandshakeResult {
@@ -309,7 +309,7 @@ namespace invilite::Mesh {
             bool                         transportFailed = false;                       // failed before identity verification (wrong network secret, scanner)
         };
 
-        // A finished punch worker's report (worker → Management)
+        // A finished punch worker's report (worker -> Management)
         struct HolePunchOutcome {
             PeerId          peer{};
             bool            connected = false;
@@ -331,10 +331,10 @@ namespace invilite::Mesh {
 
         // ===== I/O thread internals =====
         void handleWakeup();
-        // Reads and dispatches frames from one peer within a per-round budget (R5). Returns true when the budget ran out
-        // with complete frames still in the Connection's buffer — the I/O loop must come back without a poll() event.
+        // Reads and dispatches frames from one peer within a per-round budget. Returns true when the budget ran out
+        // with complete frames still in the Connection's buffer: the I/O loop must come back without a poll() event.
         bool handleConnectionReadable(int fd, short revents);
-        void handleConnectionWritable(int fd);                                          // POLLOUT — flush the peer's send queue
+        void handleConnectionWritable(int fd);                                          // POLLOUT: flush the peer's send queue
         void cleanClosedPeers();
         void parseAndDispatchFrame(const std::shared_ptr<Peer>& peer, std::vector<uint8_t> message);
 
@@ -347,7 +347,7 @@ namespace invilite::Mesh {
         void processGoodbyeMessage(const ProtocolMessage& msg);                         // subtype 0x0040
         void processObservedAddressMessage(const ProtocolMessage& msg);                 // subtype 0x0002
 
-        // ===== Discovery content (who we are, whom we know) — sent by whoever owns the moment =====
+        // ===== Discovery content (who we are, whom we know): sent by whoever owns the moment =====
         [[nodiscard]] std::vector<uint8_t> buildHelloFrame() const;                    // empty if selfRecord is missing
         [[nodiscard]] std::optional<InitialPexBatch> buildInitialPexFor(const PeerId& target) const;
         void markRecordsAnnounced(const std::vector<PeerId>& recordIds);
@@ -355,24 +355,24 @@ namespace invilite::Mesh {
         // Discovery's greeting for a peer that became Active: HELLO + initial PEX.
         void greetActivatedPeer(const std::shared_ptr<Peer>& peer, const std::string& connectedFromAddress);
 
-        // Departure window (B3), connection-layer side: the peer is already Departing. Sends the farewell (HELLO + PEX
+        // Departure window, connection-layer side: the peer is already Departing. Sends the farewell (HELLO + PEX
         // when dismissing with NoSlots, so the dismissed peer still learns where else to go), then GOODBYE, then
         // half-closes once flushed. The remote closes; the I/O thread enforces DEPARTURE_TIMEOUT.
         void sendFarewellAndDepart(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);
 
-        // Dial-side reaction to GOODBYE(NoSlots): the peer is reachable but full — growing backoff on its own counter,
-        // so it is never mistaken for failed dials (B8 would demote it). Availability is not touched.
+        // Dial-side reaction to GOODBYE(NoSlots): the peer is reachable but full, so growing backoff on its own counter,
+        // so it is never mistaken for failed dials (the failure counter would demote it). Availability is not touched.
         void recordNoSlotsRejection(const PeerId& peerId);
-        // An outbound connection that stayed Active past OUTBOUND_SETTLED_AFTER was accepted for good — the peer's
+        // An outbound connection that stayed Active past OUTBOUND_SETTLED_AFTER was accepted for good: the peer's
         // NoSlots rejection count starts over. (Not on HELLO: HELLO always precedes a GOODBYE(NoSlots).)
         void forgetNoSlotsRejectionsOfSettledPeers();
-        void sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);     // farewell path — peer must be Departing
+        void sendGoodbyeTo(const std::shared_ptr<Peer>& peer, GoodbyeReason reason);     // farewell path: peer must be Departing
         // Single path for every frame sent to a peer. Wakes the I/O thread when part of the frame stayed queued, so it
         // starts polling POLLOUT now instead of after the poll timeout.
         ssize_t sendFrameTo(const std::shared_ptr<Peer>& peer, const std::vector<uint8_t>& frame) const;
 
 
-        // Periodic anti-entropy tick — picks the N least-recently-announced verified records
+        // Periodic anti-entropy tick: picks the N least-recently-announced verified records
         // and broadcasts them to all connected peers.
         void tickPeriodicPex();
 
@@ -393,18 +393,18 @@ namespace invilite::Mesh {
         bool shouldReplaceExistingPeer(const Peer& existing, const Peer& candidate) const;
 
         // ===== Handshake workers =====
-        // Accept thread (TcpServer): admission against the inbound hard and per-address limits (R10/R1) before
+        // Accept thread (TcpServer): admission against the inbound hard and per-address limits before
         // anything is allocated for the connection.
         void onIncomingConnection(int fd, const sockaddr_storage* addr);
         void runIncomingHandshake(int fd, sockaddr_storage addr, ConnectionSlots::Slot slot, HandshakeWorker* self);
-        // Dials the addresses in order until one answers with a verified identity (F4)
+        // Dials the addresses in order until one answers with a verified identity
         void dialAddresses(std::vector<PeerAddress> addresses);
         void runOutgoingHandshake(std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self);
         void joinFinishedHandshakeWorkers();
-        void joinFinishedProbeWorkers();                                                // discovery's own workers (A1 S1)
+        void joinFinishedProbeWorkers();                                                // discovery's own workers
 
-        // ===== NAT hole punching (F7) — management thread, except the worker =====
-        void processHolePunchMessage(const ProtocolMessage& msg);                      // subtypes 0x0060–0x0064
+        // ===== NAT hole punching: management thread, except the worker =====
+        void processHolePunchMessage(const ProtocolMessage& msg);                      // subtypes 0x0060-0x0064
         void sendHolePunchMessages(const std::vector<HolePunchMessage>& messages);
         // Where a neighbor's NAT maps its connection with us: only for a neighbor that dialed us (its source port)
         [[nodiscard]] std::optional<HolePunchEndpoint> observedEndpointOf(const Peer& neighbor) const;
@@ -419,7 +419,7 @@ namespace invilite::Mesh {
         void onNeighborClosed(const PeerId& neighbor);
         void joinFinishedHolePunchWorkers();
         [[nodiscard]] std::shared_ptr<Peer> findActivePeer(const PeerId& peerId) const;
-        // Policy (F7-d, docs/nat-traversal.md 5): one punch of our own when the situation asks for it
+        // Policy: one punch of our own when the situation asks for it
         void tickHolePunchPolicy();
         [[nodiscard]] std::chrono::milliseconds pickHolePunchPolicyInterval() const;
         // Peers see us at a public address we do not announce
@@ -428,14 +428,14 @@ namespace invilite::Mesh {
         [[nodiscard]] size_t countPrivateLinks() const;
         // Outbound hard limit for a punch: the reserve for private links on top while they are below minPrivateLinks
         [[nodiscard]] uint16_t holePunchOutboundLimit() const;
-        // Topology's dial candidates (R9 backoff, F4 dialable addresses), excluding every registered peer
+        // Topology's dial candidates (dial backoff, dialable addresses), excluding every registered peer
         [[nodiscard]] std::vector<SignedPeerRecord> collectDialCandidates(const std::vector<PeerId>& registered) const;
 
         // ===== Helpers =====
         void wakeupIoThread() const;
         void markAllPeersForClose();
         void finalCleanupAllPeers();
-        // Peers visible as connected — Active only. Joining / Departing / Closing peers are invisible above this layer.
+        // Peers visible as connected: Active only. Joining / Departing / Closing peers are invisible above this layer.
         [[nodiscard]] std::vector<std::shared_ptr<Peer>> activePeersSnapshot() const;
 
         // ===== PEX =====
@@ -443,7 +443,7 @@ namespace invilite::Mesh {
         void processPexRequestMessage(const ProtocolMessage& msg);                      // subtype 0x0021
 
         // Common insert/update path for HELLO and PEX_ANNOUNCE. Returns true iff the caller
-        // should enqueue a PEX broadcast for this record — true only when the record is new,
+        // should enqueue a PEX broadcast for this record: true only when the record is new,
         // updated to a newer version, or just gained hasEverConnected, AND hasEverConnected
         // is currently true.
         bool upsertKnownPeer(SignedPeerRecord&& record, bool outboundMatch);
@@ -456,7 +456,7 @@ namespace invilite::Mesh {
         void sendPendingPexBroadcasts();
 
         // ===== Probe =====
-        // Run a peer probe — internally checks whether a probe can/should be run now (no probe
+        // Run a peer probe: internally checks whether a probe can/should be run now (no probe
         // currently in flight, at least one candidate available with elapsed nextProbeAllowedAt)
         // and launches a probe worker if all conditions are met. If nothing to do, returns silently.
         void runPeerProbe();
@@ -466,7 +466,7 @@ namespace invilite::Mesh {
         // peerDirectory. Always closes the connection before returning.
         void runProbeWorker(PeerId expected, std::vector<PeerAddress> addresses, ConnectionSlots::Slot slot, HandshakeWorker* self);
 
-        // Commit a probe's result. Only updates state if still Probing — guards against races
+        // Commit a probe's result. Only updates state if still Probing: guards against races
         // where a newer record arrived during the probe and reset the state.
         // On success also enqueues a PEX broadcast. Caller is management or probe worker thread.
         void commitProbeResult(const PeerId& expected, bool success);
@@ -478,7 +478,7 @@ namespace invilite::Mesh {
         void recordConnectionAttemptFailure(const std::string& address, uint16_t port);
 
         // Discovery's reaction to repeated failed dials reported by the connection layer: availability belongs to
-        // discovery, so the connection layer only reports the count. Demotes Available → Unavailable at the threshold.
+        // discovery, so the connection layer only reports the count. Demotes Available -> Unavailable at the threshold.
         void demoteAfterRepeatedDialFailures(const PeerId& peerId, uint8_t consecutiveFailures);
 
         // ===== Configuration (immutable after construction) =====
@@ -513,27 +513,27 @@ namespace invilite::Mesh {
         // ===== Handshake workers =====
         std::mutex                                       handshakeWorkersMutex;
         std::vector<std::unique_ptr<HandshakeWorker>>    handshakeWorkers;
-        bool                                             acceptingHandshakeWorkers = false;   // under handshakeWorkersMutex — false once stop() collects them
+        bool                                             acceptingHandshakeWorkers = false;   // under handshakeWorkersMutex: false once stop() collects them
 
-        // ===== Probe workers — discovery's own, touched only by the management thread (and stop() after it joined) =====
+        // ===== Probe workers: discovery's own, touched only by the management thread (and stop() after it joined) =====
         std::vector<std::unique_ptr<HandshakeWorker>>    probeWorkers;
 
-        // ===== Hard connection limits (R10) =====
+        // ===== Hard connection limits =====
         ConnectionSlots                                  connectionSlots;
         std::unordered_map<const Peer*, ConnectionSlots::Slot> peerSlots;               // I/O thread only: slots of registered peers, released on reap
 
         // ===== Inter-thread queues =====
-        ThreadSafeQueue<Command>                         commandQueue;                  // workers → I/O
-        ThreadSafeQueue<ProtocolMessage>                 messageProtocolQueue;          // I/O → Management (0xFF protocol)
-        ThreadSafeQueue<PeerLifecycleEvent>              peerLifecycleEvents;           // I/O → Management (peer activated / dismissed)
+        ThreadSafeQueue<Command>                         commandQueue;                  // workers -> I/O
+        ThreadSafeQueue<ProtocolMessage>                 messageProtocolQueue;          // I/O -> Management (0xFF protocol)
+        ThreadSafeQueue<PeerLifecycleEvent>              peerLifecycleEvents;           // I/O -> Management (peer activated / dismissed)
 
         // ===== Event listeners =====
-        // Subscribers for connection lifecycle and message events. Listed under shared_mutex —
+        // Subscribers for connection lifecycle and message events. Listed under shared_mutex:
         // many concurrent reads (per-event iteration) and rare writes (add/remove).
         mutable std::shared_mutex                                       listenersMutex;
         std::vector<std::shared_ptr<NetworkEventListener>>              listeners;
 
-        // ===== Connected peers — I/O thread is the ONLY writer =====
+        // ===== Connected peers: I/O thread is the ONLY writer =====
         mutable std::shared_mutex                                       peersMutex;
 
         // Discovery: how peers we dialed see us (management thread writes, getObservedSelfAddresses reads)
@@ -542,27 +542,27 @@ namespace invilite::Mesh {
         std::unordered_map<PeerId, std::shared_ptr<Peer>, PeerIDHash>   peersById;
         std::unordered_map<int,    std::shared_ptr<Peer>>               peersBySocket;
 
-        // ===== Known peers — externally owned, internally thread-safe =====
+        // ===== Known peers: externally owned, internally thread-safe =====
         // Shared with Router/MessageCrypto/NetworkMap (future) so all components see the same set.
-        // No mutex at this level — PeerDirectory locks per-operation internally.
+        // No mutex at this level: PeerDirectory locks per-operation internally.
         std::shared_ptr<PeerDirectory>                                  peerDirectory;
 
         // ===== PEX broadcast queue =====
         ThreadSafeQueue<PendingPexBroadcast>                            pexBroadcastQueue;
 
         // ===== Peer probe state =====
-        // Single probe in flight at a time — prevents flooding when many peers need probing.
+        // Single probe in flight at a time: prevents flooding when many peers need probing.
         // Per-peer cooldowns live in KnownPeer::nextProbeAllowedAt.
         std::atomic<bool>                         probeInFlight{false};
 
-        // ===== NAT hole punching (F7) — management thread only, except the two queues =====
+        // ===== NAT hole punching: management thread only, except the two queues =====
         // Fresh on every start(): exchanges of an earlier run mean nothing
         std::optional<HolePunchCoordinator>                             holePunchCoordinator;           // our role as R
         std::optional<HolePunchParticipant>                             holePunchParticipant;           // our role as A or B
         std::unordered_map<PeerId, std::vector<PeerId>, PeerIDHash>     holePunchCoordinatorsLeft;      // A: neighbors still to ask, per target
         std::vector<std::unique_ptr<HandshakeWorker>>                   holePunchWorkers;
-        ThreadSafeQueue<PeerId>                                         holePunchRequests;              // requestHolePunch (any thread) → Management
-        ThreadSafeQueue<HolePunchOutcome>                               holePunchOutcomes;              // punch workers → Management
+        ThreadSafeQueue<PeerId>                                         holePunchRequests;              // requestHolePunch (any thread) -> Management
+        ThreadSafeQueue<HolePunchOutcome>                               holePunchOutcomes;              // punch workers -> Management
         struct HolePunchCounters {                                                                    // management thread writes, diagnostics read
             std::atomic<uint64_t> requested{0}, declined{0}, started{0}, connected{0}, failed{0}, coordinated{0};
         }                                                               holePunchCounters;

@@ -11,9 +11,8 @@
 
 namespace invilite::Mesh {
 
-// Bookkeeping for the hard connection limits (roadmap R10/R1): every connection that holds resources — from accept()
-// or the start of a dial until it is closed, handshake included — holds one Slot. A Slot gives its place back in its
-// destructor, so no failure path can leak or double-release it. Pure counting: knows nothing about peers or protocol.
+// Bookkeeping for the hard connection limits: a connection holds one Slot from accept() or the start of a dial until it
+// is closed, handshake included. A Slot gives its place back in its destructor, so no failure path can leak or double-release it.
 class ConnectionSlots {
 public:
     class Slot {
@@ -32,7 +31,7 @@ public:
 
         ConnectionSlots* owner   = nullptr;                                         // nullptr = empty (moved from)
         bool             inbound = false;
-        std::string      address;                                                   // remote IP, inbound only
+        std::string      address;
     };
 
     ConnectionSlots() = default;

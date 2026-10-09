@@ -6,7 +6,6 @@
 
 using namespace invilite::Mesh;
 
-// The hard inbound limit counts every inbound connection holding resources; one more is refused until a slot returns.
 TEST(ConnectionSlotsTest, InboundHardLimitRefusesUntilSlotReturns) {
     ConnectionSlots slots;
     std::vector<ConnectionSlots::Slot> held;
@@ -18,12 +17,11 @@ TEST(ConnectionSlotsTest, InboundHardLimitRefusesUntilSlotReturns) {
     EXPECT_FALSE(slots.inboundHasRoom(3));
     EXPECT_FALSE(slots.tryTakeInbound("10.0.0.9", 3, 5).has_value());
 
-    held.pop_back();                                                                      // a connection closes
+    held.pop_back();
     EXPECT_TRUE(slots.inboundHasRoom(3));
     EXPECT_TRUE(slots.tryTakeInbound("10.0.0.9", 3, 5).has_value());
 }
 
-// One address cannot take more than perAddress slots — others still get in.
 TEST(ConnectionSlotsTest, PerAddressLimitAppliesToOneAddressOnly) {
     ConnectionSlots slots;
     std::vector<ConnectionSlots::Slot> held;
@@ -33,7 +31,7 @@ TEST(ConnectionSlotsTest, PerAddressLimitAppliesToOneAddressOnly) {
     EXPECT_TRUE(slots.tryTakeInbound("192.0.2.2", 10, 2).has_value());
 }
 
-// Slots are released exactly once on every path — destruction, move-assignment over a held slot, moved-from objects.
+// Slots are released exactly once on every path: destruction, move-assignment over a held slot, moved-from objects.
 // A leak would lock the node out after enough failures; a double release would let it exceed the hard limit.
 TEST(ConnectionSlotsTest, SlotIsReleasedExactlyOnce) {
     ConnectionSlots slots;

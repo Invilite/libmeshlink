@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# NAT hole punching (F7) end to end, on one machine, with network namespaces (needs root):
+# NAT hole punching end to end, on one machine, with network namespaces (needs root):
 #
-#         [ inet: 203.0.113.0/24 — "the Internet" ]
+#         [ inet: 203.0.113.0/24, "the Internet" ]
 #           |                 |                  |
 #      natA 203.0.113.1    R 203.0.113.10     natB 203.0.113.2
 #           |  MASQUERADE                         |  MASQUERADE
@@ -45,7 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Namespaces and links ──────────────────────────────────────────────────────
+# -- Namespaces and links ------------------------------------------------------
 for name in "${NAMESPACES[@]}"; do
     ip netns add "$(ns "$name")"
     in_ns "$name" ip link set lo up
@@ -74,7 +74,7 @@ for port in r0 a0 b0; do in_ns inet ip link set "$port" master br0; done
 
 in_ns r ip addr add 203.0.113.10/24 dev wan
 
-# A home router: LAN side, WAN side, MASQUERADE out, nothing unsolicited in (dropped, not reset — like most NATs)
+# A home router: LAN side, WAN side, MASQUERADE out, nothing unsolicited in (dropped, not reset, like most NATs)
 router() {
     local name="$1" wanAddress="$2" lan="$3" host="$4" index="$5"
     in_ns "$name" ip addr add "$wanAddress/24" dev wan
@@ -96,7 +96,7 @@ router() {
 router natA 203.0.113.1 10.1.0 hostA 4
 router natB 203.0.113.2 10.2.0 hostB 5
 
-# ── Nodes ─────────────────────────────────────────────────────────────────────
+# -- Nodes ---------------------------------------------------------------------
 for node in R A B; do mkdir -p "$WORK/$node"; done
 "$MESHLINKD" --create-network-key --state-dir "$WORK/R" >/dev/null
 cp -p "$WORK/R/network.key" "$WORK/A/network.key"
@@ -139,6 +139,6 @@ if [[ $SYMMETRIC == 0 ]]; then
     if (( punched == 1 )); then echo "PASS: A and B punched a direct link through their NATs"; exit 0; fi
     echo "FAIL: no hole punched link within ${TIMEOUT} s"; KEEP=1; exit 1
 else
-    if (( punched == 0 )) && (( links_to_r >= 2 )); then echo "PASS: symmetric NAT — no punch, both still connected through R"; exit 0; fi
-    echo "FAIL: symmetric NAT — punched=$punched, links to R=$links_to_r"; KEEP=1; exit 1
+    if (( punched == 0 )) && (( links_to_r >= 2 )); then echo "PASS: symmetric NAT: no punch, both still connected through R"; exit 0; fi
+    echo "FAIL: symmetric NAT: punched=$punched, links to R=$links_to_r"; KEEP=1; exit 1
 fi

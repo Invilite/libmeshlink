@@ -18,8 +18,7 @@ namespace invilite::Mesh {
     //       recordLen (2B BE)
     //       record    (recordLen B, = output of SignedPeerRecordCodec::serialize)
     //
-    // Used for all three PEX paths: flood (1 record), initial exchange (N records),
-    // and periodic anti-entropy tick (N records).
+    // Used for the flood (1 record), the initial exchange and the periodic anti-entropy tick (N records).
     enum class PexAnnounceStatus : int {
         Success            = 0,
         MalformedEncoding  = -1,                                                        // truncation, bad length fields, count over cap, trailing bytes
@@ -27,31 +26,27 @@ namespace invilite::Mesh {
 
     namespace PexAnnounceCodec {
 
-        // Upper bound on records per batch. Caps per-message decode cost —
-        // each record costs one Ed25519 verify, which is not free.
+        // Caps per-message decode cost: each record costs one Ed25519 verify.
         constexpr uint8_t MAX_RECORDS_PER_BATCH = 32;
 
-        // Serialize records into a PEX_ANNOUNCE payload.
-        // Records beyond MAX_RECORDS_PER_BATCH are silently truncated — caller is expected to batch responsibly.
+        // Records beyond MAX_RECORDS_PER_BATCH are silently truncated; the caller batches.
         // Records whose SignedPeerRecordCodec::serialize fails (invalid addresses) are skipped; the written
         // count reflects the number actually serialized.
         std::vector<uint8_t> serialize(const std::vector<SignedPeerRecord>& records);
 
-        // Deserialize and verify each record in the batch.
-        // Framing errors abort and return MalformedEncoding — outRecords will be empty or partial, do not use.
-        // Individual record verification failures (bad signature, future-dated timestamp) are
-        // skipped silently — invalid records simply do not appear in outRecords.
+        // Verifies each record. A framing error returns MalformedEncoding and outRecords must not be used.
+        // A record that fails verification (bad signature, future-dated timestamp) is skipped silently.
         PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<SignedPeerRecord>& outRecords);
 
     } // namespace PexAnnounceCodec
 
-    // PEX_REQUEST payload format (group 0xFF / subtype 0x0021) — "send me the records of these peers":
+    // PEX_REQUEST payload format (group 0xFF / subtype 0x0021), "send me the records of these peers":
     //
-    //   count        (1B, 1..MAX_RECORDS_PER_BATCH — the reply must fit one PEX_ANNOUNCE)
-    //   count × PeerId (32B)
+    //   count        (1B, 1..MAX_RECORDS_PER_BATCH, so the reply fits one PEX_ANNOUNCE)
+    //   count * PeerId (32B)
     //
     // The reply is an ordinary PEX_ANNOUNCE carrying the records the responder has; unknown ids are left out.
-    // Used by the Router to fetch the key of a broadcast sender it does not know yet (docs/router.md 4.1).
+    // Used by the Router to fetch the key of a broadcast sender it does not know yet.
     namespace PexRequestCodec {
 
         // Empty vector when `wanted` is empty or longer than MAX_RECORDS_PER_BATCH.

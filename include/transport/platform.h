@@ -9,7 +9,7 @@
 #include <poll.h>
 
 // Thin platform seam: every OS-specific call the library needs to drive sockets and threads lives here, so a Winsock
-// implementation (roadmap F8) replaces this one file instead of touching the rest of the library.
+// implementation replaces this one file instead of touching the rest of the library.
 // Not here yet: the socket I/O calls themselves (recv/send/sendmsg in Connection) and close() on failure paths.
 namespace invilite::Transport::Platform {
 
@@ -26,19 +26,19 @@ namespace invilite::Transport::Platform {
     bool enableKeepalive(int socket, int idleSeconds, int intervalSeconds, int probes);
 
     // Lets another socket bind to this socket's local port while it is in use (SO_REUSEADDR + SO_REUSEPORT). Set on every
-    // outgoing socket before connect: NAT hole punching (F7) later dials from the local port of an existing connection,
+    // outgoing socket before connect: NAT hole punching later dials from the local port of an existing connection,
     // and the kernel allows that only when every socket on the port opted in. Changes nothing for the connection itself;
     // the TCP four-tuple still has to be unique. False when an option is refused.
     bool allowLocalPortReuse(int socket);
 
-    // Waits for readiness on several sockets — poll() on POSIX (WSAPoll() on Windows). Same contract as poll().
+    // Waits for readiness on several sockets: poll() on POSIX (WSAPoll() on Windows). Same contract as poll().
     int waitForSockets(pollfd* sockets, size_t count, int timeoutMs);
 
     // Names a thread for debuggers and top. No-op where a thread cannot be named from outside (macOS).
     void setThreadName(std::thread& thread, const char* name);
 
     // Wakes a thread blocked in waitForSockets(): that thread polls readHandle() for POLLIN.
-    // POSIX: a non-blocking pipe (Windows will need a loopback socket pair — F8).
+    // POSIX: a non-blocking pipe (Windows will need a loopback socket pair).
     class WakeupSignal {
     public:
         WakeupSignal() = default;

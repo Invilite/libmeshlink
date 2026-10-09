@@ -57,7 +57,7 @@ void ProbeScheduler::collectDue(const PeerId& destination, const RouteTable& rou
         if (candidate.measuredAt && now - *candidate.measuredAt < interval) continue;
         due.emplace_back(candidate.measuredAt.value_or(std::chrono::steady_clock::time_point::min()), probe);
     }
-    std::sort(due.begin(), due.end(), [](const auto& a, const auto& b) { return a.first < b.first; });   // never measured, then oldest
+    std::sort(due.begin(), due.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& [at, probe] : due) out.push_back(probe);
 }
 
@@ -69,7 +69,6 @@ std::vector<ProbeScheduler::Probe> ProbeScheduler::takeDueProbes(std::chrono::st
     const auto budget = static_cast<size_t>(this->tokens);
     if (budget == 0) return {};
 
-    // Candidates in priority order: urgent, active, background — then cut to the budget
     std::vector<Probe> wanted;
     while (!this->urgent.empty() && wanted.size() < budget) {
         this->collectDue(this->urgent.front(), routes, now, std::chrono::milliseconds(0), wanted);
@@ -77,7 +76,7 @@ std::vector<ProbeScheduler::Probe> ProbeScheduler::takeDueProbes(std::chrono::st
     }
     std::vector<std::pair<std::chrono::steady_clock::time_point, PeerId>> active;
     for (const auto& [destination, at] : this->lastTrafficAt) active.emplace_back(at, destination);
-    std::sort(active.begin(), active.end(), [](const auto& a, const auto& b) { return a.first > b.first; });   // most recent traffic first
+    std::sort(active.begin(), active.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     for (const auto& [at, destination] : active) {
         if (wanted.size() >= budget) break;
         this->collectDue(destination, routes, now, this->config.activeProbeInterval, wanted);

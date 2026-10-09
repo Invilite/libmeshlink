@@ -6,7 +6,7 @@
 std::optional<invilite::Mesh::PeerId> invilite::Mesh::chooseEvictionVictim(const std::vector<KnownPeer>& entries, const std::vector<PeerId>& connected, const bool incomingRecordIsProven) {
     const KnownPeer* victim = nullptr;
 
-    // Lower key = less valuable. Tuple order is the policy order above.
+    // Lower key = less valuable; tuple order is the policy order.
     const auto evictionKey = [](const KnownPeer& entry) {
         return std::make_tuple(entry.hasEverConnected,                                  // proven entries last
                                entry.availability != AvailabilityState::Unavailable,     // Unavailable before Unknown

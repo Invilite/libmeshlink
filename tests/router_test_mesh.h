@@ -1,8 +1,8 @@
 #ifndef MESH_ROUTER_TEST_MESH_H
 #define MESH_ROUTER_TEST_MESH_H
 
-// Router test fixtures shared by the Router tests and the Plumtree simulation: real Network instances in one process over
-// loopback TCP in a declared topology, a Router with a recording listener on each.
+// Fixtures shared by the Router tests and the Plumtree simulation: real Networks over loopback TCP in a declared
+// topology, each with a Router and a recording listener.
 
 #include "meshlink/router.h"
 #include "network_test_node.h"
@@ -96,10 +96,10 @@ struct DeliveryRecorder : RouterEventListener {
     std::vector<RouteFailure>    routeFailures;
 };
 
-using Edge = std::pair<size_t, size_t>;                                                       // (dialer, listener)
+using Edge = std::pair<size_t, size_t>;
 
-// Nodes in a fixed topology: each node dials exactly its own edges (outbound soft 0, hard = its out-degree + 1 for a
-// probe), so Topology adds no connections of its own and the graph stays as declared. Every node runs a Router with a delivery recorder.
+// Each node dials exactly its own edges (dialer, listener), so Topology adds no connections and the graph stays as
+// declared.
 struct RouterMesh {
     std::shared_ptr<std::array<uint8_t, 64>>        secret = makeSecret();
     std::vector<std::unique_ptr<TestNode>>          nodes;
@@ -117,8 +117,8 @@ struct RouterMesh {
 
         for (size_t i = 0; i < count; ++i) {
             this->nodes.push_back(std::make_unique<TestNode>(this->secret, "node" + std::to_string(i), [&](NetworkConfig& c) {
-                // soft 0: Topology has no target and never dials (it would spend a slot on a gossiped node while the
-                // declared edges are still being dialed). Hard leaves one slot over: a probe holds one while it runs (R10).
+                // soft 0: Topology never dials (it would spend a slot on a gossiped node while the declared edges are still
+                // being dialed). Hard leaves one slot over for a probe.
                 c.connectionLimits.outbound = { .min = 0, .soft = 0, .hard = static_cast<uint16_t>(outDegree[i] + 1) };
                 c.periodicPexMinInterval = 600s;
                 c.periodicPexMaxInterval = 600s;
@@ -127,7 +127,7 @@ struct RouterMesh {
             this->nodes.back()->network->start();
         }
 
-        // Dial the last edges first: a node uses its outbound slots before gossip tells it about anyone else
+        // Last edges first: a node uses its outbound slots before gossip tells it about anyone else.
         for (auto it = edges.rbegin(); it != edges.rend(); ++it) {
             TestNode& dialer = *this->nodes[it->first];
             const size_t before = dialer.network->getConnectedPeerCount();
@@ -137,9 +137,10 @@ struct RouterMesh {
 
         for (size_t i = 0; i < count; ++i) {
             RouterConfig config;
-            config.announcePresence = false;                                                  // tests count traffic exactly; PRESENCE tests turn it on
-            config.treeRoot.enabled = false;                                                  // likewise: no beacons, every broadcast shapes the tree
-            config.routeEvaluation.probing.enabled = false;                                   // and no scheduled probes
+            // Presence, tree beacons and scheduled probes are off so tests count traffic exactly; tests of them turn them on.
+            config.announcePresence = false;
+            config.treeRoot.enabled = false;
+            config.routeEvaluation.probing.enabled = false;
             if (adjustRouter) adjustRouter(i, config);
             this->routers.push_back(std::make_unique<Router>(*this->nodes[i]->network, this->nodes[i]->directory, this->nodes[i]->identity, config));
             this->recorders.push_back(std::make_shared<DeliveryRecorder>());
@@ -147,8 +148,7 @@ struct RouterMesh {
             this->routers.back()->start();
         }
 
-        // Every node sees exactly its declared neighbors. Records of distant nodes are not required: gossip spreads a
-        // record only after someone dialed it successfully, so distant senders are usually verified via PEX_REQUEST.
+        // Distant nodes' records are not required: gossip spreads a record only after someone dialed it successfully.
         this->ready = waitUntil([&] {
             for (size_t i = 0; i < count; ++i) if (this->routers[i]->getNeighbors().size() != degree[i]) return false;
             return true;
@@ -163,7 +163,6 @@ struct RouterMesh {
     PeerId id(size_t i) const { return this->nodes[i]->identity->getPeerId(); }
     static PeerId peerIdOf(uint8_t fill) { PeerId id; id.fill(fill); return id; }
 
-    // Every node except `sender` delivered (sender, msgId) at least once
     bool allOthersDelivered(size_t sender, uint64_t msgId) const {
         for (size_t i = 0; i < this->nodes.size(); ++i) if (i != sender && this->recorders[i]->countOf(this->id(sender), msgId) == 0) return false;
         return true;

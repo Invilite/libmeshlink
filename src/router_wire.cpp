@@ -63,7 +63,7 @@ namespace {
         return length;
     }
 
-    // Structural consistency of a message about to be encoded — the same rules decode enforces, plus field-size limits.
+    // Structural consistency of a message about to be encoded: the same rules decode enforces, plus field-size limits.
     bool isEncodable(const RoutedMessage& message) {
         if (!carriesRoutingHeader(message.group, message.subtype))                  return false;
         if (static_cast<uint8_t>(message.mode) > HIGHEST_MODE)                      return false;
@@ -94,7 +94,7 @@ namespace {
         return out;
     }
 
-    // IHAVE / GRAFT: count(1) + count × (sender(32) + msgId(8))
+    // IHAVE / GRAFT: count(1) + count x (sender(32) + msgId(8))
     std::vector<uint8_t> encodeKeyList(uint16_t subtype, std::span<const RoutedMessageKey> keys) {
         std::vector<uint8_t> out = controlFrameHeader(subtype, 1 + keys.size() * MESSAGE_KEY_SIZE);
         out.push_back(static_cast<uint8_t>(keys.size()));
@@ -117,7 +117,7 @@ namespace {
         return true;
     }
 
-    // The payload shape of a routed Router message is part of the receive validation (3.6): a malformed ACK / ROUTE_ERROR
+    // The payload shape of a routed Router message is part of the receive validation: a malformed ACK / ROUTE_ERROR
     // is rejected before anyone acts on it. Unknown subtypes pass (a relay forwards what it does not understand).
     bool hasValidRouterMessagePayload(const RoutedMessage& message) {
         if (message.group != ROUTER_PROTOCOL_GROUP) return true;
@@ -157,11 +157,9 @@ std::vector<uint8_t> encode(const RoutedMessage& message) {
     std::vector<uint8_t> out;
     out.reserve(3 + FIXED_HEADER_SIZE + 2 * PEER_ID_SIZE + extensionsBlockLength(message) + message.signature.size() + message.payload.size());
 
-    // Layer 1 (Network)
     out.push_back(message.group);
     writeBE16(out, message.subtype);
 
-    // Fixed part
     out.push_back(versionAndModeByte(message));
     out.push_back(signedFlagsByte(message) | (message.extensions.empty() ? 0 : FLAG_HAS_EXTENSIONS));
     out.push_back(message.ttlRemaining);
@@ -170,7 +168,6 @@ std::vector<uint8_t> encode(const RoutedMessage& message) {
     writeBE32(out, message.sentAtUnixSeconds);
     out.insert(out.end(), message.sender.begin(), message.sender.end());
 
-    // Mode- and flag-dependent parts, in wire order
     if (message.destination) out.insert(out.end(), message.destination->begin(), message.destination->end());
     if (message.sourceRoute) {
         out.push_back(static_cast<uint8_t>(message.sourceRoute->hops.size()));
@@ -203,7 +200,6 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
     out.msgId             = msgId;
     out.sentAtUnixSeconds = static_cast<uint32_t>(sentAt);
 
-    // Header semantics that need no further bytes — reject early
     if ((versionAndMode >> 4) != WIRE_VERSION)                      return RoutedMessageStatus::UnsupportedVersion;
     out.mode             = static_cast<RoutingMode>(versionAndMode & 0x0F);
     out.ackRequested     = (flags & FLAG_ACK_REQUESTED) != 0;
@@ -243,7 +239,7 @@ RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint
             uint64_t valueLength = 0;
             std::span<const uint8_t> value;
             if (!blockReader.readU8(extension.type) || !blockReader.readUnsignedBE(2, valueLength) || !blockReader.readBytes(valueLength, value)) {
-                return RoutedMessageStatus::MalformedEncoding;                      // a TLV crossing the declared block end
+                return RoutedMessageStatus::MalformedEncoding;
             }
             extension.value.assign(value.begin(), value.end());
             unknownCritical |= extension.isCritical() && !isKnownExtensionType(extension.type);
@@ -307,7 +303,7 @@ bool verifySignature(const RoutedMessage& message, std::span<const uint8_t> send
         verifier.update(signedBytes.data(), signedBytes.size());
         return verifier.check_signature(message.signature.data(), message.signature.size());
     } catch (const std::exception&) {
-        return false;                                                               // malformed key
+        return false;
     }
 }
 
@@ -352,7 +348,7 @@ namespace {
         }
     }
 
-    // count(1) + count × hop, up to the end of the payload
+    // count(1) + count x hop, up to the end of the payload
     bool readRouteHops(WireReader& reader, std::vector<RouteHop>& out) {
         uint8_t count = 0;
         if (!reader.readU8(count) || reader.remaining() != count * ROUTE_HOP_SIZE) return false;

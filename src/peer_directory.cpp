@@ -6,7 +6,7 @@ namespace invilite::Mesh {
         std::shared_lock lock(this->mutex_);
         const auto it = this->peers_.find(id);
         if (it == this->peers_.end()) return std::nullopt;
-        return it->second;                                                                  // copy out under lock
+        return it->second;
     }
 
     std::vector<KnownPeer> PeerDirectory::listPeers() const {

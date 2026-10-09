@@ -36,28 +36,28 @@ namespace invilite::Transport {
         TcpClient(const TcpClient&)            = delete;
         TcpClient& operator=(const TcpClient&) = delete;
 
-        // Connect to address — accepts IPv4, IPv6, or hostname (resolved via getaddrinfo).
+        // Connect to address: accepts IPv4, IPv6, or hostname (resolved via getaddrinfo).
         // An exception thrown by the onConnect callback propagates to the caller.
         ConnectError connect(const std::string& address, int port, std::chrono::seconds timeout = std::chrono::seconds(5));
 
-        // TCP simultaneous open for NAT hole punching (F7): connects from `localPort` — the local port of an existing
-        // outgoing connection, whose NAT mapping the other side was told about — to a numeric `remoteAddress` (no DNS).
+        // TCP simultaneous open for NAT hole punching: connects from `localPort`, the local port of an existing
+        // outgoing connection, whose NAT mapping the other side was told about: to a numeric `remoteAddress` (no DNS).
         // The other side does the same towards us at about the same time; whichever SYN gets through first, both ends
         // end up with one connection. A SYN dropped by the remote NAT is retransmitted by the kernel within `timeout`.
         // The existing connection on `localPort` keeps working: the four-tuple differs. A remote host that answers
-        // with RST before its side opened yields Refused — no retry here, the caller decides.
+        // with RST before its side opened yields Refused: no retry here, the caller decides.
         ConnectError connectSimultaneous(uint16_t localPort, const std::string& remoteAddress, int remotePort, std::chrono::milliseconds timeout);
 
         // Close and release the socket. Also called automatically from destructor.
         void disconnect();
 
         // Transfer ownership of the connected socket to the caller.
-        // After this call, TcpClient no longer owns the socket — it will NOT close it
+        // After this call, TcpClient no longer owns the socket: it will NOT close it
         // on disconnect()/destructor. Returns -1 if no socket is held.
         int release();
 
         // Callback invoked once after successful connect, from within connect(); exceptions propagate out of connect().
-        // At the time of the callback the socket is still owned by TcpClient —
+        // At the time of the callback the socket is still owned by TcpClient:
         // the caller should call release() if they want to take ownership.
         void onConnect(std::function<void(int clientSocket, const sockaddr_storage* clientAddress)> cb);
 

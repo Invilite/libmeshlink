@@ -14,16 +14,16 @@
 namespace invilite::Mesh {
 
     struct HolePunchParticipantConfig {
-        std::chrono::milliseconds   exchangeTimeout = std::chrono::seconds(10);      // asked / accepted → NOW at the latest
+        std::chrono::milliseconds   exchangeTimeout = std::chrono::seconds(10);      // asked / accepted -> NOW at the latest
         std::chrono::milliseconds   punchWindow     = std::chrono::seconds(4);       // simultaneous connect after NOW (SYN retransmits at ~0, 1, 3 s)
         // Rest for a pair after consecutive failed punches, the last step repeating: a symmetric NAT or CGNAT rarely
-        // changes, but sometimes does — the pair is checked again after a while, never written off
+        // changes, but sometimes does, so the pair is checked again after a while, never written off
         std::vector<std::chrono::seconds> failureRest = { std::chrono::seconds(30), std::chrono::seconds(60), std::chrono::seconds(120),
                                                           std::chrono::seconds(300), std::chrono::seconds(600), std::chrono::seconds(1800) };
     };
 
     // Only the node with the smaller PeerId asks for a punch, so the asking side is always the handshake initiator once
-    // TCP is up — whether the socket came from connect() or (rarely) from accept()
+    // TCP is up, whether the socket came from connect() or (rarely) from accept()
     [[nodiscard]] inline bool holePunchInitiatesHandshake(const PeerId& self, const PeerId& peer) { return self < peer; }
 
     // A punch to start now: connect from the local port of our connection with `via` to `remoteEndpoint`
@@ -42,9 +42,9 @@ namespace invilite::Mesh {
         std::optional<HolePunchDeclineReason>   reason;
     };
 
-    // Both punching sides (docs/nat-traversal.md 4): A asks a common neighbor, B answers its offer, both start on NOW.
+    // Both punching sides: A asks a common neighbor, B answers its offer, both start on NOW.
     // A NOW starts nothing unless it names an exchange agreed with that same neighbor, and only once. At most one exchange
-    // per peer. A pair whose punches failed rests (failureRest): A does not ask, B declines with TooManyAttempts. Decides only — Network sends the messages, checks slots and existing connections, runs the punch.
+    // per peer. A pair whose punches failed rests (failureRest): A does not ask, B declines with TooManyAttempts. Decides only: Network sends the messages, checks slots and existing connections, runs the punch.
     // Not thread-safe: owned by the Management thread. Time comes in as `now`; the nonce is drawn by the caller.
     class HolePunchParticipant {
     public:
@@ -59,7 +59,7 @@ namespace invilite::Mesh {
         std::optional<HolePunchMessage> onOffer(const PeerId& from, const HolePunchOffer& offer, std::optional<HolePunchDeclineReason> localObstacle,
                                                 std::chrono::steady_clock::time_point now);
 
-        // Both: PUNCH_NOW from `from` — the punch to start, at most once per exchange
+        // Both: PUNCH_NOW from `from`: the punch to start, at most once per exchange
         std::optional<HolePunchStart> onNow(const PeerId& from, const HolePunchNow& message, std::chrono::steady_clock::time_point now);
 
         // Both: PUNCH_DECLINE from `from` ends its exchange

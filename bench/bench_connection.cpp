@@ -1,5 +1,5 @@
 // Frame throughput of Connection: pure frame crypto (encrypt on one side, decrypt on the other) and the full
-// send() → socket → receive() path over loopback. Build: make bench; run: ./run_bench
+// send() -> socket -> receive() path over loopback. Build: make bench; run: ./run_bench
 #include "meshlink/connection.h"
 
 #include <arpa/inet.h>
@@ -86,14 +86,14 @@ void measureEndToEnd(Pair& pair, size_t payloadSize, size_t frames) {
     });
     for (size_t sent = 0; sent < frames; ) {
         if (pair.client->send(&payload) > 0) ++sent;
-        else pair.client->drainSendQueue(milliseconds(100));                             // queue full — let the socket catch up
+        else pair.client->drainSendQueue(milliseconds(100));                             // queue full: let the socket catch up
         if (pair.client->hasQueuedFrames()) pair.client->writeQueuedFrames();
     }
     pair.client->drainSendQueue(seconds(10));
     reader.join();
     const double seconds = duration<double>(steady_clock::now() - start).count();
     const double cpu     = cpuSeconds() - cpuStart;
-    std::printf("send→recv  %6zu B  %8.0f ns/frame  %8.1f MB/s  cpu %6.0f ns/frame\n", payloadSize, seconds * 1e9 / static_cast<double>(frames),
+    std::printf("send->recv %6zu B  %8.0f ns/frame  %8.1f MB/s  cpu %6.0f ns/frame\n", payloadSize, seconds * 1e9 / static_cast<double>(frames),
                 static_cast<double>(payloadSize * frames) / seconds / 1e6, cpu * 1e9 / static_cast<double>(frames));
 }
 

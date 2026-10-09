@@ -1,4 +1,4 @@
-// F7-c: NAT hole punching through Network — two nodes nobody can dial meet through their common neighbor R.
+// NAT hole punching through Network: two nodes nobody can dial meet through their common neighbor R.
 // On loopback a SYN that arrives before the other side opened would get RST, so the test drops early SYNs the way a NAT
 // does (SynBlackhole on the ports A and B use towards R). Network logs to stderr; run `./run_test 2>/dev/null`.
 #include <gtest/gtest.h>
@@ -20,17 +20,17 @@ using namespace std::chrono_literals;
 
 namespace {
 
-// Local ports of established IPv4 connections to `remotePort` (from /proc/net/tcp — the dialers' side of them)
+// Local ports of established IPv4 connections to `remotePort`, read from /proc/net/tcp
 std::vector<uint16_t> localPortsConnectedTo(uint16_t remotePort) {
     std::ifstream table("/proc/net/tcp");
     std::string   line;
-    std::getline(table, line);                                                      // header
+    std::getline(table, line);
     std::vector<uint16_t> ports;
     while (std::getline(table, line)) {
         std::istringstream fields(line);
         std::string slot, local, remote, state;
         fields >> slot >> local >> remote >> state;
-        if (state != "01") continue;                                                // ESTABLISHED
+        if (state != "01") continue;
         const auto portOf = [](const std::string& endpoint) { return static_cast<uint16_t>(std::stoul(endpoint.substr(endpoint.find(':') + 1), nullptr, 16)); };
         if (portOf(remote) == remotePort) ports.push_back(portOf(local));
     }
@@ -47,17 +47,16 @@ struct MessageCounter : NetworkEventListener {
     std::atomic<int> received{0};
 };
 
-// Nodes "behind NAT": they announce nothing, so nobody dials them and they never dial each other
 void announceNothing(NetworkConfig& config) { config.announcedAddresses.clear(); }
 
 } // namespace
 
 TEST(HolePunchNetworkTest, TwoNodesNobodyCanDialConnectDirectlyThroughCommonNeighbor) {
     const auto secret = makeSecret();
-    // On loopback every node is 127.0.0.1 — R would take the pair for one LAN (SameNetwork) without this
+    // On loopback every node is 127.0.0.1, so without this R would take the pair for one LAN
     TestNode coordinator(secret, "R", [](NetworkConfig& config) { config.holePunching.sameNetworkShortcut = false; });
     TestNode first(secret, "first", announceNothing), second(secret, "second", announceNothing);
-    TestNode& smaller = first.identity->getPeerId() < second.identity->getPeerId() ? first : second;   // only the smaller asks
+    TestNode& smaller = first.identity->getPeerId() < second.identity->getPeerId() ? first : second;
     TestNode& larger  = &smaller == &first ? second : first;
     const auto messagesAtLarger = std::make_shared<MessageCounter>();
     larger.network->addListener(messagesAtLarger);
@@ -84,8 +83,7 @@ TEST(HolePunchNetworkTest, TwoNodesNobodyCanDialConnectDirectlyThroughCommonNeig
     EXPECT_TRUE(isConnectedTo(smaller, coordinator));
     EXPECT_TRUE(isConnectedTo(larger, coordinator));
 
-    // Counters for a real network test (F7-d): R coordinated once, both sides started and connected, the link is marked
-    // (the management thread counts a punch when it collects the worker's outcome — just after the peer is registered)
+    // The management thread counts a punch when it collects the worker's outcome, just after the peer is registered
     ASSERT_TRUE(waitUntil([&] { return smaller.network->getDiagnostics().holePunching.connected == 1 && larger.network->getDiagnostics().holePunching.connected == 1; }, 2s));
     const auto atSmaller = smaller.network->getDiagnostics().holePunching;
     const auto atLarger  = larger.network->getDiagnostics().holePunching;
@@ -114,7 +112,7 @@ TEST(HolePunchNetworkTest, WithoutCommonNeighborThePairRests) {
 
     coordinator.network->start();
     asking.network->start();
-    asking.network->connectToPeer("127.0.0.1", coordinator.port);                  // the target is nobody's neighbor
+    asking.network->connectToPeer("127.0.0.1", coordinator.port);
     ASSERT_TRUE(waitUntil([&] { return coordinator.network->getConnectedPeerCount() == 1; }, 5s));
 
     asking.network->requestHolePunch(target.identity->getPeerId());

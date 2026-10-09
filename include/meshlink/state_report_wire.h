@@ -12,7 +12,7 @@
 
 namespace invilite::Mesh {
 
-    // Payloads of STATE_QUERY / STATE_REPORT (Group 0xFE / 0x0106–0x0107, docs/router.md 4.6): "show me your state" for
+    // Payloads of STATE_QUERY / STATE_REPORT (Group 0xFE / 0x0106-0x0107): "show me your state" for
     // diagnostics and `meshlink map`. Pure codec, no threads; the Router fills the report and carries it as a signed
     // routed message.
     //
@@ -64,7 +64,7 @@ namespace invilite::Mesh {
             MissingMessagesTracked  = 0x010B,
             EagerLinks              = 0x010C,
             LazyLinks               = 0x010D,
-            // 0x010E: was PinnedLinks (link pinning, withdrawn for the tree root) — not reused
+            // 0x010E: retired id, never reuse
             // E. Delivery
             FullMessagesSent        = 0x0200,
             Delivered               = 0x0201,
@@ -117,7 +117,7 @@ namespace invilite::Mesh {
             uint8_t     protocolVersion       = 0;
             uint64_t    uptimeMs              = 0;                                  // counters are since the start: a restart resets them
             uint64_t    unixTimeMs            = 0;                                  // the node's clock when it wrote the report
-            uint64_t    clockWindowRejections = 0;                                  // messages dropped for a timestamp outside ±5 min
+            uint64_t    clockWindowRejections = 0;                                  // messages dropped for a timestamp outside +/-5 min
             std::optional<PeerId> treeRoot;                                         // whom it takes for the broadcast tree root (itself when it is)
 
             bool operator==(const NodeState&) const = default;
@@ -131,7 +131,7 @@ namespace invilite::Mesh {
             uint64_t    bytesSent        = 0;
             uint64_t    bytesReceived    = 0;
             uint32_t    sendQueueBytes   = 0;
-            bool        holePunched      = false;                                   // the link came from NAT hole punching (F7); older nodes never set it
+            bool        holePunched      = false;                                   // the link came from NAT hole punching; older nodes never set it
 
             bool operator==(const NeighborState&) const = default;
         };

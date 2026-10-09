@@ -43,8 +43,8 @@ TEST(TopologyPlannerTest, DialsCandidateWhenBelowOutboundTarget) {
     const auto decision  = TopologyPlanner{}.evaluate(outboundPeers(1), { candidate }, config);
 
     ASSERT_TRUE(decision.connectTo.has_value());
-    EXPECT_EQ(decision.connectTo->peerId, candidate.peerId);                                 // the caller tracks the attempt per peer (R9)
-    EXPECT_EQ(decision.connectTo->addresses, candidate.addresses);                         // all of them, tried in order (F4)
+    EXPECT_EQ(decision.connectTo->peerId, candidate.peerId);
+    EXPECT_EQ(decision.connectTo->addresses, candidate.addresses);                         // all of them, tried in order
     EXPECT_EQ(decision.nextTick, 3s);
 }
 
@@ -87,7 +87,7 @@ TEST(TopologyPlannerTest, NeverRequestsDisconnectYet) {
     EXPECT_FALSE(decision.disconnect.has_value());
 }
 
-// R10: the outbound target is what inbound does not cover of the healthy total, clamped to [min, soft].
+// The outbound target is what inbound does not cover of the healthy total, clamped to [min, soft].
 // A public node with plenty of inbound needs only the minimum of self-chosen outbound connections.
 TEST(TopologyPlannerTest, PublicNodeWithManyInboundKeepsOnlyMinimumOutbound) {
     NetworkConfig config;
@@ -110,7 +110,7 @@ TEST(TopologyPlannerTest, NodeWithoutInboundDialsUpToSoftLimit) {
     EXPECT_FALSE(TopologyPlanner{}.evaluate(outboundPeers(12), candidates, config).connectTo.has_value());
 }
 
-// ...and inbound above the total never pushes the target below min — an attacker filling our inbound slots must not
+// ...and inbound above the total never pushes the target below min: an attacker filling our inbound slots must not
 // leave us with only connections it chose (eclipse).
 TEST(TopologyPlannerTest, InboundAboveTotalStillKeepsMinimumOutbound) {
     NetworkConfig config;

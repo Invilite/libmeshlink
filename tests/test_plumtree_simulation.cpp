@@ -1,11 +1,10 @@
-// SIM (docs/router.md 6): Plumtree with the tree root (docs/router.md 4.3, "Korzeń drzewa") in meshes of different sizes
-// and shapes, several senders at once. Only the root's wave shapes the shared tree, so it must settle to a spanning tree
-// — every broadcast, from any sender, N − 1 full copies, no GRAFT and no PRUNE — and stay settled; when the root goes
-// away or two parts of the network join, the next smallest node id takes over and the tree settles again.
-// Real Network instances over loopback: there is no link latency, so the latency-driven tree optimization is barely
-// exercised. Beacons every 300 ms instead of 10 s, so a run takes seconds.
-// Network and Router log to stderr; run `./run_test 2>/dev/null` for quiet output. The whole matrix (up to 60 nodes,
-// five topologies) is DISABLED_ — run it with --gtest_also_run_disabled_tests --gtest_filter='*PlumtreeSimulation*'.
+// Plumtree with a tree root in meshes of different sizes and shapes, several senders at once. Only the root's wave
+// shapes the shared tree, so it must settle to a spanning tree (every broadcast costs N - 1 full copies, no GRAFT, no
+// PRUNE) and stay settled; when the root goes away or two parts join, the next smallest node id takes over.
+// Loopback has no link latency, so the latency-driven tree optimization is barely exercised. Beacons every 300 ms
+// instead of 10 s, so a run takes seconds. Network and Router log to stderr; run `./run_test 2>/dev/null` for quiet
+// output. The whole matrix (up to 60 nodes, five topologies) is DISABLED_: run it with
+// --gtest_also_run_disabled_tests --gtest_filter='*PlumtreeSimulation*'.
 #include <gtest/gtest.h>
 #include "router_test_mesh.h"
 
@@ -23,10 +22,8 @@ namespace {
 
 constexpr size_t SENDERS        = 5;
 constexpr size_t ROUNDS         = 8;
-constexpr size_t SETTLED_ROUNDS = 3;                                                          // the last rounds must cost exactly a tree
+constexpr size_t SETTLED_ROUNDS = 3;
 constexpr auto   BEACON_INTERVAL = 300ms;
-
-// ── Topologies: every edge once, as (dialer, listener) ─────────────────────────────────────────────────────────────
 
 void addEdge(std::set<std::pair<size_t, size_t>>& edges, size_t a, size_t b) {
     if (a != b) edges.insert({ std::min(a, b), std::max(a, b) });
@@ -34,7 +31,6 @@ void addEdge(std::set<std::pair<size_t, size_t>>& edges, size_t a, size_t b) {
 
 std::vector<Edge> toEdges(const std::set<std::pair<size_t, size_t>>& edges) { return { edges.begin(), edges.end() }; }
 
-// A ring (connected) with random chords: average degree about 4
 std::vector<Edge> randomMesh(size_t count, uint32_t seed) {
     std::mt19937 random(seed);
     std::set<std::pair<size_t, size_t>> edges;
@@ -44,7 +40,6 @@ std::vector<Edge> randomMesh(size_t count, uint32_t seed) {
     return toEdges(edges);
 }
 
-// Each node linked to its nearest and second-nearest ring neighbor, a tenth of the second links rewired to random nodes
 std::vector<Edge> smallWorld(size_t count, uint32_t seed) {
     std::mt19937 random(seed);
     std::set<std::pair<size_t, size_t>> edges;
@@ -57,7 +52,7 @@ std::vector<Edge> smallWorld(size_t count, uint32_t seed) {
     return toEdges(edges);
 }
 
-// Two random halves; `bridged` joins them by a single link (0 – half)
+// Two random halves; `bridged` joins them by a single link (0 to half)
 std::vector<Edge> twoClusters(size_t count, uint32_t seed, bool bridged) {
     std::mt19937 random(seed);
     std::set<std::pair<size_t, size_t>> edges;
@@ -74,7 +69,6 @@ std::vector<Edge> twoClusters(size_t count, uint32_t seed, bool bridged) {
 
 std::vector<Edge> twoClustersBridged(size_t count, uint32_t seed) { return twoClusters(count, seed, true); }
 
-// A ring where every other node also links to the one a quarter of the way round: long cycles of several lengths
 std::vector<Edge> ringWithLongChords(size_t count, uint32_t) {
     std::set<std::pair<size_t, size_t>> edges;
     for (size_t i = 0; i < count; ++i) {
@@ -107,8 +101,6 @@ const Topology TWO_CLUSTERS{ "two clusters + bridge", twoClustersBridged };
 const Topology LONG_CHORDS{ "ring + long chords", ringWithLongChords };
 const Topology GRID{ "grid", grid };
 
-// ── Measuring ──────────────────────────────────────────────────────────────────────────────────────────────────────
-
 struct Totals {
     uint64_t fullCopies = 0;
     uint64_t grafts = 0;
@@ -132,7 +124,7 @@ Totals totals(const RouterMesh& mesh, const std::set<size_t>& live) {
 
 struct RoundCost {
     uint64_t fullCopies = 0;
-    uint64_t expectedForTree = 0;                                                            // (messages + beacons) × (live nodes − 1)
+    uint64_t expectedForTree = 0;
     uint64_t grafts = 0;
     uint64_t graftsForMissing = 0;
     uint64_t prunes = 0;
@@ -157,14 +149,12 @@ std::set<size_t> nodesUpTo(size_t count) {
     return nodes;
 }
 
-// The node every live node must agree on: the smallest PeerId
 size_t smallestIdNode(const RouterMesh& mesh, const std::set<size_t>& among) {
     size_t smallest = *among.begin();
     for (size_t i : among) if (mesh.id(i) < mesh.id(smallest)) smallest = i;
     return smallest;
 }
 
-// Waits until every node in `among` sees the smallest id among them as the tree root; returns how long it took
 std::optional<std::chrono::milliseconds> awaitRootAgreement(const RouterMesh& mesh, const std::set<size_t>& among) {
     const PeerId root = mesh.id(smallestIdNode(mesh, among));
     const auto start = std::chrono::steady_clock::now();
@@ -176,7 +166,7 @@ std::optional<std::chrono::milliseconds> awaitRootAgreement(const RouterMesh& me
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
 }
 
-// Rounds of simultaneous broadcasts from SENDERS live nodes; every message must reach every other live node exactly once
+// Rounds of simultaneous broadcasts from SENDERS live nodes; every message must reach every other live node once.
 std::vector<RoundCost> runRounds(RouterMesh& mesh, const std::string& label, const std::set<size_t>& live, size_t roundCount) {
     const std::vector<size_t> liveNodes(live.begin(), live.end());
     std::vector<size_t> senders;
@@ -193,7 +183,7 @@ std::vector<RoundCost> runRounds(RouterMesh& mesh, const std::string& label, con
                 return true;
             }, 10s)) << label << ": round " << round << ", sender " << sender;
         }
-        std::this_thread::sleep_for(700ms);                                                    // IHAVE batches, GRAFT timers, PRUNEs settle
+        std::this_thread::sleep_for(700ms);
         for (const auto& [sender, msgId] : sent) {
             for (size_t node : live) {
                 if (node == sender) continue;
@@ -214,14 +204,14 @@ size_t claimers(const RouterMesh& mesh, const std::set<size_t>& live) {
 }
 
 void report(const std::string& label, const std::vector<RoundCost>& rounds, std::chrono::milliseconds agreedAfter, size_t claimed) {
-    std::cout << "[ SIM      ] " << label << ": root agreed after " << agreedAfter.count() << " ms, " << claimed
+    std::cout << "[ plumtree ] " << label << ": root agreed after " << agreedAfter.count() << " ms, " << claimed
               << " node(s) ever claimed it; per round full copies (a tree) / GRAFT (for missing) / PRUNE:";
     for (const RoundCost& cost : rounds) std::cout << "  " << cost.fullCopies << " (" << cost.expectedForTree << ")/" << cost.grafts << " (" << cost.graftsForMissing << ")/" << cost.prunes;
     std::cout << std::endl;
 }
 
-// Copies are compared over the settled rounds together, within one beacon's copies: a beacon (every 300 ms) can be half
-// way through the network when a measurement starts or ends. No GRAFT and no PRUNE is the strict part.
+// Copies are compared over the settled rounds together, within one beacon's copies, because a beacon can be halfway
+// through the network when a measurement starts or ends. No GRAFT and no PRUNE is the strict part.
 void expectSettledTree(const std::vector<RoundCost>& rounds, const std::string& label, size_t liveNodes) {
     uint64_t copies = 0, expected = 0;
     for (size_t round = rounds.size() - SETTLED_ROUNDS; round < rounds.size(); ++round) {
@@ -235,7 +225,7 @@ void expectSettledTree(const std::vector<RoundCost>& rounds, const std::string& 
     EXPECT_GE(copies + oneBeacon, expected) << label;
 }
 
-// Connected parts of the declared graph among `live` nodes — removing the root can split it (a bridge end)
+// Connected parts of the declared graph among `live` nodes; removing the root can split it.
 std::vector<std::set<size_t>> connectedParts(const std::vector<Edge>& edges, const std::set<size_t>& live) {
     std::vector<std::set<size_t>> parts;
     std::set<size_t> placed;
@@ -259,7 +249,6 @@ std::vector<std::set<size_t>> connectedParts(const std::vector<Edge>& edges, con
 
 std::string labelOf(const Topology& topology, size_t nodes) { return std::string(topology.name) + ", " + std::to_string(nodes) + " nodes"; }
 
-// Root agreed, then broadcasts from several senders settle to a spanning tree
 void simulateSettling(const Topology& topology, size_t nodeCount, uint32_t seed) {
     const std::string label = labelOf(topology, nodeCount);
     RouterMesh mesh(nodeCount, topology.make(nodeCount, seed), withTreeRoot, adjustNetwork);
@@ -300,7 +289,7 @@ void simulateRootLoss(const Topology& topology, size_t nodeCount, uint32_t seed)
     expectSettledTree(rounds, label, largest.size());
 }
 
-// Two parts with a root each join by one link: the smaller root wins everywhere, the tree settles across both
+// Two parts with a root each join by one link: the smaller root wins everywhere.
 void simulateMerge(size_t nodeCount, uint32_t seed) {
     const std::string label = "two parts joined later, " + std::to_string(nodeCount) + " nodes";
     RouterMesh mesh(nodeCount, twoClusters(nodeCount, seed, false), withTreeRoot, adjustNetwork);
@@ -323,15 +312,11 @@ void simulateMerge(size_t nodeCount, uint32_t seed) {
 
 } // namespace
 
-// ── In the regular suite: 30 nodes, three shapes, root loss, merge ─────────────────────────────────────────────────
-
 TEST(PlumtreeSimulationTest, RandomMeshSettlesToTreeWithManySenders)     { simulateSettling(RANDOM_MESH, 30, 7); }
 TEST(PlumtreeSimulationTest, SmallWorldSettlesToTreeWithManySenders)     { simulateSettling(SMALL_WORLD, 30, 11); }
 TEST(PlumtreeSimulationTest, BridgedClustersSettleToTreeWithManySenders) { simulateSettling(TWO_CLUSTERS, 30, 13); }
 TEST(PlumtreeSimulationTest, NextSmallestNodeTakesOverWhenRootStops)     { simulateRootLoss(RANDOM_MESH, 30, 7); }
 TEST(PlumtreeSimulationTest, JoinedPartsAgreeOnSmallerRoot)              { simulateMerge(30, 17); }
-
-// ── The whole matrix (slow): sizes × shapes ────────────────────────────────────────────────────────────────────────
 
 class PlumtreeSimulationMatrix : public testing::TestWithParam<std::tuple<size_t, Topology>> {};
 

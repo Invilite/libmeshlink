@@ -28,7 +28,6 @@ StateReport fullReport() {
     return report;
 }
 
-// Appends one raw section to an encoded report
 void appendSection(std::vector<uint8_t>& payload, uint8_t type, const std::vector<uint8_t>& value) {
     payload.push_back(type);
     for (int shift = 24; shift >= 0; shift -= 8) payload.push_back(static_cast<uint8_t>(value.size() >> shift));

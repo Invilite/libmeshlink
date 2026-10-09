@@ -1,4 +1,3 @@
-// P7: Network logs through the injected Logger with syslog levels (docs/logging.md 3.3).
 #include <gtest/gtest.h>
 #include "network_test_node.h"
 #include "collecting_log_sink.h"
@@ -7,7 +6,7 @@ using namespace invilite::Mesh;
 using namespace invilite::Mesh::TestHelpers;
 using namespace std::chrono_literals;
 
-// The failed dial was lost among info messages on the first real network — it must stand out as a warning
+// The failed dial was lost among info messages on the first real network, so it must stand out as a warning
 TEST(NetworkLoggingTest, FailedDialIsLoggedAsWarning) {
     auto sink   = std::make_shared<CollectingLogSink>();
     auto secret = makeSecret();

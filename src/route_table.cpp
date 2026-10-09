@@ -12,7 +12,7 @@ RouteTier RouteCandidate::tier() const {
 }
 
 namespace {
-    // docs/router.md 4.4a: measured (by RTT), delivered, hinted (by hops, then freshness), failing (by failures)
+    // Order: measured (by RTT), delivered, hinted (by hops, then freshness), failing (by failures).
     bool isBetter(const RouteCandidate& a, const RouteCandidate& b) {
         if (a.tier() != b.tier()) return a.tier() < b.tier();
         switch (a.tier()) {
@@ -43,7 +43,7 @@ RouteTable::Destination* RouteTable::touch(const PeerId& destination, bool creat
         this->leastRecentFirst.push_back(destination);
         found = this->byDestination.emplace(destination, Destination{ {}, std::prev(this->leastRecentFirst.end()) }).first;
     } else {
-        this->leastRecentFirst.splice(this->leastRecentFirst.end(), this->leastRecentFirst, found->second.recency);   // heard of it now
+        this->leastRecentFirst.splice(this->leastRecentFirst.end(), this->leastRecentFirst, found->second.recency);
     }
     return &found->second;
 }
@@ -51,7 +51,7 @@ RouteTable::Destination* RouteTable::touch(const PeerId& destination, bool creat
 bool RouteTable::admit(Destination& entry, const RouteCandidate& fresh) {
     if (this->config.candidatesPerDestination == 0) return false;
     if (entry.candidates.size() >= this->config.candidatesPerDestination) {
-        if (!isBetter(fresh, entry.candidates.back())) return false;                 // the known ones are all at least as good
+        if (!isBetter(fresh, entry.candidates.back())) return false;
         entry.candidates.pop_back();
     }
     entry.candidates.push_back(fresh);
@@ -63,7 +63,7 @@ void RouteTable::learn(const PeerId& destination, const PeerId& via, uint8_t hop
     Destination* entry = this->touch(destination, true);
     if (!entry) return;
     if (const auto existing = findVia(entry->candidates, via); existing != entry->candidates.end()) {
-        // A hint's hop count is unsigned (a relay can lower it): it never rewrites what a probe recorded (review R-5 M1)
+        // A hint's hop count is unauthenticated (a relay can lower it), so it never overwrites what a probe recorded.
         if (!existing->rtt) existing->hops = hops;
         existing->lastHeardAt = now;
     } else if (!this->admit(*entry, RouteCandidate{ via, hops, now }) && entry->candidates.empty()) {
@@ -98,7 +98,7 @@ void RouteTable::recordMeasurement(const PeerId& destination, const PeerId& via,
     } else {
         existing->rtt = existing->rtt ? smoothed(*existing->rtt, rtt) : rtt;
     }
-    existing->hops       = hops;                                                    // as the probe recorded it — better than a TTL hint
+    existing->hops       = hops;                                                    // as the probe recorded it, which is better than a TTL hint
     existing->measuredAt = now;
     existing->failures   = 0;
     existing->lastHeardAt = now;

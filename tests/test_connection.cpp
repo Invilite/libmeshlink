@@ -102,7 +102,7 @@ protected:
         return sent;
     }
 
-    // Moves data both ways — client flushes its queue, server decrypts — until `count` frames arrived or 5 s passed.
+    // Moves data both ways (client flushes its queue, server decrypts) until `count` frames arrived or 5 s passed.
     // Stops at the first receive error: a torn or reordered frame shows up as a decryption/header failure.
     std::vector<std::vector<uint8_t>> pumpUntilReceived(size_t count) {
         std::vector<std::vector<uint8_t>> received;
@@ -117,7 +117,7 @@ protected:
         return received;
     }
 
-    // Payload whose every byte depends on its sequence number — any torn, shifted or swapped frame fails comparison.
+    // Payload whose every byte depends on its sequence number: any torn, shifted or swapped frame fails comparison.
     static std::vector<uint8_t> numberedPayload(uint32_t sequence, size_t size) {
         std::vector<uint8_t> payload(size);
         for (size_t i = 0; i < size; ++i) payload[i] = static_cast<uint8_t>(sequence * 131 + i * 7);
@@ -163,7 +163,7 @@ protected:
     SmallSendQueuePair() { clientSendQueueLimit = QUEUE_LIMIT; }
 };
 
-// CRC16 as used by the frame header (CCITT polynomial 0x1021, non-reflected, custom init 0x16AB — see crc16Table
+// CRC16 as used by the frame header (CCITT polynomial 0x1021, non-reflected, custom init 0x16AB; see crc16Table
 // in connection.cpp). Recomputed here so a test can forge a header with a valid checksum.
 uint16_t crc16(const uint8_t* data, size_t length) {
     uint16_t crc = 0x16AB;
@@ -200,7 +200,7 @@ TEST_F(EstablishedConnectionPair, DeliversFrameSentByPeer) {
     EXPECT_EQ(received, payload);
 }
 
-// Guards the forging technique used by the B5 test: change only the flags byte of a genuine header (same length).
+// Guards the forging technique used by the short-header test below: change only the flags byte of a genuine header (same length).
 // If our plaintext-header reconstruction were wrong, the forged CRC would not match and the header would be rejected
 // (InvalidFrameHeader). A correct forgery passes header validation and fails only at AEAD authentication.
 TEST_F(EstablishedConnectionPair, ForgedHeaderPassesHeaderValidation) {
@@ -225,7 +225,7 @@ TEST_F(EstablishedConnectionPair, ForgedHeaderPassesHeaderValidation) {
     EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::DecryptionError));
 }
 
-// B5: a header declaring a frame shorter than nonce + header + tag (48 B) must be rejected as an invalid header.
+// A header declaring a frame shorter than nonce + header + tag (48 B) must be rejected as an invalid header.
 // Before the fix, decryptData built a negative byte range from such a frame (undefined behavior).
 TEST_F(EstablishedConnectionPair, RejectsFrameShorterThanMinimumFrameSize) {
     const std::vector<uint8_t> payload(8, 0xCD);
@@ -256,7 +256,7 @@ TEST_F(EstablishedConnectionPair, DestructorClosesSocket) {
     EXPECT_EQ(errno, EBADF);
 }
 
-// B6: receive() reports errors but never closes the socket itself. Closing belongs to the owner (Peer/Network),
+// receive() reports errors but never closes the socket itself. Closing belongs to the owner (Peer/Network),
 // which serializes it with in-flight sends; a self-close on the I/O thread raced with Peer::send on another thread.
 TEST_F(EstablishedConnectionPair, ReceiveErrorLeavesClosingToTheOwner) {
     const std::vector<uint8_t> payload(8, 0xEE);
@@ -286,7 +286,7 @@ TEST_F(EstablishedConnectionPair, ReceiveReportsRemoteCloseWithoutClosingSocket)
     EXPECT_NE(server->getSocket(), -1);
 }
 
-// ===== Receive path — frame sizes beyond the trivial =====
+// ===== Receive path: frame sizes beyond the trivial =====
 
 // A frame larger than one socket read (16 KB chunk) and the receive buffer's initial size must be reassembled from many
 // reads; several small frames arriving in one read must be split. Both are the normal shape of real traffic.
@@ -297,7 +297,7 @@ TEST_F(EstablishedConnectionPair, ReassemblesLargeFramesAndSplitsCoalescedSmallO
     EXPECT_EQ(pumpUntilReceived(expected.size()), expected);
 }
 
-// A header declaring a frame above the 16 MB hard limit cannot be buffered — the stream is unrecoverable and must be
+// A header declaring a frame above the 16 MB hard limit cannot be buffered: the stream is unrecoverable and must be
 // reported as such instead of growing the receive buffer.
 TEST_F(EstablishedConnectionPair, RejectsFrameAboveHardLimit) {
     const std::vector<uint8_t> payload(8, 0x11);
@@ -317,7 +317,7 @@ TEST_F(EstablishedConnectionPair, RejectsFrameAboveHardLimit) {
     EXPECT_EQ(result, static_cast<ssize_t>(Error::Connection::ReceivedTooMuch));
 }
 
-// ===== Send queue (B7) =====
+// ===== Send queue =====
 
 // The common case must cost nothing extra: with an empty queue and room in the socket the frame goes straight out,
 // so the owner never has to wake the I/O thread.
@@ -330,9 +330,9 @@ TEST_F(EstablishedConnectionPair, SendWritesStraightToSocketWhenNothingIsQueued)
     EXPECT_EQ(readRawFromServerSocket(NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE).size(), NONCE_SIZE + HEADER_SIZE + payload.size() + TAG_SIZE);
 }
 
-// The B7 bug: a send interrupted mid-frame left half a frame on the wire and the next frame was glued to it.
-// Now a frame the socket cannot take is queued instead (send still succeeds), and every frame — including the one
-// split between socket and queue — reaches the other side whole and in order.
+// The bug: a send interrupted mid-frame left half a frame on the wire and the next frame was glued to it.
+// Now a frame the socket cannot take is queued instead (send still succeeds), and every frame, including the one
+// split between socket and queue, reaches the other side whole and in order.
 TEST_F(EstablishedConnectionPair, QueuedFramesArriveWholeAndInOrder) {
     const uint32_t sent = sendUntilQueued(16 * 1024);
     ASSERT_TRUE(client->hasQueuedFrames()) << "socket buffers never filled";
@@ -351,7 +351,7 @@ TEST_F(EstablishedConnectionPair, QueuedFramesArriveWholeAndInOrder) {
 }
 
 // The queue is bounded: memory held for a peer that does not read never exceeds the limit. A rejected frame is dropped
-// whole — nothing of it reaches the wire — so the frames accepted before and after it still arrive intact.
+// whole (nothing of it reaches the wire), so the frames accepted before and after it still arrive intact.
 TEST_F(SmallSendQueuePair, FullQueueRejectsFrameWithoutCorruptingStream) {
     uint32_t accepted = 0;
     ssize_t  result   = 0;
@@ -378,7 +378,7 @@ TEST_F(SmallSendQueuePair, FullQueueRejectsFrameWithoutCorruptingStream) {
     EXPECT_EQ(received[0], next);
 }
 
-// A message that could never fit the queue is refused up front, even when the socket has room — otherwise one frame
+// A message that could never fit the queue is refused up front, even when the socket has room; otherwise one frame
 // could pin more memory than the limit allows. The stream stays usable.
 TEST_F(SmallSendQueuePair, MessageLargerThanQueueLimitIsRejectedBeforeAnythingIsWritten) {
     const std::vector<uint8_t> tooLarge(QUEUE_LIMIT, 0x77);
@@ -392,7 +392,7 @@ TEST_F(SmallSendQueuePair, MessageLargerThanQueueLimitIsRejectedBeforeAnythingIs
     EXPECT_EQ(received[0], small);                                                            // first thing on the wire is the small frame
 }
 
-// Unsent frames are useless once the connection is closed — close() must release them at once, and the connection
+// Unsent frames are useless once the connection is closed: close() must release them at once, and the connection
 // must refuse further sends instead of queueing into a dead socket.
 TEST_F(EstablishedConnectionPair, CloseReleasesQueuedFramesAndRefusesFurtherSends) {
     sendUntilQueued(16 * 1024);
@@ -433,7 +433,7 @@ TEST_F(EstablishedConnectionPair, ReportsSendIdleTimeOnlyWhileQueuedFramesMakeNo
 }
 
 // A failed socket write may leave part of a frame on the wire; from then on nothing may be written, and the error must
-// say "stream unusable" (SocketError), not a transient condition — the owner closes on it.
+// say "stream unusable" (SocketError), not a transient condition: the owner closes on it.
 TEST_F(EstablishedConnectionPair, WriteFailureMakesEveryFurtherSendFail) {
     const linger abortive{ 1, 0 };
     ASSERT_EQ(::setsockopt(serverFd, SOL_SOCKET, SO_LINGER, &abortive, sizeof(abortive)), 0);
@@ -448,7 +448,7 @@ TEST_F(EstablishedConnectionPair, WriteFailureMakesEveryFurtherSendFail) {
 
     ASSERT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketError));
     EXPECT_EQ(client->send(&payload), static_cast<ssize_t>(Error::Connection::SocketError));
-    EXPECT_NE(client->getSocket(), -1);                                                       // reporting only — closing stays with the owner
+    EXPECT_NE(client->getSocket(), -1);                                                       // reporting only; closing stays with the owner
 }
 
 // Handshake workers drive the socket themselves before the I/O thread owns the connection: drainSendQueue must block
@@ -491,13 +491,13 @@ TEST_F(EstablishedConnectionPair, ConcurrentSendersNeverInterleaveFrames) {
     constexpr uint32_t SENDERS = 4;
     constexpr uint32_t FRAMES_PER_SENDER = 150;
     std::atomic<bool> sendersDone{false};
-    const auto deadline = std::chrono::steady_clock::now() + 10s;                            // every loop is bounded — a broken queue fails, never hangs
+    const auto deadline = std::chrono::steady_clock::now() + 10s;                            // every loop is bounded: a broken queue fails, never hangs
 
     std::vector<std::thread> senders;
     for (uint32_t s = 0; s < SENDERS; ++s) {
         senders.emplace_back([&, s] {
             for (uint32_t i = 0; i < FRAMES_PER_SENDER; ++i) {
-                const auto payload = numberedPayload(s * 1000 + i, 1000 + (i * 977) % 20000);   // mixed sizes → partial writes at varying offsets
+                const auto payload = numberedPayload(s * 1000 + i, 1000 + (i * 977) % 20000);   // mixed sizes -> partial writes at varying offsets
                 while (client->send(&payload) == static_cast<ssize_t>(Error::Connection::SendQueueFull) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
             }
         });
@@ -521,7 +521,7 @@ TEST_F(EstablishedConnectionPair, ConcurrentSendersNeverInterleaveFrames) {
 
     for (auto& sender : senders) sender.join();
     sendersDone.store(true);
-    flusher.join();                                                                           // join before any ASSERT — threads must not outlive the fixture
+    flusher.join();                                                                           // join before any ASSERT: threads must not outlive the fixture
 
     ASSERT_EQ(receiveError, 0) << "frames interleaved on the wire";
 
@@ -556,7 +556,7 @@ TEST_F(EstablishedConnectionPair, FlushesBacklogLongerThanOneWriteBatch) {
 }
 
 // close() on the I/O thread races with senders on other threads. Every send must either be accepted before the close
-// or refused with SocketClosed afterwards — never touch a closed (possibly recycled) descriptor. Meaningful mainly
+// or refused with SocketClosed afterwards; never touch a closed (possibly recycled) descriptor. Meaningful mainly
 // under ThreadSanitizer, which flags any unsynchronized access.
 TEST_F(EstablishedConnectionPair, CloseRacingWithSendersIsSafe) {
     std::atomic<bool> stop{false};
@@ -588,11 +588,11 @@ TEST_F(EstablishedConnectionPair, CloseRacingWithSendersIsSafe) {
 // ===== Peer on top of the send queue =====
 
 // The peer owns its lifecycle: a send failure that leaves the stream unusable marks it for close, so the I/O thread
-// reaps it — no caller has to interpret the error code. Sends to a peer that is not Active never reach the connection.
+// reaps it: no caller has to interpret the error code. Sends to a peer that is not Active never reach the connection.
 TEST_F(EstablishedConnectionPair, PeerMarksItselfForCloseWhenItsStreamBreaks) {
     Peer peer(client, PeerIdentity{}, true);
     const std::vector<uint8_t> payload(100, 0x05);
-    EXPECT_EQ(peer.send(payload), static_cast<ssize_t>(Error::Connection::SocketClosed));     // Joining — refused
+    EXPECT_EQ(peer.send(payload), static_cast<ssize_t>(Error::Connection::SocketClosed));     // Joining: refused
     peer.markActive();
 
     const linger abortive{ 1, 0 };
@@ -609,10 +609,10 @@ TEST_F(EstablishedConnectionPair, PeerMarksItselfForCloseWhenItsStreamBreaks) {
     EXPECT_EQ(peer.getState(), PeerState::Closing);
 }
 
-// ===== Buffered frames invisible to poll() (R5) =====
+// ===== Buffered frames invisible to poll() =====
 
 // One socket read can pull several frames into the Connection buffer. An owner that stops after one frame (receive
-// budget) must learn that more frames are already here — poll() will not report them. A half frame is not "here":
+// budget) must learn that more frames are already here; poll() will not report them. A half frame is not "here":
 // it needs socket data, which poll() does report.
 TEST_F(EstablishedConnectionPair, ReportsFramesBufferedBeyondTheOneReturned) {
     EXPECT_FALSE(server->hasBufferedFrameData());
@@ -658,7 +658,7 @@ TEST_F(EstablishedConnectionPair, HalfFrameInBufferNeedsSocketData) {
     EXPECT_EQ(received, payload);
 }
 
-// Small messages sent back to back must not wait for an ACK of the first one (Nagle + delayed ACK ≈ 40 ms on Linux).
+// Small messages sent back to back must not wait for an ACK of the first one (Nagle + delayed ACK ~ 40 ms on Linux).
 // The send queue already coalesces frames, so Nagle would only add latency.
 TEST_F(EstablishedConnectionPair, BackToBackSmallMessagesAreNotDelayed) {
     int noDelay = 0;
@@ -677,10 +677,10 @@ TEST_F(EstablishedConnectionPair, BackToBackSmallMessagesAreNotDelayed) {
     EXPECT_LT(std::chrono::steady_clock::now() - start, 20ms) << "later frames were held back";
 }
 
-// ===== Graceful half-close (departure window, B3) =====
+// ===== Graceful half-close (departure window) =====
 
-// The leaving side's last frames must all arrive before the remote sees EOF — even when they were still queued when
-// finishSending() was called — and nothing sent afterwards may slip in behind the EOF.
+// The leaving side's last frames must all arrive before the remote sees EOF, even when they were still queued when
+// finishSending() was called, and nothing sent afterwards may slip in behind the EOF.
 TEST_F(EstablishedConnectionPair, FinishSendingDeliversQueuedFramesThenEndOfStream) {
     const uint32_t sent = sendUntilQueued(16 * 1024);
     ASSERT_TRUE(client->hasQueuedFrames());
@@ -707,7 +707,7 @@ TEST_F(EstablishedConnectionPair, FinishSendingKeepsReceiving) {
     std::vector<uint8_t> message;
     ssize_t result = 0;
     for (int attempt = 0; attempt < 20 && result == 0; ++attempt) result = server->receive(message, 100ms);
-    ASSERT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketClosed));                   // empty queue → EOF right away
+    ASSERT_EQ(result, static_cast<ssize_t>(Error::Connection::SocketClosed));                   // empty queue -> EOF right away
 
     const auto reply = numberedPayload(3, 200);
     ASSERT_GT(server->send(&reply), 0);
@@ -718,8 +718,8 @@ TEST_F(EstablishedConnectionPair, FinishSendingKeepsReceiving) {
 }
 
 // A backlog of small frames sitting in the socket must be consumed in linear time and bounded memory. receive() used to
-// pull up to 16 MB into its buffer in one go and then move the whole remainder to the front after every frame —
-// quadratic (~400 µs per 64-byte frame in the benchmark). Now a frame is consumed by advancing an offset and the
+// pull up to 16 MB into its buffer in one go and then move the whole remainder to the front after every frame:
+// quadratic (~400 us per 64-byte frame in the benchmark). Now a frame is consumed by advancing an offset and the
 // read-ahead is bounded: the buffer never holds more than the current frame plus 64 KB. The reader starts late, so the
 // server socket holds far more than 64 KB when it does.
 TEST_F(LargeSocketBuffersPair, LargeBacklogOfSmallFramesIsConsumedInBoundedMemory) {
@@ -746,7 +746,7 @@ TEST_F(LargeSocketBuffersPair, LargeBacklogOfSmallFramesIsConsumedInBoundedMemor
         if (n > 0) ++received;
     }
     const auto elapsed = std::chrono::steady_clock::now() - start;
-    flusher.join();                                                                           // before any ASSERT — a joinable thread must not be destroyed
+    flusher.join();                                                                           // before any ASSERT: a joinable thread must not be destroyed
 
     ASSERT_GT(static_cast<size_t>(pendingAtStart), 65536 + FRAME_ON_WIRE) << "precondition: the socket must hold more than the read-ahead";
     EXPECT_TRUE(intact) << "frame " << received << " corrupted or receive failed";

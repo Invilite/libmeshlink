@@ -29,7 +29,7 @@ struct PeerEventCounter : NetworkEventListener {
     explicit PeerEventCounter(PeerId watched) : watched(watched) {}
     void onPeerConnected(const PeerIdentity& identity) override {
         if (identity.getPeerId() != this->watched) return;
-        if (this->isConnected) ++this->outOfOrder;                                          // connected twice without disconnect
+        if (this->isConnected) ++this->outOfOrder;
         this->isConnected = true;
         ++this->connected;
     }
@@ -60,14 +60,14 @@ TEST(NetworkIntegrationTest, TwoNodesConnectAndExchangeHello) {
 
     EXPECT_TRUE(waitUntil([&] { return alpha.network->getConnectedPeerCount() == 1 && beta.network->getConnectedPeerCount() == 1; }, 5s));
     EXPECT_TRUE(waitUntil([&] { return alpha.knownPeer(beta).has_value() && beta.knownPeer(alpha).has_value(); }, 5s));
-    // Beta dialed Alpha's announced address → direct evidence it works.
+    // Beta dialed Alpha's announced address: direct evidence it works.
     EXPECT_TRUE(waitUntil([&] { return beta.seesAsAvailable(alpha); }, 5s));
 
     beta.network->stop();
     alpha.network->stop();
 }
 
-// The motivating scenario from the design: Beta and Gamma only dial the hub (Alpha). Via probe + PEX
+// The motivating scenario: Beta and Gamma only dial the hub (Alpha). Via probe + PEX
 // every node must end up seeing every other node as Available.
 TEST(NetworkIntegrationTest, StarTopologyConvergesToFullKnowledge) {
     const auto secret = makeSecret();
@@ -91,7 +91,7 @@ TEST(NetworkIntegrationTest, StarTopologyConvergesToFullKnowledge) {
     alpha.network->stop();
 }
 
-// B2: after one probe finishes, the next eligible peer must be probed — the single-probe-in-flight guard
+// After one probe finishes, the next eligible peer must be probed ; the single-probe-in-flight guard
 // must never stay stuck. Both peers point at ports nobody listens on, so each probe fails almost instantly
 // (connection refused), which is exactly the timing that exposed the original ordering bug.
 TEST(NetworkIntegrationTest, ProbesContinueAfterFastFailingProbe) {
@@ -114,14 +114,13 @@ TEST(NetworkIntegrationTest, ProbesContinueAfterFastFailingProbe) {
     node.network->stop();
 }
 
-// B1: a newer record with the same address set (e.g. the peer restarted and re-signed) carries no new
-// information about reachability — what we learned about those addresses must survive the version bump.
+// A newer record with the same address set (e.g. the peer restarted and re-signed) carries no new
+// information about reachability: what we learned about those addresses must survive the version bump.
 TEST(NetworkIntegrationTest, NewerRecordWithSameAddressesKeepsReachabilityKnowledge) {
     const auto secret = makeSecret();
     TestNode alpha(secret, "alpha");
     TestNode beta(secret, "beta");
 
-    // Beta already knows an older version of Alpha's record and has history with its address.
     const auto olderCreatedAt = std::chrono::system_clock::now() - 1h;
     const auto olderRecord    = makeSignedRecord(*alpha.identity, { ipv4("127.0.0.1", alpha.port) }, olderCreatedAt);
     beta.directory->upsertPeer(olderRecord.peerId, [&](KnownPeer& entry, bool) {
@@ -134,7 +133,7 @@ TEST(NetworkIntegrationTest, NewerRecordWithSameAddressesKeepsReachabilityKnowle
 
     alpha.network->start();
     beta.network->start();
-    alpha.network->connectToPeer("127.0.0.1", beta.port);                                          // Beta receives Alpha's fresh record via HELLO (inbound)
+    alpha.network->connectToPeer("127.0.0.1", beta.port);
 
     ASSERT_TRUE(waitUntil([&] { const auto e = beta.knownPeer(alpha); return e && e->record.createdAt > olderCreatedAt + 30min; }, 5s));
     const auto entry = beta.knownPeer(alpha);
@@ -146,10 +145,10 @@ TEST(NetworkIntegrationTest, NewerRecordWithSameAddressesKeepsReachabilityKnowle
     beta.network->stop();
 }
 
-// B4: when both peers dial each other, the tie-break keeps exactly one connection. Replacing the existing
+// When both peers dial each other, the tie-break keeps exactly one connection. Replacing the existing
 // connection must close the old socket, and listener events must stay consistent. On the replacing side the swap is
-// invisible. The other side may see the old connection's EOF before its own handshake for the new one completes —
-// an inherent simultaneous-open race — and then reports disconnected → connected, which is still consistent.
+// invisible. The other side may see the old connection's EOF before its own handshake for the new one completes
+// (an inherent simultaneous-open race), and then reports disconnected -> connected, which is still consistent.
 TEST(NetworkIntegrationTest, TieBreakReplacementClosesOldConnectionAndStaysTransparent) {
     const auto secret = makeSecret();
     TestNode first(secret, "first");
@@ -167,11 +166,11 @@ TEST(NetworkIntegrationTest, TieBreakReplacementClosesOldConnectionAndStaysTrans
 
     larger.network->connectToPeer("127.0.0.1", smaller.port);
     ASSERT_TRUE(waitUntil([&] { return eventsAtSmaller->connected == 1 && eventsAtLarger->connected == 1; }, 5s));
-    std::this_thread::sleep_for(300ms);                                                       // let HELLO/PEX/probes settle
+    std::this_thread::sleep_for(300ms);
     const size_t descriptorsBeforeReplacement = countOpenFileDescriptors();
 
     smaller.network->connectToPeer("127.0.0.1", larger.port);
-    std::this_thread::sleep_for(1500ms);                                                      // handshake + replacement + cleanup
+    std::this_thread::sleep_for(1500ms);
 
     EXPECT_EQ(smaller.network->getConnectedPeerCount(), 1u);
     EXPECT_EQ(larger.network->getConnectedPeerCount(), 1u);
@@ -185,7 +184,7 @@ TEST(NetworkIntegrationTest, TieBreakReplacementClosesOldConnectionAndStaysTrans
     smaller.network->stop();
 }
 
-// B8: a peer that keeps refusing our dials must not stay Available forever (Topology would redial it without end).
+// A peer that keeps refusing our dials must not stay Available forever (Topology would redial it without end).
 // After connectionFailuresBeforeUnavailable failed dials it is handed to the probe as Unavailable.
 // Topology is kept away (nextConnectionAttemptAt far ahead); connectToPeer dials regardless of backoff.
 TEST(NetworkIntegrationTest, RepeatedDialFailuresMakeAvailablePeerUnavailable) {
@@ -203,12 +202,11 @@ TEST(NetworkIntegrationTest, RepeatedDialFailuresMakeAvailablePeerUnavailable) {
     });
     node.network->start();
 
-    // Second failure: still below the threshold of 3 — one bad moment must not demote a working peer
+    // Second failure: still below the threshold of 3: one bad moment must not demote a working peer
     node.network->connectToPeer("127.0.0.1", port);
     ASSERT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveConnectionFailures == 2; }, 3s));
     EXPECT_EQ(node.directory->findPeer(record.peerId)->availability, AvailabilityState::Available);
 
-    // Third failure reaches the threshold
     node.network->connectToPeer("127.0.0.1", port);
     ASSERT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->consecutiveConnectionFailures == 3; }, 3s));
     EXPECT_TRUE(waitUntil([&] { return node.directory->findPeer(record.peerId)->availability == AvailabilityState::Unavailable; }, 3s));
@@ -220,7 +218,7 @@ TEST(NetworkIntegrationTest, RepeatedDialFailuresMakeAvailablePeerUnavailable) {
     node.network->stop();
 }
 
-// B8: once demoted, the peer comes back through the probe — when it is reachable again it becomes Available.
+// Once demoted, the peer comes back through the probe: when it is reachable again it becomes Available.
 TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
     const auto secret = makeSecret();
     TestNode node(secret, "dialer");
@@ -236,7 +234,7 @@ TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
     });
     node.network->start();
 
-    node.network->connectToPeer("127.0.0.1", target.port);                                 // target not started yet → refused
+    node.network->connectToPeer("127.0.0.1", target.port);
     ASSERT_TRUE(waitUntil([&] { const auto e = node.directory->findPeer(record.peerId); return e->availability != AvailabilityState::Available; }, 3s));
 
     target.network->start();
@@ -247,7 +245,7 @@ TEST(NetworkIntegrationTest, DemotedPeerReturnsToAvailableThroughProbe) {
     node.network->stop();
 }
 
-// F4: a dead first address must not hide a working second one — the probe tries them all, in order
+// A dead first address must not hide a working second one: the probe tries them all, in order
 TEST(NetworkIntegrationTest, ProbeTriesEveryAddressUntilOneAnswers) {
     const auto secret = makeSecret();
     TestNode node(secret, "prober");
@@ -264,7 +262,7 @@ TEST(NetworkIntegrationTest, ProbeTriesEveryAddressUntilOneAnswers) {
     target.network->stop();
 }
 
-// A peer behind NAT relative to us with only private addresses is not probed at all — it could never succeed
+// A peer behind NAT relative to us with only private addresses is not probed at all: it could never succeed
 TEST(NetworkIntegrationTest, PeerBehindNatWithOnlyPrivateAddressesIsNotProbed) {
     const auto secret = makeSecret();
     TestNode node(secret, "public");
@@ -291,7 +289,7 @@ TEST(NetworkIntegrationTest, HelloOverPrivateAddressClearsBehindNatEvidence) {
     alpha.network->start();
     beta.network->start();
 
-    alpha.network->connectToPeer("127.0.0.1", beta.port);                                    // inbound at beta, from loopback
+    alpha.network->connectToPeer("127.0.0.1", beta.port);
     EXPECT_TRUE(waitUntil([&] { const auto e = beta.knownPeer(alpha); return e && !e->reachedUsOverPublicInternet; }, 5s));
 
     alpha.network->stop();
@@ -318,9 +316,9 @@ TEST(NetworkIntegrationTest, DialerLearnsTheAddressItIsSeenFrom) {
     beta.network->stop();
 }
 
-// R9: while a dial is still in progress, Topology (ticking every 3 s) must not pick the same peer again.
+// While a dial is still in progress, Topology (ticking every 3 s) must not pick the same peer again.
 // The target listens with a full accept queue, so the kernel drops our SYNs and connect() hangs for the whole
-// 5 s connect timeout — longer than one Topology tick. One dial → one failure; a redial would add a second.
+// 5 s connect timeout, longer than one Topology tick. One dial gives one failure; a redial would add a second.
 TEST(NetworkIntegrationTest, TopologyDoesNotRedialPeerWhileAttemptIsInProgress) {
     const int listener = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
@@ -376,8 +374,8 @@ static bool tcpConnects(int family, const std::string& address, uint16_t port) {
     return connected;
 }
 
-// R7: listenAddress restricts which interface accepts connections (e.g. only a VPN address). Bound to the IPv4
-// loopback, the node must accept there and refuse on the IPv6 loopback — with the old hard-coded "::" both worked.
+// listenAddress restricts which interface accepts connections (e.g. only a VPN address). Bound to the IPv4
+// loopback, the node must accept there and refuse on the IPv6 loopback.
 TEST(NetworkIntegrationTest, ListenAddressRestrictsAcceptingInterface) {
     const auto secret = makeSecret();
     TestNode node(secret, "restricted", [](NetworkConfig& config) { config.listenAddress = "127.0.0.1"; });
@@ -389,7 +387,7 @@ TEST(NetworkIntegrationTest, ListenAddressRestrictsAcceptingInterface) {
     node.network->stop();
 }
 
-// R7: the default "::" listens on IPv4 and IPv6 (dual stack), whatever the OS default for IPV6_V6ONLY.
+// The default "::" listens on IPv4 and IPv6 (dual stack), whatever the OS default for IPV6_V6ONLY.
 TEST(NetworkIntegrationTest, DefaultListenAddressAcceptsIpv4AndIpv6) {
     const auto secret = makeSecret();
     TestNode node(secret, "dualstack");
@@ -401,7 +399,7 @@ TEST(NetworkIntegrationTest, DefaultListenAddressAcceptsIpv4AndIpv6) {
     node.network->stop();
 }
 
-// R7: a listen address that is not a numeric IP fails loudly at start instead of silently listening everywhere.
+// A listen address that is not a numeric IP fails loudly at start instead of silently listening everywhere.
 TEST(NetworkIntegrationTest, NonNumericListenAddressFailsToStart) {
     const auto secret = makeSecret();
     TestNode node(secret, "misconfigured", [](NetworkConfig& config) { config.listenAddress = "localhost"; });
@@ -445,9 +443,9 @@ std::vector<uint8_t> applicationMessage(uint8_t group, size_t payloadSize) {
 
 } // namespace
 
-// R5: a peer that has a lot to say must not make A ignore everybody else. With A's I/O frozen, the flooder queues
+// A peer that has a lot to say must not make A ignore everybody else. With A's I/O frozen, the flooder queues
 // 3000 messages and the quiet peer one. Once A resumes, the quiet peer's message must come after at most a few
-// receive budgets of the flooder — not after its whole backlog. And none of the flooder's messages may get stuck:
+// receive budgets of the flooder ; not after its whole backlog. And none of the flooder's messages may get stuck:
 // frames already read into A's buffer are invisible to poll(), so the I/O loop must come back for them on its own.
 // (The flooder connects last: with libstdc++'s unordered_map it is then served first in each round, which is the
 // order that exposed the starvation.)
@@ -468,7 +466,7 @@ TEST(NetworkIntegrationTest, FloodingPeerDoesNotStarveOthers) {
     ASSERT_TRUE(waitUntil([&] { return receiver.network->getConnectedPeerCount() == 1; }, 5s));
     flooder.network->connectToPeer("127.0.0.1", receiver.port);
     ASSERT_TRUE(waitUntil([&] { return receiver.network->getConnectedPeerCount() == 2 && flooder.network->getConnectedPeerCount() == 1 && quiet.network->getConnectedPeerCount() == 1; }, 5s));
-    std::this_thread::sleep_for(300ms);                                                       // HELLO / PEX settle
+    std::this_thread::sleep_for(300ms);
 
     staller.network->connectToPeer("127.0.0.1", receiver.port);
     ASSERT_TRUE(waitUntil([&] { return observer->stalling.load(); }, 5s));
@@ -484,7 +482,7 @@ TEST(NetworkIntegrationTest, FloodingPeerDoesNotStarveOthers) {
     ASSERT_TRUE(waitUntil([&] { return observer->flooderMessages.load() == FLOOD; }, 5s)) << "buffered frames got stuck: " << observer->flooderMessages.load();
     // The rest of the backlog is already in receiver's buffers when the quiet message arrives; draining it takes
     // milliseconds. Frames left in the Connection buffer without a socket event would wait for unrelated traffic
-    // (PEX, ~1 s later) — the time bound is what catches that.
+    // (PEX, ~1 s later) ; the time bound is what catches that.
     const auto drainTime = std::chrono::steady_clock::duration(observer->lastFloodArrivedAt.load() - observer->quietArrivedAt.load());
     EXPECT_LT(drainTime, 500ms) << "frames already in receiver's buffer waited for an unrelated socket event";
 
@@ -493,7 +491,7 @@ TEST(NetworkIntegrationTest, FloodingPeerDoesNotStarveOthers) {
 
 namespace {
 
-// Raw TCP client that never completes a handshake — what an attacker (or a slowloris) looks like to the accept path.
+// Raw TCP client that never completes a handshake: what an attacker (or a slowloris) looks like to the accept path.
 struct RawConnection {
     int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     explicit RawConnection(uint16_t port) {
@@ -529,9 +527,9 @@ struct MessageCounter : NetworkEventListener {
 
 } // namespace
 
-// B3 + B9: a node above inbound.soft is dismissed politely. The dismissed side must get the whole farewell — our HELLO,
-// a PEX sample (so it learns where else to go) and GOODBYE(NoSlots) — even though our half-close makes its I/O see EOF
-// right behind them (B9: those messages used to be dropped once the peer was no longer Active). It then backs off on
+// A node above inbound.soft is dismissed politely. The dismissed side must get the whole farewell: our HELLO,
+// a PEX sample (so it learns where else to go) and GOODBYE(NoSlots), even though our half-close makes its I/O see EOF
+// right behind them. It then backs off on
 // the rejection channel and keeps the full node Available. The full node never reports it to listeners.
 TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
     const auto secret = makeSecret();
@@ -539,7 +537,7 @@ TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
     TestNode first(secret, "first");
     TestNode dismissed(secret, "dismissed");
 
-    // A peer the full node has verified — the farewell PEX should hand it to the dismissed node
+    // A peer the full node has verified: the farewell PEX should hand it to the dismissed node
     const auto elsewhere = LocalIdentity::generate();
     const auto elsewhereRecord = makeSignedRecord(elsewhere, { ipv4("127.0.0.1", pickUnusedPort()) }, std::chrono::system_clock::now());
     full.directory->upsertPeer(elsewhereRecord.peerId, [&](KnownPeer& entry, bool) { entry.record = elsewhereRecord; entry.hasEverConnected = true; });
@@ -554,7 +552,7 @@ TEST(NetworkIntegrationTest, NodeAboveInboundSoftLimitIsDismissedWithFarewell) {
 
     ASSERT_TRUE(waitUntil([&] { const auto e = dismissed.knownPeer(full); return e && e->consecutiveNoSlotsRejections == 1; }, 5s)) << "GOODBYE(NoSlots) lost";
     const auto fullAsSeen = dismissed.knownPeer(full);
-    EXPECT_EQ(fullAsSeen->availability, AvailabilityState::Available) << "a full node is reachable — B8 must not demote it";
+    EXPECT_EQ(fullAsSeen->availability, AvailabilityState::Available) << "a full node is reachable, so it must not be demoted";
     EXPECT_EQ(fullAsSeen->consecutiveConnectionFailures, 0);
     EXPECT_GT(fullAsSeen->nextConnectionAttemptAt, std::chrono::steady_clock::now() + 5s) << "no backoff after NoSlots";
     EXPECT_TRUE(dismissed.directory->findPeer(elsewhereRecord.peerId).has_value()) << "farewell PEX lost";
@@ -619,7 +617,7 @@ TEST(NetworkIntegrationTest, ImportRefusesTamperedAndOwnRecords) {
     EXPECT_EQ(node.directory->findPeer(genuine.peerId)->availability, AvailabilityState::Unknown);   // never worked: the probe decides
 }
 
-// DIAG b: the snapshot the Router's STATE_REPORT is built from — links, limits, address book
+// The snapshot the Router's STATE_REPORT is built from: links, limits, address book
 TEST(NetworkIntegrationTest, DiagnosticsDescribeLinksLimitsAndAddressBook) {
     const auto secret = makeSecret();
     TestNode listener(secret, "listener");
@@ -667,8 +665,8 @@ TEST(NetworkIntegrationTest, DiagnosticsCountNoSlotsDismissals) {
     for (auto* node : { &dismissed, &first, &full }) node->network->stop();
 }
 
-// B3: in the departure window only management messages are expected from the departing peer. Application data from it
-// is a protocol violation — it must never reach listeners.
+// In the departure window only management messages are expected from the departing peer. Application data from it
+// is a protocol violation ; it must never reach listeners.
 TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {
     const auto secret = makeSecret();
     TestNode full(secret, "full", [](NetworkConfig& config) { config.connectionLimits.inbound.soft = 1; });
@@ -677,7 +675,6 @@ TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {
     const auto messagesAtFull = std::make_shared<MessageCounter>(dismissed.identity->getPeerId());
     full.network->addListener(messagesAtFull);
 
-    // The dismissed node sends application data the moment it considers itself connected
     struct SendOnConnect : NetworkEventListener {
         Network*          network = nullptr;
         std::atomic<bool> sent{false};
@@ -691,7 +688,7 @@ TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {
     first.network->connectToPeer("127.0.0.1", full.port);
     ASSERT_TRUE(waitUntil([&] { return full.network->getConnectedPeerCount() == 1; }, 5s));
     dismissed.network->connectToPeer("127.0.0.1", full.port);
-    // The violation closes the connection at once — possibly before our farewell even goes out
+    // The violation closes the connection at once, possibly before our farewell even goes out
     ASSERT_TRUE(waitUntil([&] { return sender->sent.load() && dismissed.network->getConnectedPeerCount() == 0; }, 5s));
     EXPECT_EQ(full.network->getConnectedPeerCount(), 1u);
     std::this_thread::sleep_for(300ms);
@@ -701,7 +698,7 @@ TEST(NetworkIntegrationTest, ApplicationDataFromDepartingPeerIsNotDelivered) {
     for (auto* node : { &dismissed, &first, &full }) node->network->stop();
 }
 
-// R10/R1: above inbound.hard a connection is closed right after accept() — nothing is allocated for it, so connections
+// Above inbound.hard a connection is closed right after accept(): nothing is allocated for it, so connections
 // that never finish a handshake cannot pile up. Handshakes in progress count towards the limit.
 TEST(NetworkIntegrationTest, InboundAboveHardLimitIsClosedImmediately) {
     const auto secret = makeSecret();
@@ -711,14 +708,14 @@ TEST(NetworkIntegrationTest, InboundAboveHardLimitIsClosedImmediately) {
     {
         RawConnection firstHandshake(node.port), secondHandshake(node.port);
         ASSERT_TRUE(firstHandshake.connected && secondHandshake.connected);
-        std::this_thread::sleep_for(100ms);                                                   // both admitted, handshakes waiting
+        std::this_thread::sleep_for(100ms);
 
         RawConnection overLimit(node.port);
         EXPECT_TRUE(overLimit.closedByRemoteWithin(500ms));
         EXPECT_FALSE(firstHandshake.closedByRemoteWithin(200ms)) << "admitted handshakes must not be cut by the limit";
     }                                                                                         // close before stop(): stop() waits for handshake workers
 
-    // Their slots come back once those connections are gone — a leak would lock the node out for good
+    // Their slots come back once those connections are gone; a leak would lock the node out for good
     std::this_thread::sleep_for(200ms);
     {
         RawConnection afterwards(node.port), another(node.port);
@@ -729,7 +726,7 @@ TEST(NetworkIntegrationTest, InboundAboveHardLimitIsClosedImmediately) {
     node.network->stop();
 }
 
-// R1: one address cannot take all inbound capacity — other addresses (and the node's LAN neighbours) still get in.
+// One address cannot take all inbound capacity: other addresses (and the node's LAN neighbours) still get in.
 TEST(NetworkIntegrationTest, InboundPerAddressLimitClosesExcessFromSameAddress) {
     const auto secret = makeSecret();
     TestNode node(secret, "guarded", [](NetworkConfig& config) { config.connectionLimits.inbound = { .soft = 8, .hard = 16, .perAddress = 2 }; });
@@ -746,8 +743,8 @@ TEST(NetworkIntegrationTest, InboundPerAddressLimitClosesExcessFromSameAddress) 
     node.network->stop();
 }
 
-// R1: the handshake deadline counts from accept(). A client trickling a byte now and then (slowloris) used to reset the
-// wait each time and hold a worker thread forever; now it is cut at the deadline (5 s) and its slot returns.
+// The handshake deadline counts from accept(). A client trickling a byte now and then (slowloris) must not reset the
+// wait each time and hold a worker thread forever; it is cut at the deadline (5 s) and its slot returns.
 TEST(NetworkIntegrationTest, SlowHandshakeIsCutAtDeadline) {
     const auto secret = makeSecret();
     TestNode node(secret, "guarded", [](NetworkConfig& config) { config.connectionLimits.inbound = { .soft = 1, .hard = 1, .perAddress = 5 }; });
@@ -773,7 +770,7 @@ TEST(NetworkIntegrationTest, SlowHandshakeIsCutAtDeadline) {
     node.network->stop();
 }
 
-// R10: the outbound hard limit is never exceeded — not even by explicit connectToPeer calls.
+// The outbound hard limit is never exceeded, not even by explicit connectToPeer calls.
 TEST(NetworkIntegrationTest, OutboundHardLimitIsNeverExceeded) {
     const auto secret = makeSecret();
     TestNode dialer(secret, "dialer", [](NetworkConfig& config) { config.connectionLimits.outbound = { .min = 0, .soft = 1, .hard = 1 }; });
@@ -791,7 +788,7 @@ TEST(NetworkIntegrationTest, OutboundHardLimitIsNeverExceeded) {
     for (auto* node : { &dialer, &one, &two }) node->network->stop();
 }
 
-// B3 (Shutdown): stop() says GOODBYE and lets the remote close first. It returns quickly when the remote cooperates,
+// stop() says GOODBYE and lets the remote close first. It returns quickly when the remote cooperates,
 // and the remote sees an orderly disconnect.
 TEST(NetworkIntegrationTest, StopDepartsGracefullyAndQuickly) {
     const auto secret = makeSecret();
@@ -814,7 +811,7 @@ TEST(NetworkIntegrationTest, StopDepartsGracefullyAndQuickly) {
 }
 
 
-// B3: a peer that refused us before but now keeps our connection has room again — once the connection has settled, its
+// A peer that refused us before but now keeps our connection has room again: once the connection has settled, its
 // refusal count starts over, so a later refusal starts from the shortest backoff instead of where the old series ended.
 TEST(NetworkIntegrationTest, SettledConnectionResetsNoSlotsRejections) {
     const auto secret = makeSecret();
@@ -851,7 +848,7 @@ TEST(NetworkIntegrationTest, RestartAfterStopWorks) {
     node.network->connectToPeer("127.0.0.1", other.port);
     EXPECT_TRUE(waitUntil([&] { return node.network->getConnectedPeerCount() == 1 && other.knownPeer(node).has_value(); }, 5s)) << "HELLO not processed after restart";
 
-    // Queues left closed still hand out items, so everything above works — but every waitPop returns at once and the
+    // Queues left closed still hand out items, so everything above works, but every waitPop returns at once and the
     // management thread spins. An idle process must stay well below one core.
     const auto cpuTime = [] { timespec t{}; ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t); return std::chrono::seconds(t.tv_sec) + std::chrono::nanoseconds(t.tv_nsec); };
     const auto cpuBefore = cpuTime();
@@ -862,8 +859,8 @@ TEST(NetworkIntegrationTest, RestartAfterStopWorks) {
     other.network->stop();
 }
 
-// R2: the address book is bounded and unverified gossip cannot push out what we know works. Bounded already holds
-// three entries that once worked (unreachable right now) and room for one more — taken by the gossiper's HELLO, proven
+// The address book is bounded and unverified gossip cannot push out what we know works. Bounded already holds
+// three entries that once worked (unreachable right now) and room for one more, taken by the gossiper's HELLO, proven
 // by our own dial. The gossiper then hands over 30 unverified records: with only proven or connected entries left,
 // every one of them must be dropped. A hostile peer can mint identities for free; they must not cost us real peers.
 TEST(NetworkIntegrationTest, AddressBookStaysWithinLimitUnderGossip) {
@@ -895,7 +892,7 @@ TEST(NetworkIntegrationTest, AddressBookStaysWithinLimitUnderGossip) {
     bounded.network->connectToPeer("127.0.0.1", gossiper.port);
 
     ASSERT_TRUE(waitUntil([&] { return bounded.knownPeer(gossiper).has_value(); }, 5s));
-    std::this_thread::sleep_for(500ms);                                                       // the whole PEX batch is processed
+    std::this_thread::sleep_for(500ms);
 
     EXPECT_EQ(bounded.directory->size(), 4u);
     for (const auto& veteran : veterans) EXPECT_TRUE(bounded.directory->findPeer(veteran).has_value()) << "an entry that once worked was pushed out by unverified gossip";
@@ -905,7 +902,7 @@ TEST(NetworkIntegrationTest, AddressBookStaysWithinLimitUnderGossip) {
     gossiper.network->stop();
 }
 
-// B10: a record whose flood reached nobody must not be booked as announced — otherwise anti-entropy treats it as fresh
+// A record whose flood reached nobody must not be booked as announced; otherwise anti-entropy treats it as fresh
 // news already spread and picks it last. Here the only flood target (B) has its I/O frozen and its queue full, so the
 // broadcast of D's newly proven record is refused; D's record must stay unannounced.
 TEST(NetworkIntegrationTest, RecordIsNotMarkedAnnouncedWhenFloodReachedNobody) {
@@ -932,7 +929,7 @@ TEST(NetworkIntegrationTest, RecordIsNotMarkedAnnouncedWhenFloodReachedNobody) {
 
     announcer.network->connectToPeer("127.0.0.1", frozen.port);
     ASSERT_TRUE(waitUntil([&] { return announcer.network->getConnectedPeerCount() == 1; }, 5s));
-    std::this_thread::sleep_for(300ms);                                                       // HELLO / PEX settle
+    std::this_thread::sleep_for(300ms);
 
     staller.network->connectToPeer("127.0.0.1", frozen.port);
     ASSERT_TRUE(waitUntil([&] { return stall->stalling.load(); }, 5s));
@@ -945,7 +942,7 @@ TEST(NetworkIntegrationTest, RecordIsNotMarkedAnnouncedWhenFloodReachedNobody) {
         ASSERT_LT(result, 0) << "queue never filled with " << size << " B messages";
     }
 
-    // A newly proven record (announcer dials fresh) is flooded — to frozen only, which refuses it
+    // A newly proven record (announcer dials fresh) is flooded, to frozen only, which refuses it
     announcer.network->connectToPeer("127.0.0.1", fresh.port);
     ASSERT_TRUE(waitUntil([&] { const auto e = announcer.knownPeer(fresh); return e && e->hasEverConnected; }, 2s));
     std::this_thread::sleep_for(1500ms);                                                      // the flood queue drains once per second
@@ -974,7 +971,7 @@ TEST(NetworkIntegrationTest, ApplicationCannotSendManagementFrames) {
     EXPECT_EQ(beta.network->sendToAllConnected(injectedGoodbye), 0u);
     EXPECT_LT(beta.network->sendToPeer(alphaId, { 0x01, 0x00 }), 0);                          // shorter than Group | Subtype
     EXPECT_GT(beta.network->sendToPeer(alphaId, applicationMessage(0x01, 10)), 0);
-    EXPECT_GT(beta.network->sendToPeer(alphaId, applicationMessage(0xFE, 10)), 0);           // Router control passes (gate comes with C6)
+    EXPECT_GT(beta.network->sendToPeer(alphaId, applicationMessage(0xFE, 10)), 0);           // Router control passes
 
     std::this_thread::sleep_for(300ms);
     EXPECT_EQ(alpha.network->getConnectedPeerCount(), 1u);
@@ -984,8 +981,8 @@ TEST(NetworkIntegrationTest, ApplicationCannotSendManagementFrames) {
     alpha.network->stop();
 }
 
-// PEX_REQUEST (docs/router.md 4.1): the Router asks the neighbor that forwarded a broadcast for the sender's record.
-// The record here belongs to a node that was never online — it is not gossiped, so only the request can deliver it.
+// PEX_REQUEST: the Router asks the neighbor that forwarded a broadcast for the sender's record.
+// The record here belongs to a node that was never online; it is not gossiped, so only the request can deliver it.
 TEST(NetworkIntegrationTest, PexRequestFetchesRecordTheNeighborHolds) {
     const auto secret = makeSecret();
     TestNode alpha(secret, "alpha", [](NetworkConfig& c) { c.periodicPexMinInterval = 600s; c.periodicPexMaxInterval = 600s; });

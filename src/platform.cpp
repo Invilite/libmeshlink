@@ -37,7 +37,7 @@ bool invilite::Transport::Platform::allowLocalPortReuse(const int socket) {
 #if defined(SO_REUSEPORT)
     return ::setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) == 0;
 #else
-    return true;                                                                        // Windows: no SO_REUSEPORT, other SO_REUSEADDR semantics (F8)
+    return true;                                                                        // Windows: no SO_REUSEPORT, other SO_REUSEADDR semantics
 #endif
 }
 

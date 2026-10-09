@@ -51,7 +51,6 @@ namespace {
             return result;
         }
 
-        // Everything read, nothing left over
         [[nodiscard]] bool complete() const { return this->ok && this->offset == this->payload.size(); }
 
     private:

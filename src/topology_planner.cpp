@@ -1,5 +1,5 @@
 #include "meshlink/topology_planner.h"
-#include "meshlink/network.h"                                                       // full NetworkConfig definition
+#include "meshlink/network.h"
 
 #include <algorithm>
 #include <random>
@@ -7,15 +7,15 @@
 namespace invilite::Mesh {
 
     namespace {
-        constexpr auto TICK_NEEDS_PEERS = std::chrono::milliseconds(3000);             // actively building connections
+        constexpr auto TICK_NEEDS_PEERS = std::chrono::milliseconds(3000);
         constexpr auto TICK_WAITING     = std::chrono::milliseconds(10000);            // below target but no candidates yet
-        constexpr auto TICK_SATISFIED   = std::chrono::milliseconds(30000);            // outbound target met
+        constexpr auto TICK_SATISFIED   = std::chrono::milliseconds(30000);
     }
 
     size_t TopologyPlanner::outboundTarget(const std::vector<ConnectedPeerInfo>& connected, const NetworkConfig& config) {
         const size_t inboundCount = static_cast<size_t>(std::count_if(connected.begin(), connected.end(), [](const ConnectedPeerInfo& p) { return !p.isOutbound; }));
 
-        // Fill up to the healthy total with what inbound does not cover, never below min (we pick those ourselves —
+        // Fill up to the healthy total with what inbound does not cover, never below min (we pick those ourselves,
         // eclipse protection) and never above soft. A public node with plenty of inbound keeps only min outbound; a node
         // behind NAT (no inbound) dials up to soft.
         const ConnectionLimits::Outbound& outbound = config.connectionLimits.outbound;
@@ -30,7 +30,7 @@ namespace invilite::Mesh {
 
         const size_t outboundCount  = std::count_if(connected.begin(), connected.end(),
                                                     [](const ConnectedPeerInfo& p) { return p.isOutbound; });
-        const size_t outboundTarget = TopologyPlanner::outboundTarget(connected, config);  // R10
+        const size_t outboundTarget = TopologyPlanner::outboundTarget(connected, config);
 
         if (outboundCount >= outboundTarget || candidates.empty()) {
             decision.nextTick = (outboundCount >= outboundTarget)
@@ -39,7 +39,7 @@ namespace invilite::Mesh {
             return decision;
         }
 
-        // Pick a random candidate — fair distribution, avoids always hammering the same peer.
+        // Pick a random candidate: fair distribution, avoids always hammering the same peer.
         // Caller has already excluded self and currently connected peers.
         static thread_local std::mt19937 rng(std::random_device{}());
         std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
@@ -48,8 +48,6 @@ namespace invilite::Mesh {
         if (!chosen.addresses.empty()) {
             decision.connectTo = DialTarget{ chosen.peerId, chosen.addresses };    // the caller left only dialable ones
         }
-
-        // disconnect remains nullopt until scoring is available (FoundAnother / churn)
 
         decision.nextTick = decision.connectTo.has_value() ? TICK_NEEDS_PEERS : TICK_WAITING;
         return decision;

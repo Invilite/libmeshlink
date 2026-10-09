@@ -13,12 +13,11 @@
 
 namespace invilite::Mesh {
 
-    // Router's duplicate and replay memory (docs/router.md 4.5). A key is remembered for `window` — longer than the
-    // accepted timestamp skew in both directions, so a replay is either remembered or rejected by its timestamp.
-    // Capacity bounds memory under a flood of distinct messages; when full, the oldest key goes first. Such an early
-    // eviction would reopen the door to replays of the forgotten messages, so the cache keeps a floor: the newest sentAt
-    // among keys evicted for capacity. A message sent at or before the floor can no longer be judged and must be dropped
-    // (under a flood, late-arriving old messages are lost rather than replayable).
+    // Router's duplicate and replay memory. A key is remembered for `window`, which is longer than the accepted
+    // timestamp skew in both directions, so a replay is either remembered or rejected by its timestamp.
+    // When capacity is reached the oldest key goes first. That would reopen the door to replays of the forgotten
+    // messages, so the cache keeps a floor: the newest sentAt among keys evicted for capacity. A message sent at or
+    // before the floor can no longer be judged and must be dropped.
     // Not thread-safe: owned by the Router thread.
     class SeenMessageCache {
     public:
@@ -26,11 +25,11 @@ namespace invilite::Mesh {
 
         [[nodiscard]] bool contains(const RoutedMessageKey& key) const;
 
-        // True when a message with this sentAt may have been forgotten early (capacity eviction) — treat it as seen
+        // True when a message with this sentAt may have been forgotten early (capacity eviction); treat it as seen.
         [[nodiscard]] bool predatesEvictedKeys(uint32_t sentAtUnixSeconds) const;
 
         // Remember `key` (sent at `sentAtUnixSeconds`) as seen at `now` (no-op if already remembered); forgets keys older
-        // than the window
+        // than the window.
         void remember(const RoutedMessageKey& key, uint32_t sentAtUnixSeconds, std::chrono::steady_clock::time_point now);
 
         [[nodiscard]] size_t size() const { return this->keys.size(); }
@@ -44,8 +43,8 @@ namespace invilite::Mesh {
 
         std::chrono::seconds                                    window;
         size_t                                                  capacity;
-        std::optional<uint32_t>                                 evictedSentAtFloor;     // newest sentAt evicted for capacity
-        std::deque<Entry>                                       byAge;              // oldest first — insertion order is age order
+        std::optional<uint32_t>                                 evictedSentAtFloor;
+        std::deque<Entry>                                       byAge;              // oldest first: insertion order is age order
         std::unordered_set<RoutedMessageKey, RoutedMessageKeyHash> keys;
     };
 

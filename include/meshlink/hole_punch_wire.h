@@ -16,14 +16,14 @@
 
 namespace invilite::Mesh {
 
-    // NAT hole punching coordination (F7, docs/nat-traversal.md 4): 0xFF messages, one hop through a common neighbor R.
-    //   PUNCH_REQUEST  A → R        target PeerId(32) + nonce(16)
-    //   PUNCH_OFFER    R → B        initiator PeerId(32) + nonce(16) + endpoint of A as R sees it
-    //   PUNCH_ACCEPT   B → R        nonce(16)
-    //   PUNCH_DECLINE  B → R, R → A nonce(16) + reason(1)
-    //   PUNCH_NOW      R → A and B  nonce(16) + endpoint of the other side as R sees it
+    // NAT hole punching coordination: 0xFF messages, one hop through a common neighbor R.
+    //   PUNCH_REQUEST  A -> R         target PeerId(32) + nonce(16)
+    //   PUNCH_OFFER    R -> B         initiator PeerId(32) + nonce(16) + endpoint of A as R sees it
+    //   PUNCH_ACCEPT   B -> R         nonce(16)
+    //   PUNCH_DECLINE  B -> R, R -> A nonce(16) + reason(1)
+    //   PUNCH_NOW      R -> A and B   nonce(16) + endpoint of the other side as R sees it
     // endpoint = family(1: 4 or 6) + address(4 or 16) + port(2 BE). Endpoints are only ever observed by R (the remote
-    // end of its connection with each side), never declared — nobody can point the other side at a third party.
+    // end of its connection with each side), never declared, so nobody can point the other side at a third party.
     namespace HolePunchSubtype {
         constexpr uint16_t REQUEST = 0x0060;
         constexpr uint16_t OFFER   = 0x0061;
@@ -34,7 +34,7 @@ namespace invilite::Mesh {
 
     using HolePunchNonce = std::array<uint8_t, 16>;                                  // chosen by A, names one exchange
 
-    // A public address and port as a NAT maps it — where the other side's SYN must go
+    // A public address and port as a NAT maps it: where the other side's SYN must go
     struct HolePunchEndpoint {
         std::string address;                                                        // numeric IPv4 / IPv6
         uint16_t    port = 0;
@@ -51,7 +51,7 @@ namespace invilite::Mesh {
         RateLimited      = 6,                                                       // A asked R too often
         PeerLeft         = 7,                                                       // the other side left R during the exchange
         NotAllowed       = 8,                                                       // protocol rule broken (e.g. the larger PeerId offered)
-        SameNetwork      = 9,                                                       // R sees both at one public address: one LAN — dial the local addresses
+        SameNetwork      = 9,                                                       // R sees both at one public address: one LAN, so dial the local addresses
     };
 
     std::string_view holePunchDeclineReasonName(HolePunchDeclineReason reason);
@@ -64,7 +64,7 @@ namespace invilite::Mesh {
 
     using HolePunchBody = std::variant<HolePunchRequest, HolePunchOffer, HolePunchAccept, HolePunchDecline, HolePunchNow>;
 
-    // A coordination message and the neighbor it goes to (or came from) — what the state machines exchange with Network
+    // A coordination message and the neighbor it goes to (or came from)
     struct HolePunchMessage {
         PeerId          peer{};
         HolePunchBody   body;

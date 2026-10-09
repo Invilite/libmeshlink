@@ -76,7 +76,7 @@ TEST(PexAnnounceCodecTest, RejectsTruncatedBatch) {
 
 TEST(PexAnnounceCodecTest, SkipsInvalidRecordButKeepsTheRest) {
     auto records = makeFreshRecords(3);
-    records[1].signature[0] ^= 0x01;                                                         // tampered
+    records[1].signature[0] ^= 0x01;
 
     std::vector<SignedPeerRecord> decoded;
     ASSERT_EQ(PexAnnounceCodec::deserialize(PexAnnounceCodec::serialize(records), decoded), PexAnnounceStatus::Success);
@@ -84,8 +84,6 @@ TEST(PexAnnounceCodecTest, SkipsInvalidRecordButKeepsTheRest) {
     EXPECT_EQ(decoded[0].peerId, records[0].peerId);
     EXPECT_EQ(decoded[1].peerId, records[2].peerId);
 }
-
-// ── PEX_REQUEST ─────────────────────────────────────────────────────────────
 
 namespace {
 PeerId filledPeerId(uint8_t fill) { PeerId id; id.fill(fill); return id; }

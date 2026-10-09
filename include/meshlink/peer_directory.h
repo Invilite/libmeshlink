@@ -17,9 +17,7 @@
 
 namespace invilite::Mesh {
 
-// Hash specialization for PeerId — used by both PeerDirectory and Network's connected-peer maps.
-// Lives here because this is the lowest-level header that depends on PeerId and is included
-// wherever PeerId-keyed maps are needed.
+// Hash for PeerId-keyed maps. Lives here because this is the lowest-level header that depends on PeerId.
     struct PeerIDHash {
         size_t operator()(const PeerId& id) const noexcept {
             size_t h;
@@ -28,71 +26,57 @@ namespace invilite::Mesh {
         }
     };
 
-// Current availability of a known peer — does the peer's announced address work *now*?
-// Present-time signal; can flip back and forth as conditions change.
-// Persistent "we have proof this peer ever worked" lives in KnownPeer::hasEverConnected.
+// Whether the peer's announced address works now; can flip back and forth.
+// The lasting proof that a peer ever worked is KnownPeer::hasEverConnected.
     enum class AvailabilityState : uint8_t {
-        Unknown      = 0,                                                                   // No evidence — never tried, or previous evidence invalidated by a fresher record.
-        Available    = 1,                                                                   // Last attempt or probe succeeded — reachable right now.
-        Unavailable  = 2,                                                                   // Last attempt or probe failed — do not retry without backoff.
-        Probing      = 3,                                                                   // Probe worker in flight; will resolve to Available or Unavailable.
+        Unknown      = 0,
+        Available    = 1,
+        Unavailable  = 2,
+        Probing      = 3,
     };
 
-// Bookkeeping for a known peer — wraps the signed record with local gossip and reachability state.
-// Owned by PeerDirectory. Callers receive copies via findPeer/listPeers and mutate in-place via
-// upsertPeer/mutatePeer (both run the supplied lambda under the directory's exclusive lock).
+// A signed record plus local gossip and reachability state. Callers get copies from findPeer/listPeers and change
+// the stored entry only through upsertPeer/mutatePeer.
     struct KnownPeer {
         SignedPeerRecord                            record;
         uint8_t                                     announceCount         = 0;
         std::chrono::steady_clock::time_point       lastAnnouncedAt{};
 
-        // Persistent flag — has any address in this record's address set ever yielded a successful connection
-        // or probe? Once true, stays true until replaced by a newer record version (createdAt >), which
-        // resets it because the address set may have changed.
+        // Set once any address of this record yielded a connection or probe. A newer record (later createdAt) resets it,
+        // because the address set may have changed.
         bool                                        hasEverConnected      = false;
 
-        // Current reachability — see AvailabilityState. Independent from hasEverConnected.
         AvailabilityState                           availability          = AvailabilityState::Unknown;
 
-        // Discovery's evidence of the path between us: this peer last connected to us from a public address, so it is
-        // behind NAT (or elsewhere) relative to us and its private addresses are not dialed or probed (dialableAddresses).
-        // Cleared when it reaches us from a private address or we reach it at one.
+        // This peer last connected to us from a public address, so its private addresses are not dialed or probed
+        // (dialableAddresses). Cleared when it reaches us from a private address or we reach it at one.
         bool                                        reachedUsOverPublicInternet = false;
 
-        // ── Connection attempt backoff (TopologyPlanner domain) ──
         uint8_t                                     consecutiveConnectionFailures = 0;
         std::chrono::steady_clock::time_point       nextConnectionAttemptAt{};
-        // GOODBYE(NoSlots) refusals — reachable but full. Separate from failures so B8 never demotes such a peer.
+        // GOODBYE(NoSlots) refusals: reachable but full. Counted apart from failures so such a peer is never demoted.
         uint8_t                                     consecutiveNoSlotsRejections  = 0;
 
-        // ── Probe backoff (Network/probe domain) ──
         uint8_t                                     consecutiveProbeFailures      = 0;
         std::chrono::steady_clock::time_point       nextProbeAllowedAt{};
 
         std::chrono::steady_clock::time_point       firstLearnedAt = std::chrono::steady_clock::now();
     };
 
-// Thread-safe storage for known peers. Pure data layer:
-//   - No knowledge of HELLO, PEX, probe, topology — those policies live in the caller.
-//   - All operations take their own lock (shared for reads, exclusive for writes) and release before
-//     returning. No reference to internal storage ever escapes a method.
-//   - Mutator lambdas in upsertPeer/mutatePeer run under the exclusive lock — they MUST be short,
-//     non-blocking, and MUST NOT call back into PeerDirectory (would deadlock).
+// Thread-safe storage for known peers; it knows nothing about HELLO, PEX, probing or topology. No reference to internal
+// storage escapes a method. Mutators passed to upsertPeer/mutatePeer run under the exclusive lock: they must be short,
+// must not block and must not call back into PeerDirectory (deadlock).
     class PeerDirectory {
     public:
-        // ── Read ──
         [[nodiscard]] std::optional<KnownPeer> findPeer(const PeerId& id) const;
 
-        // Snapshot — safe to iterate after the call returns. Copies all entries.
+        // Snapshot copy of all entries.
         [[nodiscard]] std::vector<KnownPeer>   listPeers() const;
 
         [[nodiscard]] size_t                   size() const;
 
-        // ── Write ──
-        // Atomic insert-or-update. Mutator runs under exclusive lock with:
-        //   - reference to the entry (default-constructed if newly created),
-        //   - bool indicating whether this is a fresh entry (true) or an existing one (false).
-        // Caller is responsible for populating fields appropriately on a new entry.
+        // Atomic insert-or-update. The mutator gets the entry (default-constructed when new) and whether it is new;
+        // it must fill in a new entry itself.
         template <typename Fn>
         void upsertPeer(const PeerId& id, Fn&& mutator) {
             std::unique_lock lock(this->mutex_);
@@ -100,7 +84,7 @@ namespace invilite::Mesh {
             mutator(it->second, inserted);
         }
 
-        // Mutate only if the peer already exists. Returns true iff mutator was invoked.
+        // Returns true iff the peer existed and the mutator ran.
         template <typename Fn>
         bool mutatePeer(const PeerId& id, Fn&& mutator) {
             std::unique_lock lock(this->mutex_);

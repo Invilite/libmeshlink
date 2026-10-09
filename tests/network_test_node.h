@@ -1,6 +1,5 @@
 #pragma once
 
-// Shared fixtures for tests that run real Network instances in one process over loopback TCP.
 #include "meshlink/network.h"
 #include "test_helpers.h"
 
@@ -22,7 +21,6 @@ inline bool waitUntil(const std::function<bool()>& condition, std::chrono::milli
     return condition();
 }
 
-// One mesh node: identity + directory + Network listening on its own loopback port.
 struct TestNode {
     std::shared_ptr<LocalIdentity> identity  = std::make_shared<LocalIdentity>(LocalIdentity::generate());
     std::shared_ptr<PeerDirectory> directory = std::make_shared<PeerDirectory>();

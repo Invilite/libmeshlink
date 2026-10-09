@@ -14,10 +14,9 @@
 
 namespace invilite::Mesh {
 
-    // Recently accepted BROADCAST messages, kept so a neighbor's GRAFT can be answered (docs/router.md 4.3). Holds each
-    // message as received (TTL included) and, per message, the neighbors that already got a full copy from us — each gets
-    // it at most once, so repeated GRAFTs cannot multiply traffic. Bounded by age and total encoded bytes; the oldest
-    // message goes first. Pure storage: whom to send to is the Plumtree logic's decision.
+    // Recently accepted BROADCAST messages, kept so a neighbor's GRAFT can be answered. Holds each message as received
+    // (TTL included) and the neighbors that already got a full copy from us; each gets it at most once, so repeated
+    // GRAFTs cannot multiply traffic. Bounded by age and total encoded bytes, oldest first.
     // Not thread-safe: owned by the Router thread.
     class BroadcastCache {
     public:
@@ -27,15 +26,15 @@ namespace invilite::Mesh {
         // or does not fit.
         bool store(RoutedMessage message, std::chrono::steady_clock::time_point now);
 
-        // Swap the held copy for a better one (higher TTL) — the neighbors are sent the new copy again, so the record of
-        // who got it is cleared. False when the message is not held or the copy does not fit.
+        // Swap the held copy for a better one (higher TTL). Neighbors are sent the new copy again, so the record of who
+        // got it is cleared. False when the message is not held or the copy does not fit.
         bool replace(RoutedMessage message, std::chrono::steady_clock::time_point now);
 
         [[nodiscard]] const RoutedMessage* find(const RoutedMessageKey& key) const;
 
-        // Record that `neighbor` has the full copy — after a send that succeeded, or because the copy came from it. False
-        // when it was already recorded (or the message is not held). Recording before the send would turn a refused send
-        // (full queue) into a neighbor that is never served, not even on GRAFT.
+        // Record that `neighbor` has the full copy, after a successful send or because the copy came from it. False when
+        // already recorded or the message is not held. Recording before the send would turn a refused send (full queue)
+        // into a neighbor that is never served, not even on GRAFT.
         bool markSentTo(const RoutedMessageKey& key, const PeerId& neighbor);
         [[nodiscard]] bool wasSentTo(const RoutedMessageKey& key, const PeerId& neighbor) const;
 

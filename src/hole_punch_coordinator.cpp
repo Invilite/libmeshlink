@@ -19,11 +19,11 @@ std::vector<HolePunchMessage> HolePunchCoordinator::onRequest(const PeerId& requ
     if (last != this->lastRequestAt.end() && now - last->second < this->config.requestInterval) return decline(HolePunchDeclineReason::RateLimited);
     this->lastRequestAt[requester] = now;
 
-    // Only the smaller PeerId asks (docs/nat-traversal.md 4) — crossed requests for one pair never arise
+    // Only the smaller PeerId asks, so crossed requests for one pair never arise
     if (!requesterEndpoint || !(requester < request.target)) return decline(HolePunchDeclineReason::NotAllowed);
     if (!targetEndpoint) return decline(HolePunchDeclineReason::NotNeighbor);
     // One public address for both: almost surely one LAN behind one NAT, and many routers do not loop traffic to their
-    // own public address back in (hairpinning) — they should dial each other's local addresses (docs/nat-traversal.md 6)
+    // own public address back in (hairpinning), so they should dial each other's local addresses
     if (this->config.sameNetworkShortcut && requesterEndpoint->address == targetEndpoint->address) return decline(HolePunchDeclineReason::SameNetwork);
     if (this->openExchangeCount() >= this->config.maxOpenExchanges) return decline(HolePunchDeclineReason::RateLimited);
 

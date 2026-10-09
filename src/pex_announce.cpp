@@ -23,21 +23,21 @@ std::vector<uint8_t> serialize(const std::vector<SignedPeerRecord>& records) {
     const size_t maxCount = std::min<size_t>(records.size(), MAX_RECORDS_PER_BATCH);
 
     std::vector<uint8_t> out;
-    out.reserve(COUNT_SIZE + maxCount * 300);                                       // ~max record size, generous pre-alloc
-    out.push_back(0);                                                               // count placeholder — patched at the end
+    out.reserve(COUNT_SIZE + maxCount * 300);                                       // rough upper bound of one record
+    out.push_back(0);                                                               // count placeholder, patched below
 
     uint8_t actualCount = 0;
     for (size_t i = 0; i < maxCount; ++i) {
         const std::vector<uint8_t> bytes = SignedPeerRecordCodec::serialize(records[i]);
-        if (bytes.empty())              continue;                                   // skip records that failed to serialize
-        if (bytes.size() > UINT16_MAX)  continue;                                   // defensive — length must fit 2B
+        if (bytes.empty())              continue;
+        if (bytes.size() > UINT16_MAX)  continue;                                   // length must fit 2 bytes
 
         writeBE16(out, static_cast<uint16_t>(bytes.size()));
         out.insert(out.end(), bytes.begin(), bytes.end());
         ++actualCount;
     }
 
-    out[0] = actualCount;                                                           // patch actual count
+    out[0] = actualCount;
     return out;
 }
 
@@ -67,11 +67,9 @@ PexAnnounceStatus deserialize(std::span<const uint8_t> data, std::vector<SignedP
         if (SignedPeerRecordCodec::deserialize(recordBytes, record) == SignedRecordStatus::Success) {
             outRecords.push_back(std::move(record));
         }
-        // else: framing is fine, this individual record failed verification — skip silently.
-        // Caller comparing outRecords.size() vs expected can detect skipped records if needed.
+        // A record that fails verification is skipped; the framing is still valid.
     }
 
-    // No trailing bytes allowed — tightens the format and helps catch subtle bugs.
     if (offset != data.size()) return PexAnnounceStatus::MalformedEncoding;
 
     return PexAnnounceStatus::Success;

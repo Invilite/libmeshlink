@@ -18,30 +18,27 @@ namespace invilite::Mesh {
 
     struct PlumtreeConfig {
         std::chrono::milliseconds   announcementInterval      = std::chrono::milliseconds(100);  // IHAVE batch period
-        std::chrono::milliseconds   graftTimeout              = std::chrono::milliseconds(500);  // announced, not arrived → GRAFT
-        std::chrono::milliseconds   treeOptimizationThreshold = std::chrono::milliseconds(50);   // announcement earlier than the full copy by more → swap links
-        size_t                      maxMissingMessages        = 4096;              // announced-but-missing messages tracked at once
-        size_t                      maxMissingPerLink         = 512;               // share one link's announcements may open — fake keys from one neighbor cannot block repair for the rest
-        size_t                      maxAnnouncersPerMessage   = 8;                 // neighbors remembered per missing message, GRAFT tries them in order
+        std::chrono::milliseconds   graftTimeout              = std::chrono::milliseconds(500);  // announced, not arrived: GRAFT
+        std::chrono::milliseconds   treeOptimizationThreshold = std::chrono::milliseconds(50);   // announcement earlier than the full copy by more: swap links
+        size_t                      maxMissingMessages        = 4096;
+        size_t                      maxMissingPerLink         = 512;               // fake keys from one neighbor cannot use up the whole budget and block repair for the rest
+        size_t                      maxAnnouncersPerMessage   = 8;                 // GRAFT tries them in order
     };
 
-    // Decisions for a message seen for the first time (docs/router.md 4.3)
     struct PlumtreeNewMessageDecision {
         std::vector<PeerId>     fullCopyTo;                                         // eager links, minus where it came from, its originator and its announcers
         std::optional<PeerId>   graftTo;                                            // tree optimization: the faster announcer becomes eager (empty GRAFT)
-        std::optional<PeerId>   pruneTo;                                            // … and the slower eager link becomes lazy (PRUNE)
+        std::optional<PeerId>   pruneTo;                                            // the slower eager link becomes lazy (PRUNE)
     };
 
-    // Plumtree for BROADCAST (docs/router.md 4.3): which links get full copies (eager) and which only announcements (lazy),
-    // which announced messages are missing and whom to GRAFT them from. Decides only — the Router sends, checks duplicates
-    // and serves GRAFTs from BroadcastCache. Links are identified by PeerId, not by connections, so a future group
-    // delivery (class C) can run it over paths instead of TCP links.
-    // Not thread-safe: owned by the Router thread. Time comes in as `now` (tests drive it by hand).
+    // Plumtree for BROADCAST: which links get full copies (eager) and which only announcements (lazy), which announced
+    // messages are missing and whom to GRAFT them from. Only decides; the Router sends and serves GRAFTs from
+    // BroadcastCache. Links are identified by PeerId, not by connection. Not thread-safe: owned by the Router thread.
     class PlumtreeState {
     public:
         explicit PlumtreeState(PlumtreeConfig config = {});
 
-        // A new link starts eager: until something is pruned, Plumtree is exactly flooding
+        // A new link starts eager, so until something is pruned this is plain flooding
         void addLink(const PeerId& peer);
 
         // Returns the lazy links to send an empty GRAFT to when an eager link was lost (fast repair: a short flood that
@@ -50,12 +47,12 @@ namespace invilite::Mesh {
 
         // A verified message seen for the first time. `receivedFrom` is empty for our own message. `forwarding` is false
         // when TTL ends here: nothing is sent or announced, but a pending GRAFT for it is cancelled all the same.
-        // `shapesTree`: the message comes from the tree root — only then may it swap links (tree optimization); the
-        // shared tree follows one wave only (docs/router.md 4.3, "Korzeń drzewa").
+        // `shapesTree`: the message comes from the tree root. Only then may it swap links, so the shared tree follows
+        // one wave only.
         PlumtreeNewMessageDecision onNewMessage(const RoutedMessageKey& key, const std::optional<PeerId>& receivedFrom, bool forwarding, std::chrono::steady_clock::time_point now, bool shapesTree = true);
 
         // A copy we already had. True: send PRUNE to `receivedFrom` (it was eager, now lazy). A copy with a higher TTL than
-        // ours is a better path, not a redundant one — no PRUNE.
+        // ours is a better path, not a redundant one: no PRUNE.
         bool onDuplicate(const PeerId& receivedFrom, bool higherTtlThanOurs);
 
         void onPrune(const PeerId& from);
@@ -85,10 +82,10 @@ namespace invilite::Mesh {
 
         struct MissingMessage {
             std::chrono::steady_clock::time_point   firstAnnouncedAt;
-            GraftDeadlines::iterator                graftAt;                        // this message's entry in graftDeadlines
-            PeerId                                  openedBy{};                     // the link whose announcement opened it — its share is charged
-            std::deque<PeerId>                      announcers;                     // not yet asked, in announcement order
-            std::vector<PeerId>                     asked;                          // announcers already sent a GRAFT — they hold it too
+            GraftDeadlines::iterator                graftAt;
+            PeerId                                  openedBy{};                     // the link whose announcement opened it; its share is charged
+            std::deque<PeerId>                      announcers;
+            std::vector<PeerId>                     asked;                          // they hold the message too
             bool                                    graftSent = false;
         };
         using MissingMessages = std::unordered_map<RoutedMessageKey, MissingMessage, RoutedMessageKeyHash>;
@@ -101,7 +98,7 @@ namespace invilite::Mesh {
         GraftDeadlines                                                          graftDeadlines;     // earliest first: nextDeadline and takeDueGrafts never scan
         std::unordered_map<PeerId, size_t, PeerIDHash>                          missingOpenedByLink;
         std::unordered_map<PeerId, std::vector<RoutedMessageKey>, PeerIDHash>   queuedAnnouncements;
-        std::optional<std::chrono::steady_clock::time_point>                    announcementsDueAt;     // set when the first key is queued
+        std::optional<std::chrono::steady_clock::time_point>                    announcementsDueAt;
     };
 
 } // namespace invilite::Mesh

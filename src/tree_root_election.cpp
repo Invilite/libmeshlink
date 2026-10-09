@@ -35,7 +35,7 @@ std::vector<TreeRootChange> TreeRootElection::onBeacon(const PeerId& sender, std
     const std::optional<PeerId> previous = this->heardRoot;
     this->heardRoot = sender;
     this->heardAt   = now;
-    if (sender < this->self) this->claimAt.reset();                                 // a smaller root: nothing to claim
+    if (sender < this->self) this->claimAt.reset();
     return { { TreeRootChange::Kind::Adopted, sender, previous } };
 }
 
@@ -56,7 +56,7 @@ TreeRootElection::TickResult TreeRootElection::tick(std::chrono::steady_clock::t
         return result;
     }
 
-    // Nobody smaller is heard: listen for a random while (the caller's draw), then claim — so that after a loss only a
+    // Nobody smaller is heard: listen for a random while (the caller's draw), then claim, so that after a loss only a
     // few nodes claim at once, and a node smaller than the current root takes over without a stampede
     if (this->heardRoot && *this->heardRoot < this->self) return result;
     if (!this->claimAt) this->claimAt = now + listenAfterLoss;

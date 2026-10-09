@@ -15,8 +15,8 @@
 
 namespace invilite::Mesh::TestHelpers {
 
-// Build a record signed by `identity` with an arbitrary createdAt — LocalIdentity::buildSelfRecord
-// always stamps "now", tests need to produce stale and future-dated records as well.
+// Build a record signed by `identity` with an arbitrary createdAt: LocalIdentity::buildSelfRecord always stamps "now",
+// and tests also need stale and future-dated records.
 inline SignedPeerRecord makeSignedRecord(const LocalIdentity& identity, const std::vector<PeerAddress>& addresses, std::chrono::system_clock::time_point createdAt) {
     SignedPeerRecord rec;
     rec.peerId     = identity.getPeerId();
@@ -32,9 +32,9 @@ inline PeerAddress ipv4(const char* address, uint16_t port) { return { PeerAddre
 inline PeerAddress ipv6(const char* address, uint16_t port) { return { PeerAddress::Type::IPv6, address, port }; }
 
 // A TCP port nobody listens on (also usable as a "connection refused" target). Chosen BELOW the kernel's ephemeral
-// range: bind(0) hands out ports from that range, and so does every outgoing connect — an outgoing connection of some
-// node in the same test could take the port between our probe and the listener's bind, which showed up as a rare
-// "Cannot bind socket" (1 run in 40). Below the range only explicit binds compete.
+// range: bind(0) and every outgoing connect take ports from that range, so an outgoing connection of some node in the
+// same test could take the port between our probe and the listener's bind (seen as a rare "Cannot bind socket").
+// Below the range only explicit binds compete.
 inline uint16_t pickUnusedPort() {
     static const uint16_t ephemeralStart = [] {
         std::ifstream range("/proc/sys/net/ipv4/ip_local_port_range");

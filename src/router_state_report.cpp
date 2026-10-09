@@ -1,6 +1,3 @@
-// Router::buildStateReport — the node's state for STATE_REPORT (docs/router.md 4.6). Kept apart from router.cpp: it only
-// reads Router and Network state, it routes nothing.
-
 #include "meshlink/network.h"
 #include "meshlink/router.h"
 
@@ -29,7 +26,7 @@ namespace {
     }
 }
 
-// Runs on the Router thread (it reads Plumtree, the GRAFT cache and the awaited replies, which only that thread touches)
+// Runs on the Router thread: Plumtree, the GRAFT cache and the awaited replies are touched by that thread only.
 StateReport Router::buildStateReport(const StateQuery& query) const {
     StateReport report;
     const auto now = std::chrono::steady_clock::now();
@@ -67,7 +64,7 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         addCounter(counters, StateCounter::GraftsForMissing, this->graftsForMissing.load());
         addCounter(counters, StateCounter::BroadcastCacheEntries, this->broadcastCache.size());
         addCounter(counters, StateCounter::MissingMessagesTracked, this->plumtree.missingCount());
-        if (needsNetwork) {                                                         // link states come from the Network snapshot
+        if (needsNetwork) {
             addCounter(counters, StateCounter::EagerLinks, eagerLinks);
             addCounter(counters, StateCounter::LazyLinks, lazyLinks);
         }
@@ -111,7 +108,6 @@ StateReport Router::buildStateReport(const StateQuery& query) const {
         addCounter(state.counters, StateCounter::InboundHardLimit, network.limits.inbound.effectiveHard());
         addCounter(state.counters, StateCounter::OutboundSoftLimit, network.limits.outbound.soft);
         addCounter(state.counters, StateCounter::OutboundHardLimit, network.limits.outbound.effectiveHard());
-        // Slots held by no registered peer: handshakes in flight and probes
         const size_t registered = network.activeInbound + network.activeOutbound;
         const size_t slotsInUse = network.inboundSlotsInUse + network.outboundSlotsInUse;
         addCounter(state.counters, StateCounter::HandshakesInFlight, slotsInUse > registered ? slotsInUse - registered : 0);

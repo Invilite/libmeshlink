@@ -18,7 +18,7 @@ public:
     void write(const LogRecord&) override { throw std::runtime_error("sink failed"); }
 };
 
-// Counts how many times it was formatted — proves that a filtered-out message is never formatted
+// Counts how many times it was formatted, to prove that a filtered-out message is never formatted
 struct FormatCounter { int* formatted; };
 
 const auto T0 = std::chrono::steady_clock::time_point(std::chrono::seconds(1000));
@@ -173,7 +173,7 @@ TEST(LoggerTest, RateLimitedFormatSkipsLimiterWhenDisabled) {
     auto sink = std::make_shared<CollectingLogSink>();
     ComponentLog log(std::make_shared<Logger>(sink, LogLevel::Error), "Router");
     LogRateLimiter limiter(std::chrono::hours(1), 16);
-    log.formatRateLimited(limiter, "k", LogLevel::Warning, "hidden");                // filtered out — must not consume the window
+    log.formatRateLimited(limiter, "k", LogLevel::Warning, "hidden");                // filtered out: must not consume the window
     log.getLogger()->setThreshold(LogLevel::Info);
     log.formatRateLimited(limiter, "k", LogLevel::Warning, "shown");
     ASSERT_EQ(sink->snapshot().size(), 1u);

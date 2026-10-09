@@ -53,7 +53,7 @@ TEST(TreeRootElectionTest, SmallerBeaconWhileListeningIsAdoptedAndNothingIsClaim
     EXPECT_EQ(election.root(), SMALL);
 }
 
-// A larger root is followed until this node, being smaller, has listened long enough — then it takes over
+// A larger root is followed until this node, being smaller, has listened long enough; then it takes over.
 TEST(TreeRootElectionTest, LargerRootIsFollowedUntilThisNodeClaims) {
     TreeRootElection election(SELF, config());
     election.start(T0, 40s);
@@ -95,7 +95,7 @@ TEST(TreeRootElectionTest, SmallerRootReplacesHeardOne) {
     EXPECT_EQ(follower.root(), SMALL);
 }
 
-// Three missed beacons: the root is forgotten, and after listening again the node claims (nobody smaller is heard)
+// Three missed beacons: the root is forgotten, and after listening again the node claims (nobody smaller is heard).
 TEST(TreeRootElectionTest, SilentRootIsLostThenNextSmallestClaims) {
     TreeRootElection election(SELF, config());
     election.start(T0, 40s);

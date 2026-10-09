@@ -21,9 +21,8 @@ namespace {
     constexpr size_t IPV4_BYTES         = 4;
     constexpr size_t IPV6_BYTES         = 16;
     constexpr size_t PORT_SIZE          = 2;
-    constexpr uint8_t MAX_ADDRESSES     = 8;                                        // sanity cap — a peer announcing more is suspicious
+    constexpr uint8_t MAX_ADDRESSES     = 8;
 
-    // Serialize one PeerAddress: addrType(1B) + addr(4B|16B) + port(2B BE)
     bool writeAddress(std::vector<uint8_t>& out, const PeerAddress& addr) {
         out.push_back(static_cast<uint8_t>(addr.type));
 
@@ -46,7 +45,6 @@ namespace {
         return true;
     }
 
-    // Read one PeerAddress; advances offset. Returns false on any error.
     bool readAddress(std::span<const uint8_t> data, size_t& offset, PeerAddress& out) {
         if (offset + ADDR_TYPE_SIZE > data.size()) return false;
         const auto type = static_cast<PeerAddress::Type>(data[offset]);
@@ -71,7 +69,7 @@ namespace {
             out.address = buf;
             offset += IPV6_BYTES;
         } else {
-            return false;                                                           // unknown addrType
+            return false;
         }
 
         out.port = (static_cast<uint16_t>(data[offset]) << 8) | static_cast<uint16_t>(data[offset + 1]);
@@ -111,7 +109,6 @@ std::vector<uint8_t> serializeForSigning(
 
     for (uint8_t i = 0; i < count; ++i) {
         if (!writeAddress(out, addresses[i])) {
-            // Invalid address — produce empty vector to signal failure upstream
             return {};
         }
     }
@@ -136,7 +133,6 @@ SignedRecordStatus deserialize(
 {
     size_t offset = 0;
 
-    // Fixed-size prefix: keys + timestamp + addrCount
     if (data.size() < ED25519_PUB_SIZE + X25519_PUB_SIZE + CREATED_AT_SIZE + ADDR_COUNT_SIZE) {
         return SignedRecordStatus::MalformedEncoding;
     }
@@ -167,16 +163,13 @@ SignedRecordStatus deserialize(
         outRecord.addresses.push_back(std::move(addr));
     }
 
-    // Signature follows the signed portion
     if (offset + SIGNATURE_SIZE != data.size()) {
-        return SignedRecordStatus::MalformedEncoding;                               // extra junk or missing signature
+        return SignedRecordStatus::MalformedEncoding;
     }
     outRecord.signature.assign(data.begin() + offset, data.end());
 
-    // ── Verify PeerId — derived from (ed25519Pub || x25519Pub) ──────────────
     outRecord.peerId = LocalIdentity::derivePeerId(outRecord.ed25519Pub, outRecord.x25519Pub);
 
-    // ── Verify timestamp is not in the future ───────────────────────────────
     // Records never expire: createdAt only orders versions of the same peer's record. A future-dated record
     // (misconfigured clock) would otherwise shadow the owner's own later, correctly dated records.
     const auto now = std::chrono::system_clock::now();
@@ -184,7 +177,6 @@ SignedRecordStatus deserialize(
         return SignedRecordStatus::TimestampOutOfRange;
     }
 
-    // ── Verify Ed25519 signature over signed portion ────────────────────────
     try {
         const Botan::Ed25519_PublicKey key(outRecord.ed25519Pub);
         Botan::PK_Verifier verifier(key, "Pure");

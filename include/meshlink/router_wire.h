@@ -14,12 +14,12 @@
 
 namespace invilite::Mesh {
 
-    // Routed message format (layer 2b, docs/router.md section 3.4) — pure data + codec, no threads, no peer knowledge.
+    // Routed message format (layer 2b): pure data + codec, no threads, no peer knowledge.
     //
-    //   Group(1) | Subtype(2)                                     — layer 1 (Network): Group 0x00..0xFD, or 0xFE with subtype 0x0100..0x01FF
-    //   version+mode(1) | flags(1) | ttlRemaining(1) | ttlInitial(1) | msgId(8) | sentAt(4) | sender(32)   — fixed 48 B
+    //   Group(1) | Subtype(2)                                     layer 1 (Network): Group 0x00..0xFD, or 0xFE with subtype 0x0100..0x01FF
+    //   version+mode(1) | flags(1) | ttlRemaining(1) | ttlInitial(1) | msgId(8) | sentAt(4) | sender(32)   fixed 48 B
     //   [destination(32)]                                          mode ROUTED / UNICAST
-    //   [count(1) + nextHopIndex(1) + count × PeerId(32)]          mode ROUTED
+    //   [count(1) + nextHopIndex(1) + count * PeerId(32)]          mode ROUTED
     //   [totalLength(2) + TLV...]                                  flag HAS_EXTENSIONS, TLV = type(1) | length(2) | value
     //   [signature(64)]                                            mode FLOOD / BROADCAST, every routed Router message (Group 0xFE)
     //   payload                                                    up to the end of the frame
@@ -27,11 +27,11 @@ namespace invilite::Mesh {
     // All multi-byte integers big-endian. Fields mutated by relays (ttlRemaining, nextHopIndex, per-hop extensions,
     // HAS_EXTENSIONS bit) are outside the signature; everything else is signed.
 
-    // How a message travels (docs/router.md 4.0). FLOOD and BROADCAST go to every node, have no destination and are always
+    // How a message travels. FLOOD and BROADCAST go to every node, have no destination and are always
     // signed; they differ only in how copies spread. A mode this node does not know is ignored and reported to the neighbor.
     enum class RoutingMode : uint8_t {
         Flood     = 0x0,                                                            // to every node: full copy to every neighbor
-        Broadcast = 0x1,                                                            // to every node: Plumtree — tree built from traffic, other links get announcements
+        Broadcast = 0x1,                                                            // to every node: Plumtree, tree built from traffic, other links get announcements
         Routed    = 0x2,                                                            // to one node along the hops the sender lists
         Unicast   = 0x3,                                                            // to one node; each hop picks the next hop, floods locally without a route
     };
@@ -42,7 +42,7 @@ namespace invilite::Mesh {
         TtlExhausted       = 0x03,                                                  // TTL ran out at a hop that knew the way on (point-to-point only)
     };
 
-    // TLV extension. Type bit 7 = critical (unknown → reject message), bit 6 = per-hop (unsigned, relays may change it).
+    // TLV extension. Type bit 7 = critical (unknown: reject message), bit 6 = per-hop (unsigned, relays may change it).
     struct RoutingExtension {
         uint8_t                 type = 0;
         std::vector<uint8_t>    value;
@@ -62,7 +62,7 @@ namespace invilite::Mesh {
 
     // Decoded routed message. Optional parts are present exactly when the mode / flags require them (encode enforces it).
     struct RoutedMessage {
-        uint8_t                         group   = 0;                                // 0x00..0xFD application, 0xFE Router's own routed message; signed — a relay cannot move it elsewhere
+        uint8_t                         group   = 0;                                // 0x00..0xFD application, 0xFE Router's own routed message; signed, so a relay cannot move it elsewhere
         uint16_t                        subtype = 0;                                // application subtype (untouched by the Router), or a routed Router message type
         RoutingMode                     mode    = RoutingMode::Broadcast;
         bool                            ackRequested = false;                       // every addressee that receives it answers with an ACK
@@ -72,17 +72,17 @@ namespace invilite::Mesh {
         uint64_t                        msgId = 0;                                  // random; duplicate / replay key = (sender, msgId)
         uint32_t                        sentAtUnixSeconds = 0;
         PeerId                          sender{};
-        std::optional<PeerId>           destination;                                // mode Routed / Unicast
-        std::optional<SourceRoute>      sourceRoute;                                // mode Routed
-        std::vector<RoutingExtension>   extensions;                                 // all received extensions, known or not — unknown signed ones must survive forwarding
+        std::optional<PeerId>           destination;
+        std::optional<SourceRoute>      sourceRoute;
+        std::vector<RoutingExtension>   extensions;                                 // all received extensions, known or not; unknown signed ones must survive forwarding
         std::vector<uint8_t>            signature;                                  // 64 B when requiresSignature(group, mode), empty otherwise
         std::vector<uint8_t>            payload;
 
         bool operator==(const RoutedMessage&) const = default;
     };
 
-    // ACK payload (Group 0xFE / ACK): sent by every addressee that received a message with ACK_REQUESTED — the destination
-    // of ROUTED / UNICAST, every node for FLOOD / BROADCAST. Relays never acknowledge.
+    // ACK payload (Group 0xFE / ACK): sent by every addressee that received a message with ACK_REQUESTED (the destination
+    // of ROUTED / UNICAST, every node for FLOOD / BROADCAST). Relays never acknowledge.
     struct AckPayload {
         uint64_t                acknowledgedMsgId = 0;
 
@@ -98,8 +98,8 @@ namespace invilite::Mesh {
         bool operator==(const RouteErrorPayload&) const = default;
     };
 
-    // One relay a route probe crossed: who, and when (ms after the probe was sent — clocks are synchronized, so per-hop
-    // delays are as good as the sync; the sender's round trip is exact)
+    // One relay a route probe crossed: who, and when (ms after the probe was sent; clocks are synchronized, so per-hop
+    // delays are only as good as the sync, while the sender's round trip is exact)
     struct RouteHop {
         PeerId                  node{};
         uint32_t                offsetMs = 0;
@@ -108,7 +108,7 @@ namespace invilite::Mesh {
     };
 
     // RECORD_ROUTE payload (Group 0xFE / 0x0102): sentAtMs is signed by the probe's sender; the hops are appended by
-    // relays and are not — claims of intermediaries (D5)
+    // relays and are not signed: they are claims of intermediaries
     struct RecordRoutePayload {
         uint64_t                sentAtUnixMs = 0;
         std::vector<RouteHop>   hops;                                               // relays in order, at most 255
@@ -134,7 +134,7 @@ namespace invilite::Mesh {
         bool operator==(const UnknownDeliveryModeReport&) const = default;
     };
 
-    // Receive-side validation outcome (docs/router.md 3.6). Signature is checked separately (verifySignature) because
+    // Receive-side validation outcome. Signature is checked separately (verifySignature) because
     // the sender's key comes from PeerDirectory, which the codec does not know.
     enum class RoutedMessageStatus : int {
         Success                    =   0,
@@ -153,11 +153,11 @@ namespace invilite::Mesh {
     namespace RouterWire {
 
         constexpr uint8_t  WIRE_VERSION          = 1;
-        constexpr uint8_t  ROUTER_PROTOCOL_GROUP = 0xFE;                            // Router's own messages (section 3.3)
+        constexpr uint8_t  ROUTER_PROTOCOL_GROUP = 0xFE;                            // Router's own messages
         constexpr uint8_t  MAX_ROUTED_GROUP      = 0xFD;
         constexpr size_t   FIXED_HEADER_SIZE     = 48;
         constexpr size_t   SIGNATURE_SIZE        = 64;
-        constexpr uint8_t  EXTENSION_SENT_TO     = 0x40;                            // per-hop Bloom filter of neighbors sent the full message (R-7)
+        constexpr uint8_t  EXTENSION_SENT_TO     = 0x40;                            // per-hop Bloom filter of neighbors sent the full message
 
         // Group 0xFE subtypes 0x0001..0x00FF: neighbor-only control, no routing header
         constexpr uint16_t SUBTYPE_NEIGHBORS             = 0x0001;
@@ -165,21 +165,21 @@ namespace invilite::Mesh {
         constexpr uint16_t SUBTYPE_GRAFT                 = 0x0003;
         constexpr uint16_t SUBTYPE_PRUNE                 = 0x0004;
         constexpr uint16_t SUBTYPE_UNKNOWN_DELIVERY_MODE = 0x0005;
-        // Group 0xFE subtypes 0x0100..0x01FF: the Router's own routed messages — routing header, always signed, ROUTED / UNICAST
+        // Group 0xFE subtypes 0x0100..0x01FF: the Router's own routed messages: routing header, always signed, ROUTED / UNICAST
         // only, except PRESENCE, which only travels to every node
         constexpr uint16_t FIRST_ROUTED_ROUTER_SUBTYPE   = 0x0100;
         constexpr uint16_t LAST_ROUTED_ROUTER_SUBTYPE    = 0x01FF;
         constexpr uint16_t SUBTYPE_ACK                   = 0x0100;
         constexpr uint16_t SUBTYPE_ROUTE_ERROR           = 0x0101;
-        constexpr uint16_t SUBTYPE_RECORD_ROUTE          = 0x0102;                  // route probe (R-5)
-        constexpr uint16_t SUBTYPE_ROUTE_REPORT          = 0x0103;                  // probe answer from the destination (R-5)
-        constexpr uint16_t SUBTYPE_PRESENCE              = 0x0104;                  // "I am here": a node's Router to every other Router, empty — teaches the way back to it
-        constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender — teaches it the way back to us; carries our SignedPeerRecord (a joiner lacks it)
-        constexpr uint16_t SUBTYPE_STATE_QUERY           = 0x0106;                  // "show me your state" — diagnostics, `meshlink map` (state_report_wire.h)
+        constexpr uint16_t SUBTYPE_RECORD_ROUTE          = 0x0102;                  // route probe
+        constexpr uint16_t SUBTYPE_ROUTE_REPORT          = 0x0103;                  // probe answer from the destination
+        constexpr uint16_t SUBTYPE_PRESENCE              = 0x0104;                  // "I am here": a node's Router to every other Router, empty; teaches the way back to it
+        constexpr uint16_t SUBTYPE_PRESENCE_REPLY        = 0x0105;                  // answer to PRESENCE, to its sender; teaches it the way back to us and carries our SignedPeerRecord (a joiner lacks it)
+        constexpr uint16_t SUBTYPE_STATE_QUERY           = 0x0106;                  // "show me your state": diagnostics, `meshlink map` (state_report_wire.h)
         constexpr uint16_t SUBTYPE_STATE_REPORT          = 0x0107;                  // answer to STATE_QUERY, to its sender
-        constexpr uint16_t SUBTYPE_TREE_BEACON           = 0x0108;                  // "I shape the broadcast tree": the tree root to every Router, empty (docs/router.md 4.3)
+        constexpr uint16_t SUBTYPE_TREE_BEACON           = 0x0108;                  // "I shape the broadcast tree": the tree root to every Router, empty
 
-        // Retries of unsigned point-to-point data (docs/router.md 4.4a, R-8 e): the two lowest msgId bits number the attempt.
+        // Retries of unsigned point-to-point data: the two lowest msgId bits number the attempt.
         // The first send has 00; relays see a retry as a new message, the destination delivers once per base id; the last
         // attempt (11) floods locally on every hop instead of following route tables.
         constexpr uint64_t MSG_ATTEMPT_MASK = 0x3;
@@ -187,7 +187,7 @@ namespace invilite::Mesh {
         constexpr uint64_t baseMessageId(uint64_t msgId) { return msgId & ~MSG_ATTEMPT_MASK; }
         constexpr uint8_t  attemptOf(uint64_t msgId)     { return static_cast<uint8_t>(msgId & MSG_ATTEMPT_MASK); }
 
-        // The Router messages that travel to every node — and only so (FLOOD / BROADCAST)
+        // The Router messages that travel to every node, and only so (FLOOD / BROADCAST)
         constexpr bool travelsToEveryNode(uint16_t subtype) { return subtype == SUBTYPE_PRESENCE || subtype == SUBTYPE_TREE_BEACON; }
 
         // FLOOD and BROADCAST: to every node, no destination
@@ -196,11 +196,11 @@ namespace invilite::Mesh {
         // Whether a Network frame with this Group / Subtype starts with a routing header
         bool carriesRoutingHeader(uint8_t group, uint16_t subtype);
 
-        // Ed25519 signature present: FLOOD and BROADCAST (D8), and every routed Router message (D5). Application
-        // ROUTED / UNICAST data relies on E2E (D12).
+        // Ed25519 signature present: FLOOD and BROADCAST, and every routed Router message. Application
+        // ROUTED / UNICAST data relies on E2E.
         bool requiresSignature(uint8_t group, RoutingMode mode);
 
-        // Full Network frame: Group | Subtype | routing header | payload — ready for Network::sendToPeer.
+        // Full Network frame: Group | Subtype | routing header | payload, ready for Network::sendToPeer.
         // Returns an empty vector when the message is inconsistent (optional parts not matching mode / flags,
         // signature presence not matching requiresSignature, counts or lengths over their field size, invalid TTL,
         // Group / Subtype without a routing header, unknown mode, Router message in FLOOD / BROADCAST, source-route index past the route).
@@ -210,15 +210,15 @@ namespace invilite::Mesh {
         size_t encodedSize(const RoutedMessage& message);
 
         // Decode and validate a received message. Network has already split off Group and Subtype, so they come
-        // separately and `body` starts at the routing header. sentAt must lie within now ± maxClockSkew.
-        // On failure `out` is unspecified — do not use it — except UnknownMode, where the fixed header is filled in.
+        // separately and `body` starts at the routing header. sentAt must lie within now +/- maxClockSkew.
+        // On failure `out` is unspecified (do not use it) except UnknownMode, where the fixed header is filled in.
         RoutedMessageStatus decode(uint8_t group, uint16_t subtype, std::span<const uint8_t> body, std::chrono::system_clock::time_point now,
                                    RoutedMessage& out, std::chrono::seconds maxClockSkew = std::chrono::minutes(5));
 
         // Bytes covered by the sender's Ed25519 signature:
         //   "MeshLink-Router-V1" | Group | Subtype | version+mode | flags without HAS_EXTENSIONS | ttlInitial | msgId | sentAt
         //   | sender | [destination] | [count + source-route hops] | signedExtensionsLength(2) | signed TLVs | payload
-        // — of a RECORD_ROUTE probe only the first RECORD_ROUTE_SIGNED_PREFIX bytes of the payload (relays append hops)
+        // For a RECORD_ROUTE probe only the first RECORD_ROUTE_SIGNED_PREFIX bytes of the payload are covered (relays append hops).
         // The signed-extensions length keeps the TLV / payload boundary inside the signature: without it a relay could drop
         // a signed extension and prepend its bytes to the payload without breaking the signature.
         std::vector<uint8_t> bytesToSign(const RoutedMessage& message);
@@ -238,7 +238,7 @@ namespace invilite::Mesh {
         std::vector<uint8_t> encodeRouteErrorPayload(const RouteErrorPayload& error);
         bool                 decodeRouteErrorPayload(std::span<const uint8_t> payload, RouteErrorPayload& out);
 
-        // Neighbor-only control (Group 0xFE, subtypes 0x0001..0x00FF, section 3.3). Encoders return the whole Network frame
+        // Neighbor-only control (Group 0xFE, subtypes 0x0001..0x00FF). Encoders return the whole Network frame
         // (Group | Subtype | payload) ready for Network::sendToPeer, or an empty vector when the content does not fit;
         // decoders take the payload Network split off and require the exact length.
         constexpr size_t MAX_KEYS_PER_CONTROL_MESSAGE = 255;                        // 1-byte count

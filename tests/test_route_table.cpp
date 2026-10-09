@@ -24,7 +24,7 @@ TEST(RouteTableTest, LearnsFromBroadcastsAndRanksByHops) {
     EXPECT_EQ(table.nextHops(DEST, B), (std::vector<PeerId>{ C, A }));                       // not back where it came from
 }
 
-// docs/router.md 4.4a: measured (by RTT) before delivered before hinted (by hops) — fewer hops do not beat a measurement
+// Measured (by RTT) before delivered before hinted (by hops); fewer hops do not beat a measurement
 TEST(RouteTableTest, MeasuredBeforeDeliveredBeforeHinted) {
     RouteTable table;
     table.learn(DEST, A, 1, T0);
@@ -45,7 +45,7 @@ TEST(RouteTableTest, MeasurementsAreSmoothedAndOrderedByRtt) {
     RouteTable table;
     table.recordMeasurement(DEST, A, 3, 100ms, T0);
     table.recordMeasurement(DEST, A, 3, 20ms, T0 + 1s);
-    EXPECT_EQ(table.candidates(DEST).front().rtt, 80ms);                                     // (3 × 100 + 20) / 4
+    EXPECT_EQ(table.candidates(DEST).front().rtt, 80ms);                                     // (3 * 100 + 20) / 4
     table.recordMeasurement(DEST, B, 5, 50ms, T0 + 2s);
     EXPECT_EQ(table.nextHops(DEST), (std::vector<PeerId>{ B, A }));                          // faster wins over fewer hops
 }
@@ -59,7 +59,7 @@ TEST(RouteTableTest, FailuresDemoteAndThreeInARowRemove) {
     EXPECT_EQ(table.nextHops(DEST), (std::vector<PeerId>{ B, A }));
     EXPECT_EQ(table.candidates(DEST).back().tier(), RouteTier::Failing);
 
-    table.recordMeasurement(DEST, A, 2, 30ms, T0 + 1s);                                       // works again
+    table.recordMeasurement(DEST, A, 2, 30ms, T0 + 1s);
     EXPECT_EQ(table.nextHops(DEST), (std::vector<PeerId>{ A, B }));
     EXPECT_EQ(table.candidates(DEST).front().failures, 0);
 
@@ -69,7 +69,7 @@ TEST(RouteTableTest, FailuresDemoteAndThreeInARowRemove) {
     EXPECT_EQ(table.destinationCount(), 0u);
 }
 
-// A delivery through a neighbor we never heard the destination behind says nothing usable — except the destination
+// A delivery through a neighbor we never heard the destination behind says nothing usable, except the destination
 // itself, a direct neighbor
 TEST(RouteTableTest, DeliveryAddsOnlyTheDestinationItself) {
     RouteTable table;
@@ -125,7 +125,7 @@ TEST(RouteTableTest, FullTableDropsTheLeastRecentlyHeardDestination) {
     EXPECT_FALSE(table.nextHops(peerId(3)).empty());
 }
 
-// Review R-5 M1: a hint's hop count is unsigned (a relay can lower it); it must not rewrite what a probe recorded
+// A hint's hop count is unsigned (a relay can lower it); it must not rewrite what a probe recorded
 TEST(RouteTableTest, HintDoesNotRewriteHopsOfMeasuredRoute) {
     RouteTable table;
     table.recordMeasurement(DEST, A, 3, 40ms, T0);

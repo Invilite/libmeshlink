@@ -16,8 +16,8 @@
 
 namespace invilite::Mesh {
 
-    // Severity with syslog numbering (docs/logging.md). The library never emits Emergency — only the application knows
-    // whether it stopped working altogether.
+    // Severity with syslog numbering. The library never emits Emergency: only the application knows whether it stopped
+    // working altogether.
     enum class LogLevel : uint8_t { Emergency = 0, Alert, Critical, Error, Warning, Notice, Info, Debug };
 
     // syslog keyword of the level: "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug"
@@ -75,8 +75,8 @@ namespace invilite::Mesh {
 
     // Bounds messages a remote peer can trigger (malformed frames, protocol violations), so a misbehaving neighbor
     // cannot flood the log. Per key (event kind + neighbor), the first record in each window passes and the rest are
-    // counted; the next record let through reports how many were suppressed. The key count is bounded too — at the cap
-    // the least recently seen key is forgotten — so the limiter itself cannot be used to exhaust memory.
+    // counted; the next record let through reports how many were suppressed. The key count is bounded too (at the cap
+    // the least recently seen key is forgotten), so the limiter itself cannot be used to exhaust memory.
     // Not thread-safe: each logging thread owns its own limiter. Time is passed in, so tests need no sleeping.
     class LogRateLimiter {
     public:
@@ -84,7 +84,7 @@ namespace invilite::Mesh {
 
         explicit LogRateLimiter(Clock::duration window = std::chrono::seconds(10), size_t maxKeys = 256);
 
-        // nullopt = suppress this record; otherwise log it — the value is the number suppressed since the last one let through
+        // nullopt = suppress this record; otherwise log it, the value being the number suppressed since the last one let through
         [[nodiscard]] std::optional<uint32_t> admit(std::string_view key, Clock::time_point now);
 
         // Suffix for a record let through: "" or " (N similar suppressed)"
@@ -104,11 +104,11 @@ namespace invilite::Mesh {
         std::unordered_map<std::string, KeyState> states;
     };
 
-    // A Logger bound to one component name — what Network and Router hold. Formatting happens only after the filter
+    // A Logger bound to one component name, as held by Network and Router. Formatting happens only after the filter
     // passed, so a disabled message costs two atomic loads.
     class ComponentLog {
     public:
-        ComponentLog(std::shared_ptr<Logger> logger, std::string_view component);       // null logger → default Logger (stderr, Info)
+        ComponentLog(std::shared_ptr<Logger> logger, std::string_view component);       // a null logger gives the default Logger (stderr, Info)
 
         [[nodiscard]] bool isEnabled(LogLevel level, bool isDebug = false) const { return this->logger->isEnabled(level, isDebug); }
 
@@ -118,7 +118,7 @@ namespace invilite::Mesh {
             this->logger->write(level, this->component, std::format(fmt, std::forward<Args>(args)...));
         }
 
-        // Debug record with isDebug set — the noisy details shown only with -v and --debug together
+        // Debug record with isDebug set: noisy details shown only with -v and --debug together
         template <class... Args>
         void formatDebugDetail(std::format_string<Args...> fmt, Args&&... args) const {
             if (!this->logger->isEnabled(LogLevel::Debug, true)) return;

@@ -1,5 +1,4 @@
 // Router integration tests: real Network instances in one process over loopback TCP, a Router on top of each.
-// Network and Router log to stderr; run `./run_test 2>/dev/null` for quiet output.
 #include <gtest/gtest.h>
 #include "meshlink/router.h"
 #include "meshlink/router_wire.h"
@@ -34,7 +33,7 @@ void connect(TestNode& dialer, TestNode& listener) {
 
 uint64_t randomTestMsgId();
 
-// Unsigned shell of a routed Router message (UNICAST) — the caller signs it
+// Unsigned shell of a routed Router message (UNICAST); the caller signs it
 RoutedMessage testRouterMessage(const PeerId& sender, const PeerId& destination, uint16_t subtype, std::vector<uint8_t> payload) {
     RoutedMessage message;
     message.group = RouterWire::ROUTER_PROTOCOL_GROUP;
@@ -55,7 +54,6 @@ std::vector<uint8_t> craftAckFrame(const LocalIdentity& signer, const PeerId& cl
     return RouterWire::encode(ack);
 }
 
-// Router control frames (Group 0xFE neighbor-only subtypes) seen by one node's Network
 struct ControlFrameRecorder : NetworkEventListener {
     void onMessageReceived(const NetworkMessage& message) override {
         if (message.group != RouterWire::ROUTER_PROTOCOL_GROUP || RouterWire::carriesRoutingHeader(message.group, message.subtype)) return;
@@ -82,7 +80,7 @@ uint64_t randomTestMsgId() {
     return generator();
 }
 
-// A broadcast built by hand — for frames a well-behaved Router would never send (forgeries, replays)
+// A broadcast built by hand, for frames a well-behaved Router would never send (forgeries, replays)
 RoutedMessage craftBroadcast(const PeerId& claimedSender, const LocalIdentity& signer, std::vector<uint8_t> payload) {
     RoutedMessage m;
     m.group             = 0x10;
@@ -110,8 +108,6 @@ std::vector<uint8_t> frameWithUnknownMode(const LocalIdentity& sender, uint8_t m
 }
 
 } // namespace
-
-// ── Skeleton (R-2) ──────────────────────────────────────────────────────────
 
 TEST(RouterTest, TracksNeighborsFromNetworkEvents) {
     const auto secret = makeSecret();
@@ -189,8 +185,6 @@ TEST(RouterTest, BadRoutedAndControlFramesDoNotDisturbRouterOrConnection) {
     alpha.network->stop();
 }
 
-// ── BROADCAST as flooding (R-3) ─────────────────────────────────────────────
-
 TEST(RouterTest, BroadcastCrossesLineAndEveryNodeDeliversOnce) {
     RouterMesh mesh(5, lineEdges(5));
     ASSERT_TRUE(mesh.ready);
@@ -200,7 +194,7 @@ TEST(RouterTest, BroadcastCrossesLineAndEveryNodeDeliversOnce) {
     ASSERT_TRUE(waitUntil([&] { return mesh.allOthersDelivered(0, *msgId); }, 5s));
     std::this_thread::sleep_for(300ms);                                                       // room for any duplicate to show up
 
-    EXPECT_EQ(mesh.recorders[0]->total(), 0u);                                                // own broadcast is not delivered back
+    EXPECT_EQ(mesh.recorders[0]->total(), 0u);
     for (size_t i = 1; i < 5; ++i) {
         EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), *msgId), 1u) << "node " << i;
         const auto delivery = mesh.recorders[i]->find(mesh.id(0), *msgId);
@@ -268,7 +262,7 @@ TEST(RouterTest, ForgedBroadcastIsDroppedAtFirstHop) {
     const RoutedMessage fromStranger = craftBroadcast(stranger.getPeerId(), stranger, { 's', 't', 'r', 'a', 'n', 'g', 'e', 'r' });
     ASSERT_GT(mesh.nodes[0]->network->sendToPeer(toNode1, RouterWire::encode(fromStranger)), 0);
 
-    // A genuine broadcast after them still gets through — the Router kept working
+    // A genuine broadcast after them still gets through: the Router kept working
     const uint64_t genuine = mesh.routers[0]->broadcast(0x10, 0, { 'o', 'k' }).value();
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), genuine) == 1; }, 5s));
     std::this_thread::sleep_for(600ms);
@@ -289,13 +283,13 @@ TEST(RouterTest, ReplayedBroadcastIsDeliveredOnce) {
     ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), genuine.msgId) == 1; }, 5s));
 
-    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);                      // the same frame again
+    ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), frame), 0);
     std::this_thread::sleep_for(500ms);
     EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), genuine.msgId), 1u);
     EXPECT_EQ(mesh.recorders[2]->countOf(mesh.id(0), genuine.msgId), 1u);
 }
 
-// docs/router.md 4.1: a node that lacks the sender's record asks the neighbor that forwarded the broadcast (PEX_REQUEST)
+// A node that lacks the sender's record asks the neighbor that forwarded the broadcast (PEX_REQUEST)
 TEST(RouterTest, UnknownSenderRecordIsFetchedFromForwardingNeighbor) {
     RouterMesh mesh(3, lineEdges(3));
     ASSERT_TRUE(mesh.ready);
@@ -430,8 +424,6 @@ TEST(RouterTest, RepeatedWaitingMessageTakesOneVerificationSlot) {
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(known.getPeerId(), relayed.msgId) == 1; }, 1500ms));
 }
 
-// ── Modes reaching every node (R-4a) ────────────────────────────────────────
-
 TEST(RouterTest, FloodModeChosenBySenderCrossesLine) {
     RouterMesh mesh(4, lineEdges(4));
     ASSERT_TRUE(mesh.ready);
@@ -466,8 +458,6 @@ TEST(RouterTest, UnknownModeIsIgnored) {
     for (size_t i = 1; i < 3; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), future.msgId), 0u) << "node " << i;
     EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 1u);                         // only the control message
 }
-
-// ── Unknown mode is reported to the neighbor (R-4b a) ───────────────────────
 
 TEST(RouterTest, UnknownModeIsReportedOncePerNeighborAndModeWithinInterval) {
     RouterMesh mesh(2, lineEdges(2));
@@ -507,11 +497,9 @@ TEST(RouterTest, UnknownModeIsReportedAgainAfterInterval) {
     mesh.nodes[0]->network->removeListener(recorder);
 }
 
-// ── Plumtree (R-4b) ─────────────────────────────────────────────────────────
-
 namespace {
 
-// Ring of 8 with four chords: every node has degree 3, so flooding sends far more than N − 1 copies
+// Ring of 8 with four chords: every node has degree 3, so flooding sends far more than N - 1 copies
 std::vector<Edge> ringWithChords() {
     std::vector<Edge> edges;
     for (size_t i = 0; i < 8; ++i) edges.push_back({ i, (i + 1) % 8 });
@@ -547,7 +535,7 @@ TEST(RouterTest, PlumtreeSettlesToOneFullCopyPerNode) {
     const uint64_t firstBroadcast = fullCopiesForOneBroadcast(mesh, 0);                       // every link eager: a flood
     EXPECT_GT(firstBroadcast, 7u);
     warmUp(mesh, 0);
-    for (int i = 0; i < 3; ++i) EXPECT_EQ(fullCopiesForOneBroadcast(mesh, 0), 7u) << "broadcast " << i;   // N − 1: a spanning tree
+    for (int i = 0; i < 3; ++i) EXPECT_EQ(fullCopiesForOneBroadcast(mesh, 0), 7u) << "broadcast " << i;   // N - 1: a spanning tree
 
     uint64_t announced = 0;
     for (const auto& router : mesh.routers) announced += router->getStatistics().announcementsSent;
@@ -556,7 +544,7 @@ TEST(RouterTest, PlumtreeSettlesToOneFullCopyPerNode) {
 }
 
 // A node of the tree leaves: its neighbors' eager link is gone and fast repair (empty GRAFT to lazy links) restores
-// delivery within a round trip — well before the GRAFT timeout would
+// delivery within a round trip, well before the GRAFT timeout would
 TEST(RouterTest, PlumtreeRepairsQuicklyWhenTreeNodeLeaves) {
     RouterMesh mesh(8, ringWithChords());
     ASSERT_TRUE(mesh.ready);
@@ -586,7 +574,7 @@ TEST(RouterTest, PlumtreeRepairsQuicklyWhenTreeNodeLeaves) {
     EXPECT_LT(std::chrono::steady_clock::now() - sentAt, 400ms);                              // no GRAFT wait (500 ms)
 }
 
-// Link 1→2 made lazy by hand (PRUNE from node 2): node 2 only hears IHAVE and must GRAFT the message
+// Link 1->2 made lazy by hand (PRUNE from node 2): node 2 only hears IHAVE and must GRAFT the message
 TEST(RouterTest, AnnouncedMessageIsFetchedByGraftOnce) {
     RouterMesh mesh(3, lineEdges(3));
     ASSERT_TRUE(mesh.ready);
@@ -637,11 +625,9 @@ TEST(RouterTest, LowTtlFirstCopyDoesNotCutOffRestOfNetwork) {
     message.ttlRemaining = 16;
     ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), RouterWire::encode(message)), 0);
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), message.msgId) == 1; }, 5s));
-    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), message.msgId), 1u);                    // still delivered once
+    EXPECT_EQ(mesh.recorders[1]->countOf(mesh.id(0), message.msgId), 1u);
     EXPECT_EQ(mesh.routers[1]->getStatistics().prunesSent, 0u);                               // the better path is not pruned
 }
-
-// ── Review findings (R-4) ───────────────────────────────────────────────────
 
 // An unverified duplicate claiming TTL 255 must not leave the relay with a copy nobody can encode: the genuine message
 // still reaches the rest of the network
@@ -705,8 +691,6 @@ TEST(RouterTest, GraftForMessageThatEndedHereIsNotAnswered) {
     EXPECT_EQ(mesh.routers[1]->getStatistics().fullMessagesSent, 0u);
 }
 
-// ── Routes learned from traffic (R-5 a) ─────────────────────────────────────
-
 TEST(RouterTest, BroadcastTeachesRouteToItsSenderAndDisconnectEndsIt) {
     RouterMesh mesh(4, lineEdges(4));
     ASSERT_TRUE(mesh.ready);
@@ -721,15 +705,13 @@ TEST(RouterTest, BroadcastTeachesRouteToItsSenderAndDisconnectEndsIt) {
         EXPECT_EQ(candidates.front().hops, i);
         EXPECT_EQ(candidates.front().tier(), RouteTier::Hinted);
     }
-    EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(0)).empty());                     // no route to ourselves
+    EXPECT_TRUE(mesh.routers[0]->getRouteCandidates(mesh.id(0)).empty());
 
     mesh.routers[2]->stop();
     mesh.nodes[2]->network->stop();
     EXPECT_TRUE(waitUntil([&] { return mesh.routers[3]->getRouteCandidates(mesh.id(0)).empty(); }, 5s));   // its only neighbor left
     EXPECT_EQ(mesh.routers[1]->getRouteCandidates(mesh.id(0)).size(), 1u);                    // not through node 2: unaffected
 }
-
-// ── UNICAST (R-5 b) ─────────────────────────────────────────────────────────
 
 namespace {
 RoutedMessage craftUnicast(const PeerId& claimedSender, const PeerId& destination, std::vector<uint8_t> payload) {
@@ -768,7 +750,7 @@ TEST(RouterTest, UnicastFollowsLearnedRouteToEndOfLine) {
     EXPECT_FALSE(delivery->senderAuthenticated);                                              // relayed: the sender is only claimed
     EXPECT_EQ(totalFullMessagesSent(mesh) - before, 4u);                                      // one copy per hop
     for (size_t i = 0; i < 5; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().localFloods, 0u) << "node " << i;
-    for (size_t i = 1; i < 4; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), msgId), 0u);   // relays do not deliver
+    for (size_t i = 1; i < 4; ++i) EXPECT_EQ(mesh.recorders[i]->countOf(mesh.id(0), msgId), 0u);
 }
 
 // Nobody knows the destination: local flooding finds it, and it is delivered exactly once
@@ -822,12 +804,10 @@ TEST(RouterTest, SendRefusesOwnNodeAndNonUserGroups) {
 }
 
 
-// ── ACK (R-5 c) ─────────────────────────────────────────────────────────────
-
 TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     RouterMesh mesh(4, lineEdges(4));
     ASSERT_TRUE(mesh.ready);
-    // Node 3 acknowledges an unsigned UNICAST only over a route it knows (review R-5 I4): node 0's broadcast teaches it
+    // Node 3 acknowledges an unsigned UNICAST only over a route it knows: node 0's broadcast teaches it
     const uint64_t presence = mesh.routers[0]->broadcast(0x10, 0, { 'p' }).value();
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[3]->countOf(mesh.id(0), presence) == 1; }, 5s));
 
@@ -838,7 +818,7 @@ TEST(RouterTest, UnicastAckComesBackWithRttAndConfirmsTheRoute) {
     EXPECT_EQ(receipt.hopsTraveled, 3);
     EXPECT_LT(receipt.rtt, 2s);
 
-    // The signed ACK taught the way to node 3 on every hop it crossed — a hint only (docs/router.md 4.4a): it may come back
+    // The signed ACK taught the way to node 3 on every hop it crossed: a hint only: it may come back
     // any way. The first message went by local flooding (no first hop), so it proves no route.
     const auto atSender = mesh.routers[0]->getRouteCandidates(mesh.id(3));
     ASSERT_EQ(atSender.size(), 1u);
@@ -871,9 +851,9 @@ TEST(RouterTest, BroadcastAckComesFromEveryNode) {
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[0]->acksFor(msgId).size() == 7; }, 5s));
     std::set<PeerId> acknowledgedBy;
     for (const auto& ack : mesh.recorders[0]->acksFor(msgId)) acknowledgedBy.insert(ack.acknowledgedBy);
-    EXPECT_EQ(acknowledgedBy.size(), 7u);                                                     // a count of the network
+    EXPECT_EQ(acknowledgedBy.size(), 7u);
     std::this_thread::sleep_for(300ms);
-    EXPECT_EQ(mesh.recorders[0]->acksFor(msgId).size(), 7u);                                  // each once
+    EXPECT_EQ(mesh.recorders[0]->acksFor(msgId).size(), 7u);
 }
 
 TEST(RouterTest, NoAckWithoutRequest) {
@@ -887,7 +867,7 @@ TEST(RouterTest, NoAckWithoutRequest) {
 }
 
 // An ACK must be signed by the node it names, and come from the message's addressee: a relay that drops a message and
-// acknowledges it itself is ignored (review R-5 I3)
+// acknowledges it itself is ignored
 TEST(RouterTest, ForgedAckIsDropped) {
     RouterMesh mesh(2, lineEdges(2));
     ASSERT_TRUE(mesh.ready);
@@ -926,8 +906,6 @@ TEST(RouterTest, RouteReportFromAnotherNodeIsIgnored) {
 }
 
 
-// ── Route probe (R-5 d) ─────────────────────────────────────────────────────
-
 TEST(RouterTest, RouteProbeRecordsEveryRelayInOrderWithTimes) {
     RouterMesh mesh(5, lineEdges(5));
     ASSERT_TRUE(mesh.ready);
@@ -950,8 +928,6 @@ TEST(RouterTest, RouteProbeRecordsEveryRelayInOrderWithTimes) {
     EXPECT_EQ(route.front().tier(), RouteTier::Hinted);
     EXPECT_FALSE(report.returnedSameWay);
 }
-
-// ── Route evaluation (R-8, docs/router.md 4.4a) ─────────────────────────────
 
 // A probe through a chosen neighbor that comes back over the reversed route measures that route
 TEST(RouterTest, MeasuredRouteThroughChosenNeighborRanksFirst) {
@@ -997,7 +973,7 @@ TEST(RouterTest, AckCreditsTheFirstHopNotTheWayBack) {
     }
 }
 
-// A report that did not come back the way the probe went (here: as UNICAST over the other neighbor) is no measurement —
+// A report that did not come back the way the probe went (here: as UNICAST over the other neighbor) is no measurement;
 // it counts as a failed one, so a relay cannot make a route look measured by answering around it
 TEST(RouterTest, ReportComingBackAnotherWayIsAFailedMeasurement) {
     RouterMesh mesh(4, { { 0, 1 }, { 0, 2 }, { 1, 3 }, { 2, 3 } });
@@ -1019,7 +995,7 @@ TEST(RouterTest, ReportComingBackAnotherWayIsAFailedMeasurement) {
     for (const RouteCandidate& candidate : mesh.routers[0]->getRouteCandidates(mesh.id(3))) EXPECT_NE(candidate.tier(), RouteTier::Measured);
 }
 
-// The scheduler (docs/router.md 4.4a) measures the routes of a destination we send to, without anyone asking — and in
+// The scheduler measures the routes of a destination we send to, without anyone asking, and in
 // the background, a known route nobody sends to
 TEST(RouterTest, ScheduledProbesMeasureActiveAndIdleRoutes) {
     RouterMesh mesh(4, lineEdges(4), [](size_t, RouterConfig& c) { c.routeEvaluation.probing.enabled = true; });
@@ -1038,11 +1014,11 @@ TEST(RouterTest, ScheduledProbesMeasureActiveAndIdleRoutes) {
     EXPECT_EQ(mesh.recorders[0]->routeReports.size(), 0u);                                    // the scheduler's probes are quiet
 }
 
-// ── Retries (R-8 e): the two low msgId bits number the attempt ──────────────
+// Retries: the two low msgId bits number the attempt
 
 void fastAcks(size_t, RouterConfig& c) { c.routeEvaluation.ackTimeout = 300ms; }
 
-// The first send goes through node 1, which swallows it (Router stopped); the retry does not take that route again — node 0
+// The first send goes through node 1, which swallows it (Router stopped); the retry does not take that route again: node 0
 // knows no other (a broadcast teaches only the first copy's neighbor), so it floods locally and arrives through node 2
 TEST(RouterTest, MessageWithoutAckIsResentOverTheNextRoute) {
     RouterMesh mesh(4, { { 0, 1 }, { 0, 2 }, { 1, 3 }, { 2, 3 } }, fastAcks);
@@ -1072,7 +1048,7 @@ TEST(RouterTest, RetryOfDeliveredMessageIsAcknowledgedNotDeliveredAgain) {
     ASSERT_TRUE(mesh.ready);
     const uint64_t msgId = mesh.routers[0]->send(mesh.id(2), 0x10, 0, { 'o' }, { .ackRequested = true }).value();
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), msgId) == 1; }, 5s));
-    EXPECT_EQ(mesh.routers[2]->getStatistics().acksSent, 0u);                                 // no known way back: no ACK (review R-5 I4)
+    EXPECT_EQ(mesh.routers[2]->getStatistics().acksSent, 0u);                                 // no known way back: no ACK
     const uint64_t hello = mesh.routers[0]->broadcast(0x10, 0, { 'h' }).value();             // now node 2 knows the way back
     ASSERT_TRUE(waitUntil([&] { return mesh.recorders[2]->countOf(mesh.id(0), hello) == 1; }, 5s));
 
@@ -1084,7 +1060,7 @@ TEST(RouterTest, RetryOfDeliveredMessageIsAcknowledgedNotDeliveredAgain) {
     EXPECT_EQ(deliveries, 1u);
 }
 
-// Nobody answers: three retries, the last one flooding on every hop, then onAckMissing — once
+// Nobody answers: three retries, the last one flooding on every hop, then onAckMissing, once
 TEST(RouterTest, MessageWithoutAckAfterEveryRetryIsReportedMissing) {
     struct MissingRecorder : RouterEventListener {
         void onAckMissing(const AckMissing& missing) override { std::lock_guard lock(this->mutex); this->missing.push_back(missing); }
@@ -1112,7 +1088,7 @@ TEST(RouterTest, MessageWithoutAckAfterEveryRetryIsReportedMissing) {
     mesh.routers[0]->removeListener(recorder);
 }
 
-// No report in probeTimeout, no ACK in ackTimeout: a failure for the route through the first hop — it drops to the end
+// No report in probeTimeout, no ACK in ackTimeout: a failure for the route through the first hop; it drops to the end
 TEST(RouterTest, MissingAnswersFailTheRouteThroughTheFirstHop) {
     RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& c) {
         c.routeEvaluation.ackTimeout   = 300ms;
@@ -1154,7 +1130,7 @@ TEST(RouterTest, RouteProbeWithoutRouteFindsAPath) {
     std::this_thread::sleep_for(300ms);
     ASSERT_EQ(mesh.recorders[0]->reportsFor(probe).size(), 1u);                               // later copies are duplicates
 
-    // Every step of node 0 → hops… → node 6 is an edge of the topology
+    // Every step of node 0 -> hops... -> node 6 is an edge of the topology
     const auto edges = ringWithChords();
     auto adjacent = [&](const PeerId& a, const PeerId& b) {
         for (const auto& [x, y] : edges) if ((mesh.id(x) == a && mesh.id(y) == b) || (mesh.id(x) == b && mesh.id(y) == a)) return true;
@@ -1175,7 +1151,7 @@ TEST(RouterTest, RecordRouteRefusesOwnNode) {
 
 // Routes end only with their neighbor and never expire. A broadcast parked for its sender's record can be accepted after
 // the neighbor that handed it over has left (here: alpha forgets beta's record and gets it back only after beta is
-// gone) — it must not bring a route through that neighbor back
+// gone); it must not bring a route through that neighbor back
 TEST(RouterTest, MessageAcceptedAfterItsNeighborLeftTeachesNoRoute) {
     const auto secret = makeSecret();
     TestNode alpha(secret, "alpha");
@@ -1213,7 +1189,7 @@ TEST(RouterTest, MessageAcceptedAfterItsNeighborLeftTeachesNoRoute) {
     alpha.network->stop();
 }
 
-// Review R-5 C1: unsigned UNICASTs cost nothing to forge. Overflowing the duplicate memory with them (sentAt far in the
+// Unsigned UNICASTs cost nothing to forge. Overflowing the duplicate memory with them (sentAt far in the
 // future) must neither make genuine signed traffic look already seen, nor silence unsigned traffic after the flood ends
 TEST(RouterTest, UnsignedFloodDoesNotSilenceRoutedTraffic) {
     RouterMesh mesh(2, lineEdges(2), [](size_t, RouterConfig& config) { config.duplicateCacheCapacity = 16; });
@@ -1242,8 +1218,8 @@ TEST(RouterTest, UnsignedFloodDoesNotSilenceRoutedTraffic) {
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->countOf(mesh.id(1), unicastId) == 1; }, 3s));
 }
 
-// Review R-5 I4: the sender of an unsigned UNICAST is not authenticated. Acknowledging a forged one would make us sign and
-// flood an ACK toward anyone — so an ACK goes only to a neighbor or over a known route
+// The sender of an unsigned UNICAST is not authenticated. Acknowledging a forged one would make us sign and
+// flood an ACK toward anyone, so an ACK goes only to a neighbor or over a known route
 TEST(RouterTest, UnicastFromUnknownSenderIsNotAcknowledged) {
     RouterMesh mesh(2, lineEdges(2));
     ASSERT_TRUE(mesh.ready);
@@ -1273,8 +1249,6 @@ TEST(RouterTest, UnicastAcksPerNeighborAreLimited) {
     std::this_thread::sleep_for(200ms);
     EXPECT_EQ(mesh.routers[0]->getStatistics().acksSent, 5u);
 }
-
-// ── R-6: ROUTED and ROUTE_ERROR (docs/router.md 4.2) ─────────────────────────────────────────────────────────────────
 
 uint32_t testUnixNow() { return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count()); }
 
@@ -1391,7 +1365,7 @@ TEST(RouterTest, RouteErrorFromNodeOffTheRouteIsIgnored) {
     std::this_thread::sleep_for(300ms);
     EXPECT_TRUE(mesh.recorders[0]->failuresFor(msgId).empty());
 
-    // Control: the same error signed by the route's relay counts — once, a repeat is ignored
+    // Control: the same error signed by the route's relay counts: once, a repeat is ignored
     for (int i = 0; i < 2; ++i) {
         RoutedMessage genuine = testRouterMessage(mesh.id(1), mesh.id(0), RouterWire::SUBTYPE_ROUTE_ERROR, RouterWire::encodeRouteErrorPayload({ msgId, mesh.id(2), RouteErrorReason::NextHopSendRefused }));
         genuine.signature = mesh.nodes[1]->identity->sign(RouterWire::bytesToSign(genuine));
@@ -1413,7 +1387,7 @@ TEST(RouterTest, RouteReportReturnsAlongReversedRoute) {
     EXPECT_EQ(mesh.routers[2]->getStatistics().routedForwarded, 1u);
 }
 
-// Review R-6 I1: a send refused for a local reason (here: larger than the send queue) says nothing about the route — the
+// A send refused for a local reason (here: larger than the send queue) says nothing about the route: the
 // sender hears of the failure, but the route it learned through that first hop stays
 TEST(RouterTest, LocallyRefusedSendKeepsTheRoute) {
     RouterMesh mesh(3, lineEdges(3));
@@ -1429,8 +1403,6 @@ TEST(RouterTest, LocallyRefusedSendKeepsTheRoute) {
     EXPECT_EQ(failure.reason, RouteErrorReason::NextHopSendRefused);
     EXPECT_EQ(mesh.routers[0]->getRouteCandidates(mesh.id(2)).size(), 1u);
 }
-
-// ── TTL exhausted on a known way (ROUTE_ERROR 0x03, docs/router.md 4.2) ───────────────────────────────────────────
 
 // Every node of the line learns the way to both ends, so a relay whose TTL runs out knows where the message would go
 void learnBothEnds(RouterMesh& mesh) {
@@ -1469,7 +1441,7 @@ TEST(RouterTest, UnicastTtlEndingInLocalFloodingIsNotReported) {
     EXPECT_TRUE(mesh.recorders[0]->failuresFor(toFar).empty());
     for (size_t i = 0; i < 5; ++i) EXPECT_EQ(mesh.routers[i]->getStatistics().routeErrorsSent, 0u) << "node " << i;
 
-    // Control: the same TTL toward node 3 — a neighbor of node 2, where the TTL runs out — is reported
+    // Control: the same TTL toward node 3 (a neighbor of node 2, where the TTL runs out) is reported
     const uint64_t toNeighborOfLast = mesh.routers[0]->send(mesh.id(3), 0x10, 0, { 'n' }, { .ackRequested = true }).value();
     EXPECT_TRUE(waitUntil([&] { return mesh.recorders[0]->failuresFor(toNeighborOfLast).size() == 1; }, 5s));
 }
@@ -1496,7 +1468,7 @@ TEST(RouterTest, RoutedTtlEndingAtRelayReportsRouteError) {
     EXPECT_EQ(mesh.recorders[3]->total(), 0u);
 }
 
-// For UNICAST the sender does not know the relays, so only a TTL report counts — and only once; a "broken link" claim about
+// For UNICAST the sender does not know the relays, so only a TTL report counts, and only once; a "broken link" claim about
 // a hop it never chose must not reach the application
 TEST(RouterTest, UnicastAcceptsOnlyTtlReportOnce) {
     RouterMesh mesh(3, lineEdges(3));
@@ -1520,7 +1492,7 @@ TEST(RouterTest, UnicastAcceptsOnlyTtlReportOnce) {
     EXPECT_EQ(mesh.recorders[0]->failuresFor(msgId).size(), 1u);
 }
 
-// Nobody waits for a report about an answer (ACK, ROUTE_ERROR, ROUTE_REPORT, PRESENCE_REPLY) — only about data and probes
+// Nobody waits for a report about an answer (ACK, ROUTE_ERROR, ROUTE_REPORT, PRESENCE_REPLY), only about data and probes
 TEST(RouterTest, AnswerRunningOutOfTtlIsNotReported) {
     RouterMesh mesh(4, lineEdges(4));
     ASSERT_TRUE(mesh.ready);
@@ -1541,8 +1513,6 @@ TEST(RouterTest, AnswerRunningOutOfTtlIsNotReported) {
     ASSERT_GT(mesh.nodes[0]->network->sendToPeer(mesh.id(1), signedFromNodeZero(RouterWire::SUBTYPE_RECORD_ROUTE, RouterWire::encodeRecordRoutePayload({ nowMs, {} }))), 0);
     EXPECT_TRUE(waitUntil([&] { return mesh.routers[2]->getStatistics().routeErrorsSent == 1; }, 5s));
 }
-
-// ── DIAG: STATE_QUERY / STATE_REPORT (docs/router.md 4.6) ──────────────────────────────────────────────────────────
 
 using StateReportWire::StateQuery;
 using StateReportWire::StateSection;
@@ -1679,8 +1649,6 @@ TEST(RouterTest, StateReportOverLimitIsMarkedTruncated) {
     EXPECT_FALSE(receipt->report.neighbors.has_value());                                      // one neighbor entry alone takes 57 B
 }
 
-// ── PRESENCE: the Router's own "I am here" to every other Router ────────────────────────────────────────────────────
-
 // Without any application traffic every node learns the way back to every other, and no application hears of it
 TEST(RouterTest, PresenceTeachesTheWayBackWithoutDelivery) {
     RouterMesh mesh(4, lineEdges(4), [](size_t, RouterConfig& config) { config.announcePresence = true; });
@@ -1712,7 +1680,7 @@ TEST(RouterTest, PresenceIsLimitedAndCaughtUp) {
 }
 
 // A node that joins later learns the way to nodes that get no new neighbor (and so send no PRESENCE): every Router answers
-// a PRESENCE with a PRESENCE_REPLY to its sender — at most once per presenceMinInterval to the same node
+// a PRESENCE with a PRESENCE_REPLY to its sender, at most once per presenceMinInterval to the same node
 TEST(RouterTest, LateJoinerLearnsTheWayToEveryone) {
     RouterMesh mesh(3, lineEdges(3), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 0ms; });
     ASSERT_TRUE(mesh.ready);
@@ -1732,8 +1700,8 @@ TEST(RouterTest, LateJoinerLearnsTheWayToEveryone) {
     gamma.network->stop();
 }
 
-// Review PRESENCE I1: the answers to a joiner's PRESENCE come from nodes whose records it mostly lacks, so they wait for
-// those records — in a bounded queue per neighbor. Answers spread over time get through that queue; a burst would be
+// The answers to a joiner's PRESENCE come from nodes whose records it mostly lacks, so they wait for
+// those records, in a bounded queue per neighbor. Answers spread over time get through that queue; a burst would be
 // dropped, and each replier would not answer again for a whole interval
 TEST(RouterTest, LateJoinerLearnsEveryoneThroughASmallVerificationQueue) {
     RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 1500ms; },
@@ -1755,7 +1723,7 @@ TEST(RouterTest, LateJoinerLearnsEveryoneThroughASmallVerificationQueue) {
     gamma.network->stop();
 }
 
-// Each PRESENCE_REPLY carries its sender's record, so a joiner verifies every answer at once — even with no room at all
+// Each PRESENCE_REPLY carries its sender's record, so a joiner verifies every answer at once, even with no room at all
 // for messages from unknown senders (nothing parked, no PEX_REQUEST, no race between answers)
 TEST(RouterTest, LateJoinerVerifiesAnswersByTheirAttachedRecords) {
     RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) { config.announcePresence = true; config.presenceReplySpread = 200ms; },
@@ -1777,7 +1745,7 @@ TEST(RouterTest, LateJoinerVerifiesAnswersByTheirAttachedRecords) {
     gamma.network->stop();
 }
 
-// Review PRESENCE I2: one node's answers together are budgeted — the rest wait for the next second, none is lost
+// One node's answers together are budgeted: the rest wait for the next second, none is lost
 TEST(RouterTest, PresenceRepliesAreBudgetedPerSecond) {
     RouterMesh mesh(5, lineEdges(5), [](size_t, RouterConfig& config) {
         config.announcePresence = true; config.presenceReplySpread = 0ms; config.presenceRepliesPerSecond = 1;

@@ -22,12 +22,12 @@ ProbeSchedulerConfig config(double probesPerSecond = 5) {
 
 } // namespace
 
-// An active destination's routes are measured — never measured first — and again after activeProbeInterval
+// An active destination's routes are measured (never measured first) and again after activeProbeInterval
 TEST(ProbeSchedulerTest, RoutesOfActiveDestinationAreMeasuredPeriodically) {
     const PeerId dest = peerId(0xD0);
     RouteTable routes;
     routes.learn(dest, A, 2, T0);
-    routes.recordMeasurement(dest, B, 3, 40ms, T0);                                           // measured just now
+    routes.recordMeasurement(dest, B, 3, 40ms, T0);
     ProbeScheduler scheduler(config());
     scheduler.noteTraffic(dest, T0);
     // Busy: no background scan in the way
@@ -57,7 +57,6 @@ TEST(ProbeSchedulerTest, ProbesPerSecondIsAHardLimit) {
     EXPECT_EQ(scheduler.takeDueProbes(T0 + 5s, routes).size(), 2u);                           // saved up for one second at most
 }
 
-// Urgent before active before background
 TEST(ProbeSchedulerTest, UrgentBeforeActiveBeforeBackground) {
     const PeerId urgent = peerId(0x01), active = peerId(0x02), idle = peerId(0x03);
     RouteTable routes;

@@ -22,7 +22,6 @@ namespace {
     constexpr uint8_t  NEIGHBOR_INBOUND    = 0x01;
     constexpr uint8_t  NEIGHBOR_EAGER      = 0x02;
     constexpr uint8_t  NEIGHBOR_HOLE_PUNCHED = 0x04;
-    // flag 0x04 was "pinned" (withdrawn) — not reused
     constexpr uint32_t RTT_UNKNOWN         = 0xFFFFFFFF;
 
     void writeShortString(std::vector<uint8_t>& out, const std::string& text) {

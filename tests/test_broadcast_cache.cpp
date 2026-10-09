@@ -10,7 +10,7 @@ const auto T0 = std::chrono::steady_clock::time_point(std::chrono::seconds(1000)
 
 PeerId peerId(uint8_t fill) { PeerId id; id.fill(fill); return id; }
 
-// Signature bytes need not be valid — the cache never verifies
+// Signature bytes need not be valid: the cache never verifies
 RoutedMessage broadcast(uint8_t sender, uint64_t msgId, size_t payloadSize, uint8_t ttlRemaining = 10) {
     RoutedMessage m;
     m.group        = 0x10;
@@ -60,7 +60,7 @@ TEST(BroadcastCacheTest, ByteLimitEvictsOldestFirstAndRefusesOversize) {
     EXPECT_EQ(cache.bytes(), 3 * (OVERHEAD + 100));
 
     ASSERT_TRUE(cache.store(broadcast(1, 4, 100), T0 + 4s));
-    EXPECT_EQ(cache.find({ peerId(1), 1 }), nullptr);                                          // oldest went
+    EXPECT_EQ(cache.find({ peerId(1), 1 }), nullptr);
     EXPECT_NE(cache.find({ peerId(1), 2 }), nullptr);
     EXPECT_EQ(cache.bytes(), 3 * (OVERHEAD + 100));
 
@@ -81,7 +81,7 @@ TEST(BroadcastCacheTest, EachNeighborGetsTheFullCopyOnce) {
     EXPECT_TRUE(cache.wasSentTo(keyOf(m), peerId(0xA)));
     EXPECT_FALSE(cache.markSentTo(keyOf(m), peerId(0xA)));                                     // a repeated GRAFT gets nothing more
     EXPECT_TRUE(cache.markSentTo(keyOf(m), peerId(0xB)));
-    EXPECT_FALSE(cache.markSentTo({ peerId(1), 8 }, peerId(0xA)));                             // not held
+    EXPECT_FALSE(cache.markSentTo({ peerId(1), 8 }, peerId(0xA)));
 }
 
 // The copy queued to a neighbor whose connection broke may never have arrived
@@ -97,7 +97,7 @@ TEST(BroadcastCacheTest, NeighborThatLeftCanBeSentEverythingAgain) {
     cache.forgetNeighbor(peerId(0xA));
     EXPECT_TRUE(cache.markSentTo(keyOf(first), peerId(0xA)));
     EXPECT_TRUE(cache.markSentTo(keyOf(second), peerId(0xA)));
-    EXPECT_FALSE(cache.markSentTo(keyOf(second), peerId(0xB)));                                // others untouched
+    EXPECT_FALSE(cache.markSentTo(keyOf(second), peerId(0xB)));
 }
 
 TEST(BroadcastCacheTest, ReplaceTakesBetterCopyAndClearsWhoGotIt) {
@@ -114,6 +114,6 @@ TEST(BroadcastCacheTest, ReplaceTakesBetterCopyAndClearsWhoGotIt) {
     EXPECT_EQ(cache.bytes(), RouterWire::encodedSize(better));
     EXPECT_TRUE(cache.markSentTo(keyOf(low), peerId(0xA)));                                    // the better copy goes to everyone again
 
-    EXPECT_FALSE(cache.replace(broadcast(1, 8, 10), T0 + 1s));                                 // nothing to replace
+    EXPECT_FALSE(cache.replace(broadcast(1, 8, 10), T0 + 1s));
     EXPECT_EQ(cache.size(), 1u);
 }

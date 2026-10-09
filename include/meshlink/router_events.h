@@ -13,48 +13,47 @@
 
 namespace invilite::Mesh {
 
-    // A routed message delivered to this node's applications. The Router delivers every broadcast; filtering by
-    // group / subtype is the application's job (nodes forward services they do not implement — docs/router.md 1).
+    // A routed message delivered to this node's applications. Every broadcast is delivered; filtering by group and
+    // subtype is the application's job, because nodes forward services they do not implement themselves.
     struct RoutedDelivery {
-        PeerId                  sender{};                                           // originator as the header says — see senderAuthenticated
+        PeerId                  sender{};                                           // originator as the header says; see senderAuthenticated
         uint64_t                msgId   = 0;                                        // sender's message id; (sender, msgId) is unique
         uint8_t                 group   = 0;
         uint16_t                subtype = 0;
         RoutingMode             mode    = RoutingMode::Broadcast;
         uint8_t                 hopsTraveled = 0;                                   // 1 = from a direct neighbor
-        // The sender is proven: by its signature (FLOOD / BROADCAST), or by the link when a UNICAST came straight from that
-        // neighbor. A UNICAST relayed by others names its sender unverified until E2E (C2).
+        // The sender is proven by its signature (FLOOD / BROADCAST), or by the link when a UNICAST came straight from that
+        // neighbor. A UNICAST relayed by others names its sender unverified.
         bool                    senderAuthenticated = false;
         std::vector<uint8_t>    payload;
     };
 
     // An ACK for a message this node sent with ACK_REQUESTED: one per destination of a UNICAST, one per node for a
-    // broadcast. Signed by the acknowledging node (verified).
+    // broadcast. The signature of the acknowledging node is already verified.
     struct AckReceipt {
         uint64_t                    acknowledgedMsgId = 0;
         PeerId                      acknowledgedBy{};
         std::chrono::milliseconds   rtt{0};                                         // from our send to this ACK's arrival
         uint8_t                     hopsTraveled = 0;                               // of the ACK on its way back
-        uint8_t                     attempt = 0;                                    // which send it answers: 0 the first, 1–3 retries (R-8 e)
+        uint8_t                     attempt = 0;                                    // which send it answers: 0 the first, 1-3 retries
     };
 
-    // No ACK for a message sent with ackRequested, after every retry (docs/router.md 4.4a, R-8 e): it may have arrived
-    // all the same (only the ACKs lost), or not
+    // No ACK for a message sent with ackRequested, after every retry. It may still have arrived (only the ACKs lost).
     struct AckMissing {
         PeerId                      destination{};
         uint64_t                    msgId = 0;
         uint8_t                     attempts = 0;                                   // sends made, the first included
     };
 
-    // Answer to Router::recordRoute (diagnostics): the path the probe took and when each relay saw it
+    // Answer to Router::recordRoute: the path the probe took and when each relay saw it.
     struct RouteReport {
         PeerId                      destination{};
         uint64_t                    probeMsgId = 0;
-        std::vector<RouteHop>       hops;                                           // relays in order; offsets in ms after sending (synchronized clocks)
+        std::vector<RouteHop>       hops;                                           // relays in order; offsets in ms after sending (assumes synchronized clocks)
         uint32_t                    receivedOffsetMs = 0;                           // at the destination
         std::chrono::milliseconds   rtt{0};                                         // probe out + report back, our clock only
         std::optional<PeerId>       firstHop;                                       // the neighbor the probe was handed to, when one
-        bool                        returnedSameWay = false;                        // the report came back over the reversed route: a measurement (docs/router.md 4.4a)
+        bool                        returnedSameWay = false;                        // the report came back over the reversed route: a measurement
     };
 
     // A message we sent along a source route (Router::sendAlongRoute) did not get through: a relay of the route reported
@@ -69,7 +68,7 @@ namespace invilite::Mesh {
         RouteErrorReason    reason = RouteErrorReason::NextHopNotNeighbor;
     };
 
-    // A node's answer to our STATE_QUERY (docs/router.md 4.6); our own node answers locally with rtt 0
+    // A node's answer to our STATE_QUERY; our own node answers locally with rtt 0.
     struct StateReportReceipt {
         PeerId                          from{};
         uint64_t                        queryMsgId = 0;
@@ -77,9 +76,8 @@ namespace invilite::Mesh {
         StateReportWire::StateReport    report;
     };
 
-    // Observer for Router deliveries. Callbacks fire on the Router thread, which serves every peer: listeners MUST be
-    // fast and non-blocking (enqueue and return), and MUST NOT call Router::stop() (it joins the very thread running the
-    // callback). Exceptions are caught per listener. Default implementations are empty.
+    // Observer for Router events. Every callback runs on the Router thread; must not block (enqueue and return), and must
+    // not call Router::stop(), which joins that thread. Exceptions are caught per listener. Defaults do nothing.
     class RouterEventListener {
     public:
         virtual ~RouterEventListener() = default;

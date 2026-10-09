@@ -19,7 +19,7 @@ TEST(PeerReachabilityTest, PeerBehindNatKeepsOnlyAddressesReachableFromHere) {
     KnownPeer peer;
     peer.record.addresses = { { PeerAddress::Type::IPv4, "172.16.1.10", 8420 }, { PeerAddress::Type::IPv4, "203.0.113.7", 8420 },
                               { PeerAddress::Type::IPv4, "192.168.1.2", 8420 }, { PeerAddress::Type::IPv4, "198.51.100.1", 0 } };
-    EXPECT_EQ(dialableAddresses(peer).size(), 3u);                                           // no evidence: all but port 0 (R3)
+    EXPECT_EQ(dialableAddresses(peer).size(), 3u);                                           // no evidence: all but port 0
 
     peer.reachedUsOverPublicInternet = true;
     const auto dialable = dialableAddresses(peer);

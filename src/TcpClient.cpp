@@ -32,7 +32,7 @@ std::string_view connectErrorName(ConnectError error) {
 
 namespace {
 
-// One TCP connect attempt — the code shared by connect() and connectSimultaneous(): a socket that allows local port
+// One TCP connect attempt, the code shared by connect() and connectSimultaneous(): a socket that allows local port
 // reuse, bound to `localEndpoint` (any port when null), a non-blocking connect and a wait of at most `timeout`. On success
 // `connectedSocket` holds the socket; on failure it is closed and -1.
 ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const sockaddr* localEndpoint, socklen_t localLength, std::chrono::milliseconds timeout, int& connectedSocket) {
@@ -43,10 +43,10 @@ ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const s
     const auto fail = [sock](ConnectError error) { ::close(sock); return error; };
 
     // Every outgoing socket allows reuse of its local port from the start: which connection will later carry a NAT
-    // hole punch (F7) is not known in advance, and the kernel lets a second socket bind only if all of them opted in
+    // hole punch is not known in advance, and the kernel lets a second socket bind only if all of them opted in
     if (!Platform::allowLocalPortReuse(sock)) return fail(ConnectError::PortReuse);
 
-    // Always an explicit bind — to the given endpoint, otherwise to any port. A port picked by connect() alone may be
+    // Always an explicit bind: to the given endpoint, otherwise to any port. A port picked by connect() alone may be
     // shared with other programs' connected sockets (Linux shares it whenever the four-tuples differ), and one of them
     // without SO_REUSEADDR would make a later punch from that port fail to bind. bind() reserves the port for us.
     sockaddr_storage anyPort{};
@@ -64,7 +64,7 @@ ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const s
     if (result < 0 && errno != EINPROGRESS) return fail(ConnectError::ConnectFailed);
 
     if (result != 0) {
-        // EINPROGRESS — wait for socket to become writable within timeout (poll: no FD_SETSIZE limit, unlike select)
+        // EINPROGRESS: wait for socket to become writable within timeout (poll: no FD_SETSIZE limit, unlike select)
         pollfd pending{ sock, POLLOUT, 0 };
         int pollResult;
         do {
@@ -79,7 +79,7 @@ ConnectError connectOnce(const sockaddr* remote, socklen_t remoteLength, const s
         socklen_t errLen  = sizeof(soError);
         if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &errLen) < 0 || soError != 0) return fail(ConnectError::Refused);
     }
-    // result == 0: instant connect (rare — e.g. loopback with nothing to wait for)
+    // result == 0: instant connect (rare: e.g. loopback with nothing to wait for)
 
     connectedSocket = sock;
     return ConnectError::None;
@@ -98,7 +98,7 @@ ConnectError TcpClient::connect(const std::string& address, int port, std::chron
         return ConnectError::AlreadyConnected;
     }
 
-    // Resolve address — handles IPv4 literals, IPv6 literals, and hostnames
+    // Resolve address: handles IPv4 literals, IPv6 literals, and hostnames
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;                                                  // accept both IPv4 and IPv6
     hints.ai_socktype = SOCK_STREAM;
@@ -117,7 +117,7 @@ ConnectError TcpClient::connect(const std::string& address, int port, std::chron
     ConnectError     lastError = ConnectError::ConnectFailed;
     int              sock      = -1;
 
-    // Try each resolved address in turn — first one that connects wins
+    // Try each resolved address in turn: first one that connects wins
     for (addrinfo* rp = resolved; rp != nullptr; rp = rp->ai_next) {
         lastError = connectOnce(rp->ai_addr, rp->ai_addrlen, nullptr, 0, timeout, sock);
         if (lastError == ConnectError::None) {
@@ -195,7 +195,7 @@ ConnectError TcpClient::adoptConnectedSocket(const int connectedSocket, const so
         return ConnectError::KeepAlive;
     }
 
-    // Fire callback — caller may extract socket via release() if they want ownership. An exception from it reaches the
+    // Fire callback: caller may extract socket via release() if they want ownership. An exception from it reaches the
     // caller of connect(), which knows how to report it; the socket stays owned (and is closed) by this client.
     if (this->onConnect_) this->onConnect_(this->clientSocket, &remoteAddress);
 
