@@ -13,7 +13,7 @@ ifeq ($(BOTAN),system)
   BOTAN_LIBS := $(shell pkg-config --libs botan-3)
   BOTAN_DEP :=
 else
-  BOTAN_DIR := third_party/botan
+  BOTAN_DIR := $(CURDIR)/third_party/botan
   BOTAN_CFLAGS := -I$(BOTAN_DIR)/build/include/public
   BOTAN_LIBS := $(BOTAN_DIR)/libbotan-3.a
   BOTAN_DEP := $(BOTAN_DIR)/libbotan-3.a
@@ -82,8 +82,9 @@ bench/%.o: bench/%.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
 install: all
-	install -d $(DESTDIR)$(PREFIX)/include/meshlink $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	install -d $(DESTDIR)$(PREFIX)/include/meshlink $(DESTDIR)$(PREFIX)/include/transport $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	cp -r include/meshlink/. $(DESTDIR)$(PREFIX)/include/meshlink/
+	cp -r include/transport/. $(DESTDIR)$(PREFIX)/include/transport/
 	install -m 644 $(STATIC_LIB) $(DESTDIR)$(PREFIX)/lib/
 	install -m 755 $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/
 	ln -sf $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/libmeshlink.so.$(SOVERSION)
@@ -98,7 +99,13 @@ else
 	    -e 's|@LIBS_PRIVATE@||' -e 's|@CFLAGS_EXTRA@||' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
 endif
 
-.PHONY: all dev test tests tsan bench install clean
+# Used by meshlink's Makefile when it builds against a libmeshlink checkout instead of an installed copy
+print-botan-cflags:
+	@echo $(BOTAN_CFLAGS)
+print-botan-libs:
+	@echo $(BOTAN_LIBS)
+
+.PHONY: all dev test tests tsan bench install clean print-botan-cflags print-botan-libs
 
 clean:
 	rm -f $(OBJECTS) $(STATIC_LIB) libmeshlink.so* $(TEST_OBJECTS) $(TEST_BINARY) run_test_tsan bench/*.o bench/*.d run_bench $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
