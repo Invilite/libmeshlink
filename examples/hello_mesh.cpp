@@ -14,10 +14,17 @@
 #include <chrono>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
 using namespace invilite::Mesh;
+
+static std::optional<uint16_t> parsePort(const std::string& text) {
+    if (text.empty() || text.size() > 5 || text.find_first_not_of("0123456789") != std::string::npos) return std::nullopt;
+    const int port = std::stoi(text);
+    return port > 0 && port <= 65535 ? std::optional<uint16_t>(port) : std::nullopt;
+}
 
 // Runs on the Router's thread: print and return, never block here.
 class PrintMessages : public RouterEventListener {
@@ -29,8 +36,20 @@ public:
 };
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s <port> [host:port]\n", argv[0]); return 1; }
-    const auto port = static_cast<uint16_t>(std::stoi(argv[1]));
+    const auto usage = [&] { std::fprintf(stderr, "usage: %s <port> [host:port]\n", argv[0]); return 1; };
+    if (argc < 2) return usage();
+    const std::optional<uint16_t> port = parsePort(argv[1]);
+    std::optional<uint16_t> peerPort;
+    std::string peerHost;
+    if (argc > 2) {
+        const std::string peer = argv[2];
+        const auto colon = peer.rfind(':');
+        if (colon == std::string::npos || colon == 0) return usage();
+        peerHost = peer.substr(0, colon);
+        peerPort = parsePort(peer.substr(colon + 1));
+        if (!peerPort) return usage();
+    }
+    if (!port) return usage();
 
     // Every node of one mesh shares this 64-byte key. A real network uses a random one (meshlinkd --create-network-key).
     auto networkKey = std::make_shared<std::array<uint8_t, 64>>();
@@ -41,8 +60,8 @@ int main(int argc, char** argv) {
     auto directory = std::make_shared<PeerDirectory>();
 
     NetworkConfig config;
-    config.listenPort = port;
-    config.nodeName   = "hello-" + std::to_string(port);
+    config.listenPort = *port;
+    config.nodeName   = "hello-" + std::to_string(*port);
 
     Network network(identity, networkKey, directory, config);
     Router  router(network, directory, identity);
@@ -50,11 +69,7 @@ int main(int argc, char** argv) {
 
     network.start();
     router.start();
-    if (argc > 2) {
-        const std::string peer = argv[2];
-        const auto colon = peer.rfind(':');
-        network.connectToPeer(peer.substr(0, colon), static_cast<uint16_t>(std::stoi(peer.substr(colon + 1))));
-    }
+    if (peerPort) network.connectToPeer(peerHost, *peerPort);
 
     while (network.getConnectedPeerCount() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     std::this_thread::sleep_for(std::chrono::milliseconds(500));       // let the other side's Router see us too

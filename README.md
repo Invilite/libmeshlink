@@ -63,8 +63,10 @@ only random bytes.
 **Identity.** The key exchange only proves that both sides know the network key. Each side then proves its identity
 over the encrypted channel:
 
-1. The initiator sends a fresh nonce, its Ed25519 and X25519 public keys and its name.
-2. The responder answers with the same fields plus an Ed25519 signature over the initiator's nonce and its own fields.
+1. The initiator sends a fresh nonce, a flags byte (for example: this connection is only a reachability probe), its
+   Ed25519 and X25519 public keys and its name.
+2. The responder answers with the same fields plus an Ed25519 signature over the initiator's nonce and its own fields,
+   flags included.
 3. The initiator sends its signature over the responder's nonce.
 
 A node's id is BLAKE2b of its two public keys, so an id cannot be claimed without the matching private key.
@@ -107,12 +109,12 @@ out of the signature; everything else is signed.
 
 ## Example
 
-`examples/hello_mesh.cpp` is a complete node in under 70 lines:
+`examples/hello_mesh.cpp` is a complete node in about 80 lines:
 
 ```cpp
 NetworkConfig config;
-config.listenPort = port;
-config.nodeName   = "hello-" + std::to_string(port);
+config.listenPort = *port;
+config.nodeName   = "hello-" + std::to_string(*port);
 
 Network network(identity, networkKey, directory, config);
 Router  router(network, directory, identity);
@@ -120,11 +122,7 @@ router.addListener(std::make_shared<PrintMessages>());
 
 network.start();
 router.start();
-if (argc > 2) {
-    const std::string peer = argv[2];
-    const auto colon = peer.rfind(':');
-    network.connectToPeer(peer.substr(0, colon), static_cast<uint16_t>(std::stoi(peer.substr(colon + 1))));
-}
+if (peerPort) network.connectToPeer(peerHost, *peerPort);
 
 while (network.getConnectedPeerCount() == 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
 std::this_thread::sleep_for(std::chrono::milliseconds(500));       // let the other side's Router see us too
