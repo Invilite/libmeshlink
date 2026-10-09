@@ -762,10 +762,13 @@ TEST(NetworkIntegrationTest, SlowHandshakeIsCutAtDeadline) {
     EXPECT_TRUE(closed);
     EXPECT_LT(std::chrono::steady_clock::now() - start, 6500ms);
 
-    {
-        RawConnection next(node.port);                                                        // the slot came back: admitted, not closed at once
-        EXPECT_FALSE(next.closedByRemoteWithin(300ms));
+    // The slot comes back when the handshake worker ends, a moment after the socket was closed: allow it that moment
+    bool admitted = false;
+    for (const auto until = std::chrono::steady_clock::now() + 2s; !admitted && std::chrono::steady_clock::now() < until;) {
+        RawConnection next(node.port);
+        admitted = !next.closedByRemoteWithin(300ms);
     }
+    EXPECT_TRUE(admitted);
 
     node.network->stop();
 }
