@@ -20,7 +20,7 @@
 #include <cstring>
 #include <memory>
 
-// Never raise SIGPIPE when the remote is gone — sends run on any thread, including application threads whose signal mask
+// Never raise SIGPIPE when the remote is gone: sends run on any thread, including application threads whose signal mask
 // we do not control. Linux/BSD suppress it per call (MSG_NOSIGNAL); macOS has no such flag and uses SO_NOSIGPIPE per socket.
 #ifdef MSG_NOSIGNAL
 constexpr int SEND_FLAGS = MSG_NOSIGNAL;
@@ -82,7 +82,7 @@ invilite::Mesh::Connection::Connection(const int clientSocket, const sockaddr_st
         throw std::runtime_error("Unable to switch socket to non-blocking mode");
     }
 
-    // Latency only, never correctness — a socket that refuses it still works
+    // Latency only, never correctness: a socket that refuses it still works
     Transport::Platform::disableNagle(clientSocket);
 
 #if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
@@ -121,7 +121,7 @@ int invilite::Mesh::Connection::initHandshake() {
         header[16 + i] ^= headerMask[i];
     }
 
-    // Generate Elliptic-curve Diffie–Hellman key pair using X448 curve
+    // Generate Elliptic-curve Diffie-Hellman key pair using X448 curve
     Botan::AutoSeeded_RNG rng;
     this->privateKey = std::make_shared<Botan::X448_PrivateKey>(rng);
     const std::vector<uint8_t> pubKeyA = static_cast<Botan::X448_PrivateKey*>(this->privateKey.get())->public_value();
@@ -157,8 +157,8 @@ int invilite::Mesh::Connection::waitForHandshake(const milliseconds timeout) {
     std::vector<uint8_t> message;
     message.reserve(maxLength);
 
-    // Wait for full handshake receiving. `timeout` bounds the whole wait, not each chunk — otherwise a client sending one
-    // byte just before every timeout keeps the handshake (and its worker thread) alive forever (R1, slowloris).
+    // Wait for full handshake receiving. `timeout` bounds the whole wait, not each chunk: otherwise a client sending one
+    // byte just before every timeout keeps the handshake (and its worker thread) alive forever (slowloris).
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     bool handshakeReceived = false;
     while (!handshakeReceived) {
@@ -242,7 +242,7 @@ int invilite::Mesh::Connection::validateHandshake(const std::vector<uint8_t>* me
     // Load received public key "A"
     const Botan::X448_PublicKey pubKeyA(std::span<const uint8_t>(message->data() + header.size(), 56));
 
-    // Generate Elliptic-curve Diffie–Hellman key pair using X448 curve
+    // Generate Elliptic-curve Diffie-Hellman key pair using X448 curve
     Botan::AutoSeeded_RNG rng;
     const Botan::X448_PrivateKey privateKeyB(rng);
     const std::vector<uint8_t> pubKeyB = privateKeyB.public_value();
@@ -384,7 +384,7 @@ template <uint16_t bufferSize> ssize_t invilite::Mesh::Connection::receiveRaw(st
         return 0;
     }
 
-    // Remember the base offset — data may already contain bytes from a previous call
+    // Remember the base offset: data may already contain bytes from a previous call
     const size_t baseOffset = data.size();
     ssize_t totalReceived = 0;
 
@@ -396,7 +396,7 @@ template <uint16_t bufferSize> ssize_t invilite::Mesh::Connection::receiveRaw(st
             break;
         }
 
-        // Expand buffer to fit incoming chunk — no reallocation if capacity was reserved upfront
+        // Expand buffer to fit incoming chunk: no reallocation if capacity was reserved upfront
         const size_t writeOffset = baseOffset + totalReceived;
         data.resize(writeOffset + maxChunkSize);
 
@@ -420,7 +420,7 @@ template <uint16_t bufferSize> ssize_t invilite::Mesh::Connection::receiveRaw(st
 
             // Remote peer closed connection
             if (receivedBytes == 0) {
-                // EOF — remote closed connection. If we already read some data this call,
+                // EOF: remote closed connection. If we already read some data this call,
                 // return it now; the next call will see SocketClosed with zero bytes.
                 if (totalReceived > 0) break;
                 return static_cast<int32_t>(Error::Connection::SocketClosed);
@@ -496,11 +496,11 @@ ssize_t invilite::Mesh::Connection::receive(std::vector<uint8_t>& data, const mi
         return buffered;
     }
 
-    // Need more data — read from socket. Only the start of one incomplete frame is left in the buffer now; moving it to
+    // Need more data: read from socket. Only the start of one incomplete frame is left in the buffer now; moving it to
     // the front here, once per socket read, keeps consuming frames free of copies (moving the rest after every frame
     // was quadratic in the buffered amount).
     this->compactFrameBuffer();
-    if (this->frameBuffer.size() >= messageHardLimit) {                                                                 // Buffer full and still no valid frame — stream is unrecoverable
+    if (this->frameBuffer.size() >= messageHardLimit) {                                                                 // Buffer full and still no valid frame: stream is unrecoverable
         return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
     }
 
@@ -550,12 +550,12 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
             return static_cast<int32_t>(Error::Connection::InvalidFrameHeader);
         }
 
-        if (this->frameLength > messageHardLimit) {                                                                     // Reject frames exceeding hard limit — we can't recover stream sync
+        if (this->frameLength > messageHardLimit) {                                                                     // Reject frames exceeding hard limit: we can't recover stream sync
             return static_cast<int32_t>(Error::Connection::ReceivedTooMuch);
         }
 
         if (this->frameLength > available && this->frameBufferOffset + this->frameLength > this->frameBuffer.capacity()) {
-            this->compactFrameBuffer();                                                                                 // Large frame: start it at the front, then reserve its exact size —
+            this->compactFrameBuffer();                                                                                 // Large frame: start it at the front, then reserve its exact size:
             this->frameBuffer.reserve(this->frameLength);                                                               // receiveRaw will write directly without reallocation
         }
     }
@@ -565,7 +565,7 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
         return 0;
     }
 
-    // We have a complete frame — decrypt it
+    // We have a complete frame: decrypt it
     try {
         const std::span<const uint8_t> frame(this->frameBuffer.data() + this->frameBufferOffset, this->frameLength);
         std::vector<uint8_t> decryptedData = this->decryptData(frame);
@@ -574,7 +574,7 @@ ssize_t invilite::Mesh::Connection::processFrame(std::vector<uint8_t>& data) {
         // if (this->frameFlags) { }
 
         const ssize_t finalDataSize = static_cast<ssize_t>(decryptedData.size());
-        data = std::move(decryptedData);                                                                                // Move decrypted data to output buffer — no copy
+        data = std::move(decryptedData);                                                                                // Move decrypted data to output buffer: no copy
 
         // Consume the frame by advancing the offset; once everything is consumed, start over at the front for free
         this->frameBufferOffset += this->frameLength;
@@ -612,18 +612,18 @@ ssize_t invilite::Mesh::Connection::send(const std::vector<uint8_t>* data) {
     }
 
     constexpr size_t overhead = 24 + 8 + 16;                                                                            // nonce + header + Poly1305 tag
-    if (data->size() > messageHardLimit - overhead || data->size() + overhead > this->sendQueueLimit) {                // Such a frame could never be accepted — reject before encrypting
+    if (data->size() > messageHardLimit - overhead || data->size() + overhead > this->sendQueueLimit) {                // Such a frame could never be accepted: reject before encrypting
         return static_cast<int32_t>(Error::Connection::MessageTooLarge);
     }
 
     const size_t frameSize = data->size() + overhead;
     {
-        // Cheap rejection before encrypting — a send toward a peer whose queue is full must not burn CPU and memory on crypto
+        // Cheap rejection before encrypting: a send toward a peer whose queue is full must not burn CPU and memory on crypto
         std::lock_guard lock(this->sendQueueMutex);
         if (const ssize_t refusal = this->checkFrameFitsLocked(frameSize); refusal < 0) return refusal;
     }
 
-    std::vector<uint8_t> frame = this->encryptData(*data);                                                              // Encrypt outside the lock — senders on other threads keep going
+    std::vector<uint8_t> frame = this->encryptData(*data);                                                              // Encrypt outside the lock: senders on other threads keep going
 
     std::lock_guard lock(this->sendQueueMutex);
     if (const ssize_t refusal = this->checkFrameFitsLocked(frame.size()); refusal < 0) return refusal;                 // Re-check: the queue may have changed while encrypting
@@ -632,7 +632,7 @@ ssize_t invilite::Mesh::Connection::send(const std::vector<uint8_t>* data) {
     this->queuedFrameBytes += frame.size();
     this->sendQueue.push_back(std::move(frame));
 
-    // Fast path: nothing was waiting, so write now. Behind queued frames we must not write — the I/O thread flushes in order.
+    // Fast path: nothing was waiting, so write now. Behind queued frames we must not write: the I/O thread flushes in order.
     if (queueWasEmpty) {
         const ssize_t written = this->writeQueuedFramesLocked();
         if (written < 0) return written;
@@ -646,7 +646,7 @@ ssize_t invilite::Mesh::Connection::send(const std::vector<uint8_t>* data) {
 ssize_t invilite::Mesh::Connection::checkFrameFitsLocked(const size_t frameSize) const {
     if (this->clientSocket == -1 || this->sendFinishing) return static_cast<int32_t>(Error::Connection::SocketClosed);
     if (this->sendStreamFailed)   return static_cast<int32_t>(Error::Connection::SocketError);
-    if (this->queuedFrameBytes + frameSize > this->sendQueueLimit) {                                                    // Only reachable with frames already queued — an empty queue takes any frame up to the limit
+    if (this->queuedFrameBytes + frameSize > this->sendQueueLimit) {                                                    // Only reachable with frames already queued: an empty queue takes any frame up to the limit
         return static_cast<int32_t>(Error::Connection::SendQueueFull);
     }
     return 0;
@@ -666,7 +666,7 @@ ssize_t invilite::Mesh::Connection::writeQueuedFramesLocked() {
     size_t totalWritten = 0;
 
     while (!this->sendQueue.empty()) {
-        // Gather several queued frames into one syscall — a backlog of small frames costs one write, not one per frame
+        // Gather several queued frames into one syscall: a backlog of small frames costs one write, not one per frame
         std::array<iovec, MAX_FRAMES_PER_WRITE> iov{};
         size_t iovCount  = 0;
         size_t requested = 0;
@@ -684,8 +684,8 @@ ssize_t invilite::Mesh::Connection::writeQueuedFramesLocked() {
         const ssize_t n = ::sendmsg(this->clientSocket, &message, SEND_FLAGS);
         if (n < 0) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;                                                         // Socket full — the rest waits for the next POLLOUT
-            this->sendStreamFailed = true;                                                                              // Part of a frame may be on the wire — never write again
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;                                                         // Socket full: the rest waits for the next POLLOUT
+            this->sendStreamFailed = true;                                                                              // Part of a frame may be on the wire: never write again
             return static_cast<int32_t>(Error::Connection::SocketError);
         }
 
@@ -706,7 +706,7 @@ ssize_t invilite::Mesh::Connection::writeQueuedFramesLocked() {
             this->sendQueueFrontOffset = 0;
         }
 
-        if (static_cast<size_t>(n) < requested) break;                                                                  // Short write — the kernel buffer is full, skip the EAGAIN round trip
+        if (static_cast<size_t>(n) < requested) break;                                                                  // Short write: the kernel buffer is full, skip the EAGAIN round trip
     }
 
     this->shutDownSendDirectionIfFinishedLocked();
@@ -722,7 +722,7 @@ void invilite::Mesh::Connection::shutDownSendDirectionIfFinishedLocked() {
 void invilite::Mesh::Connection::finishSending() {
     std::lock_guard lock(this->sendQueueMutex);
     this->sendFinishing = true;
-    this->shutDownSendDirectionIfFinishedLocked();                                                                     // Nothing queued → half-close now; otherwise the last flush does it
+    this->shutDownSendDirectionIfFinishedLocked();                                                                     // Nothing queued: half-close now; otherwise the last flush does it
 }
 
 bool invilite::Mesh::Connection::drainSendQueue(const milliseconds timeout) {
@@ -739,7 +739,7 @@ bool invilite::Mesh::Connection::drainSendQueue(const milliseconds timeout) {
             socket = this->clientSocket;
         }
 
-        const auto left = std::chrono::ceil<milliseconds>(deadline - std::chrono::steady_clock::now());               // Round up — never give up before the deadline
+        const auto left = std::chrono::ceil<milliseconds>(deadline - std::chrono::steady_clock::now());               // Round up: never give up before the deadline
         if (left.count() <= 0) return false;
 
         pollfd pfd{ socket, POLLOUT, 0 };
@@ -764,7 +764,7 @@ std::optional<std::chrono::steady_clock::duration> invilite::Mesh::Connection::t
 }
 
 void invilite::Mesh::Connection::keyFrameCrypto() {
-    this->frameEncryptor = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Encryption);   // 24-byte nonce → XChaCha20
+    this->frameEncryptor = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Encryption);   // 24-byte nonce selects XChaCha20
     this->frameEncryptor->set_key(this->sessionKey);
     this->frameDecryptor = Botan::AEAD_Mode::create_or_throw("ChaCha20Poly1305", Botan::Cipher_Dir::Decryption);
     this->frameDecryptor->set_key(this->sessionKey);
@@ -788,7 +788,7 @@ std::vector<uint8_t> invilite::Mesh::Connection::encryptData(const std::vector<u
     constexpr size_t tagSize    = 16;
     const std::array<uint8_t, nonceSize> nonce = generateNonce<nonceSize>();                                            // Random 24-byte nonce (XChaCha20)
 
-    // Frame layout: nonce | masked header | ciphertext | tag — built in one buffer, the payload copied in once and
+    // Frame layout: nonce | masked header | ciphertext | tag, built in one buffer, the payload copied in once and
     // encrypted in place
     const auto frameLen = static_cast<uint32_t>(nonceSize + headerSize + data.size() + tagSize);
     std::vector<uint8_t> frame(frameLen);
@@ -818,7 +818,7 @@ std::vector<uint8_t> invilite::Mesh::Connection::encryptData(const std::vector<u
     this->frameEncryptor->start(nonce.data(), nonce.size());
     this->frameEncryptor->process(body, data.size());                                                                  // encrypt in place
     Botan::secure_vector<uint8_t> tag;
-    this->frameEncryptor->finish(tag);                                                                                  // empty final block → only the Poly1305 tag
+    this->frameEncryptor->finish(tag);                                                                                  // empty final block: only the Poly1305 tag
     std::copy(tag.begin(), tag.end(), body + data.size());
 
     return frame;
@@ -896,7 +896,7 @@ std::vector<uint8_t> invilite::Mesh::Connection::decryptData(const std::span<con
         this->frameDecryptor->set_associated_data(frame.data() + nonceSize, headerSize);
         this->frameDecryptor->start(frame.data(), nonceSize);
         this->frameDecryptor->process(plain.data(), plain.size());
-        this->frameDecryptor->finish(tag);                                                                              // verifies the tag — throws when the frame was tampered with
+        this->frameDecryptor->finish(tag);                                                                              // verifies the tag: throws when the frame was tampered with
         return plain;
     } catch (const Botan::Exception& e) {
         throw std::runtime_error(std::string("Decryption failed: ") + e.what());
@@ -920,7 +920,7 @@ std::string invilite::Mesh::Connection::getRemoteClientAddress() const {
         const auto& addr4 = reinterpret_cast<const sockaddr_in&>(this->clientAddress);
         inet_ntop(AF_INET, &addr4.sin_addr, remoteClientAddress, sizeof(remoteClientAddress));
     } else if (this->clientAddress.ss_family == AF_INET6) {
-        // Incoming IPv6 connection. An IPv4 client on a dual-stack listener ("::") arrives as ::ffff:a.b.c.d — report the
+        // Incoming IPv6 connection. An IPv4 client on a dual-stack listener ("::") arrives as ::ffff:a.b.c.d; report the
         // IPv4 address it really is, or it never matches announced addresses and is shown to peers in a form they do not use.
         const auto& addr6 = reinterpret_cast<const sockaddr_in6&>(this->clientAddress);
         if (IN6_IS_ADDR_V4MAPPED(&addr6.sin6_addr)) inet_ntop(AF_INET, &addr6.sin6_addr.s6_addr[12], remoteClientAddress, sizeof(remoteClientAddress));
@@ -971,7 +971,7 @@ void invilite::Mesh::Connection::close() {
         this->clientSocket = -1;
     }
 
-    // Unsent frames can never be delivered now — release their memory right away (swap also frees the deque's blocks)
+    // Unsent frames can never be delivered now: release their memory right away (swap also frees the deque's blocks)
     std::deque<std::vector<uint8_t>>().swap(this->sendQueue);
     this->sendQueueFrontOffset = 0;
     this->queuedFrameBytes     = 0;
@@ -1017,8 +1017,8 @@ template <typename Container> uint16_t invilite::Mesh::Connection::calculateCRC1
 
 template<std::uint8_t length>
 std::array<uint8_t, length> invilite::Mesh::Connection::generateNonce() {
-    // The OS CSPRNG (getrandom): ~40 ns, thread-safe, stateless. AutoSeeded_RNG cost ~6 µs per call even when reused
-    // (it mixes extra input and updates its DRBG on every request) and ~5 µs more to construct — per frame.
+    // The OS CSPRNG (getrandom): ~40 ns, thread-safe, stateless. AutoSeeded_RNG cost ~6 us per call even when reused
+    // (it mixes extra input and updates its DRBG on every request) and ~5 us more to construct, per frame.
     std::array<uint8_t, length> nonce{};
     Botan::system_rng().randomize(nonce.data(), nonce.size());
 

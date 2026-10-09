@@ -11,7 +11,7 @@
 
 namespace invilite::Mesh {
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers ------------------------------------------------------------------
 
 std::array<uint8_t, IdentityVerification::NAME_SIZE> IdentityVerification::packName(std::string_view name) {
     std::array<uint8_t, NAME_SIZE> packed{};
@@ -30,7 +30,7 @@ std::vector<uint8_t> IdentityVerification::buildSignPayload(
     // Signed payload layout:
     //   DOMAIN || nonce_other || flags_self || EdPub_self || XPub_self || name_self
     // flags_self is part of the signature so that a man-in-the-middle cannot flip the probe bit
-    // (or any future bit) in flight — the verifier recomputes this exact payload.
+    // (or any future bit) in flight: the verifier recomputes this exact payload.
     std::vector<uint8_t> payload;
     payload.reserve(DOMAIN.size() + nonceOther.size() + FLAGS_SIZE
                     + ed25519PubSelf.size() + x25519PubSelf.size() + nameSelf.size());
@@ -80,7 +80,7 @@ PeerIdentity IdentityVerification::buildPeerIdentity(
     return pi;
 }
 
-// ── Initiator ────────────────────────────────────────────────────────────────
+// -- Initiator ----------------------------------------------------------------
 
 std::string_view verificationResultName(VerificationResult result) {
     switch (result) {
@@ -115,10 +115,10 @@ VerificationOutcome IdentityVerification::runAsInitiator(
 {
     Botan::AutoSeeded_RNG rng;
 
-    // Default output — overwritten on success. Keeps caller state deterministic on early return.
+    // Default output: overwritten on success. Keeps caller state deterministic on early return.
     remoteFlagsOut = IdentityFlags{};
 
-    // ── Msg1: send our intro ──────────────────────────────────────────────────
+    // -- Msg1: send our intro --------------------------------------------------
     //   nonce_I (16) || flags_I (1) || EdPub_I (32) || XPub_I (32) || name_I (40) = 121B
     std::array<uint8_t, NONCE_SIZE> nonceI{};
     rng.randomize(nonceI.data(), nonceI.size());
@@ -139,7 +139,7 @@ VerificationOutcome IdentityVerification::runAsInitiator(
         return {VerificationResult::ConnectionError, VerificationStep::Msg1};
     }
 
-    // ── Msg2: receive responder's intro + signature ───────────────────────────
+    // -- Msg2: receive responder's intro + signature ---------------------------
     //   nonce_R (16) || flags_R (1) || EdPub_R (32) || XPub_R (32) || sig_R (64) || name_R (40) = 185B
     std::vector<uint8_t> msg2;
     const ssize_t received = conn.receive(msg2, timeout);
@@ -156,13 +156,13 @@ VerificationOutcome IdentityVerification::runAsInitiator(
     std::span<const uint8_t> sigR        (ptr, SIGNATURE_SIZE);  ptr += SIGNATURE_SIZE;
     std::span<const uint8_t> nameR       (ptr, NAME_SIZE);
 
-    // Verify responder's signature — payload must include their flags byte to prevent bit-flipping.
+    // Verify responder's signature: payload must include their flags byte to prevent bit-flipping.
     const std::vector<uint8_t> payloadR = buildSignPayload(nonceI, flagsR, ed25519PubR, x25519PubR, nameR);
     if (!verifySignature(ed25519PubR, payloadR, sigR)) {
         return {VerificationResult::InvalidSignature, VerificationStep::Msg2};
     }
 
-    // ── Msg3: send our signature ──────────────────────────────────────────────
+    // -- Msg3: send our signature ----------------------------------------------
     // Our signature covers our own flags (flagsSelf), matching what we sent in MSG1.
     const std::vector<uint8_t> payloadI = buildSignPayload(
         nonceR,
@@ -184,7 +184,7 @@ VerificationOutcome IdentityVerification::runAsInitiator(
     return {VerificationResult::Success};
 }
 
-// ── Responder ────────────────────────────────────────────────────────────────
+// -- Responder ----------------------------------------------------------------
 
 VerificationOutcome IdentityVerification::runAsResponder(
         Connection& conn,
@@ -197,7 +197,7 @@ VerificationOutcome IdentityVerification::runAsResponder(
     Botan::AutoSeeded_RNG rng;
     remoteFlagsOut = IdentityFlags{};
 
-    // ── Msg1: receive initiator's intro ───────────────────────────────────────
+    // -- Msg1: receive initiator's intro ---------------------------------------
     std::vector<uint8_t> msg1;
     const ssize_t received = conn.receive(msg1, timeout);
 
@@ -212,7 +212,7 @@ VerificationOutcome IdentityVerification::runAsResponder(
     std::span<const uint8_t> x25519PubI  (ptr, PUBKEY_SIZE); ptr += PUBKEY_SIZE;
     std::span<const uint8_t> nameI       (ptr, NAME_SIZE);
 
-    // ── Msg2: send our intro + signature ─────────────────────────────────────
+    // -- Msg2: send our intro + signature -------------------------------------
     const IdentityFlags flagsSelf{};
 
     std::array<uint8_t, NONCE_SIZE> nonceR{};
@@ -237,7 +237,7 @@ VerificationOutcome IdentityVerification::runAsResponder(
 
     if (conn.send(&msg2) <= 0 || !conn.drainSendQueue(timeout)) return {VerificationResult::ConnectionError, VerificationStep::Msg2};
 
-    // ── Msg3: receive initiator's signature ───────────────────────────────────
+    // -- Msg3: receive initiator's signature -----------------------------------
     std::vector<uint8_t> msg3;
     const ssize_t received3 = conn.receive(msg3, timeout);
 

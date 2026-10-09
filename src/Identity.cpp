@@ -91,13 +91,13 @@ namespace invilite::Mesh {
     SignedPeerRecord LocalIdentity::buildSelfRecord(const std::vector<PeerAddress>& addresses) const {
         const auto now = std::chrono::system_clock::now();
 
-        // Serialize the to-be-signed portion. Returns empty on invalid address strings —
+        // Serialize the to-be-signed portion. Returns empty on invalid address strings:
         // treat that as a hard configuration error (caller misconfigured announcedAddresses).
         const std::vector<uint8_t> toSign = SignedPeerRecordCodec::serializeForSigning(
                 ed25519Pub, x25519Pub, now, addresses
         );
         if (toSign.empty()) {
-            throw std::runtime_error("LocalIdentity::buildSelfRecord — failed to serialize record (invalid addresses?)");
+            throw std::runtime_error("LocalIdentity::buildSelfRecord: failed to serialize record (invalid addresses?)");
         }
 
         SignedPeerRecord rec;
