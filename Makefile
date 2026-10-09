@@ -34,7 +34,8 @@ TEST_SOURCES = $(wildcard tests/*.cpp)
 TEST_OBJECTS = $(TEST_SOURCES:.cpp=.o)
 TEST_BINARY = run_test
 
-all: CXXFLAGS += -O2 -flto
+# Fat LTO objects: libmeshlink.a also links with another compiler version or without -flto
+all: CXXFLAGS += -O2 -flto -ffat-lto-objects
 all: LDFLAGS += -flto
 all: $(STATIC_LIB) $(SHARED_LIB)
 
@@ -65,7 +66,7 @@ test: tests
 
 # Race checks: TSAN alone (combined with UBSan it reports false data races)
 tsan:
-	$(MAKE) clean && $(MAKE) TSAN=1 tests && ./$(TEST_BINARY) --gtest_brief=1; $(MAKE) clean
+	$(MAKE) clean && $(MAKE) TSAN=1 tests && ./$(TEST_BINARY) --gtest_brief=1; status=$$?; $(MAKE) clean; exit $$status
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
@@ -95,10 +96,12 @@ install: all
 	ln -sf $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/libmeshlink.so.$(SOVERSION)
 	ln -sf $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/libmeshlink.so
 ifeq ($(BOTAN),bundled)
-	install -m 644 $(BOTAN_DIR)/libbotan-3.a $(DESTDIR)$(PREFIX)/lib/
-	install -d $(DESTDIR)$(PREFIX)/include/botan-3 && cp -r $(BOTAN_DIR)/build/include/public/botan $(DESTDIR)$(PREFIX)/include/botan-3/
+	# The bundled Botan is minimized to what libmeshlink needs: kept in a private directory, never in the way of a full Botan
+	install -d $(DESTDIR)$(PREFIX)/lib/meshlink $(DESTDIR)$(PREFIX)/include/meshlink/botan-3
+	install -m 644 $(BOTAN_DIR)/libbotan-3.a $(DESTDIR)$(PREFIX)/lib/meshlink/
+	cp -r $(BOTAN_DIR)/build/include/public/botan $(DESTDIR)$(PREFIX)/include/meshlink/botan-3/
 	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@VERSION@|$(VERSION)|' -e 's|@REQUIRES@||' \
-	    -e 's|@LIBS_PRIVATE@|$${libdir}/libbotan-3.a|' -e 's|@CFLAGS_EXTRA@|-I$${includedir}/botan-3|' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
+	    -e 's|@LIBS_PRIVATE@|$${libdir}/meshlink/libbotan-3.a|' -e 's|@CFLAGS_EXTRA@|-I$${includedir}/meshlink/botan-3|' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
 else
 	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@VERSION@|$(VERSION)|' -e 's|@REQUIRES@|botan-3|' \
 	    -e 's|@LIBS_PRIVATE@||' -e 's|@CFLAGS_EXTRA@||' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
