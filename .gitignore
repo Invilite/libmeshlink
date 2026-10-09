@@ -11,3 +11,4 @@ run_bench
 build/
 .idea/
 .vscode/
+examples/hello_mesh

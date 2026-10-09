@@ -81,6 +81,11 @@ bench: bench/bench_connection.o $(STATIC_LIB)
 bench/%.o: bench/%.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
+# A minimal node; built in CI so the README's example keeps compiling
+examples: examples/hello_mesh
+examples/hello_mesh: examples/hello_mesh.cpp $(STATIC_LIB)
+	$(CXX) $(CXXFLAGS) $(INCLUDE) -o $@ $< $(STATIC_LIB) $(LDFLAGS) -pthread
+
 install: all
 	install -d $(DESTDIR)$(PREFIX)/include/meshlink $(DESTDIR)$(PREFIX)/include/transport $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	cp -r include/meshlink/. $(DESTDIR)$(PREFIX)/include/meshlink/
@@ -105,9 +110,9 @@ print-botan-cflags:
 print-botan-libs:
 	@echo $(BOTAN_LIBS)
 
-.PHONY: all dev test tests tsan bench install clean print-botan-cflags print-botan-libs
+.PHONY: all dev test tests tsan bench examples install clean print-botan-cflags print-botan-libs
 
 clean:
-	rm -f $(OBJECTS) $(STATIC_LIB) libmeshlink.so* $(TEST_OBJECTS) $(TEST_BINARY) run_test_tsan bench/*.o bench/*.d run_bench $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+	rm -f $(OBJECTS) $(STATIC_LIB) libmeshlink.so* $(TEST_OBJECTS) $(TEST_BINARY) run_test_tsan bench/*.o bench/*.d run_bench examples/hello_mesh $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
 
 -include $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
