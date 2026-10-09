@@ -1,0 +1,26 @@
+name: build
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    strategy:
+      matrix:
+        botan: [system, bundled]
+    steps:
+      - run: apt-get update -qq && apt-get install -y -qq g++ make git python3 pkg-config libgtest-dev ${{ matrix.botan == 'system' && 'libbotan-3-dev' || '' }}
+      - uses: actions/checkout@v4
+        with:
+          submodules: ${{ matrix.botan == 'bundled' }}
+      - run: make BOTAN=${{ matrix.botan }} && make BOTAN=${{ matrix.botan }} test && make BOTAN=${{ matrix.botan }} examples
+  # On the runner itself: ThreadSanitizer needs vm.mmap_rnd_bits <= 28, which a container cannot set.
+  # Ubuntu has no Botan 3 package, so the bundled one is built.
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq g++ make python3 pkg-config libgtest-dev
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: make tsan BOTAN=bundled
