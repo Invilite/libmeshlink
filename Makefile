@@ -1,14 +1,33 @@
-# sudo apt install libgtest-dev
-
+# sudo apt install libgtest-dev (tests); Botan 3 from the system (libbotan-3-dev) or built from third_party/botan
 CXX = g++
-MAKEFLAGS += -j$(nproc)
+MAKEFLAGS += -j$(shell nproc)
 CXXFLAGS = -std=c++20 -Wall -Wextra -pedantic -fPIC -fstack-protector-all
 DEPFLAGS = -MMD -MP                                         # emit .d files so header edits rebuild every dependent object
-LDFLAGS = ../botan/libbotan-3.a
+PREFIX ?= /usr/local
+VERSION = 0.1.0
+SOVERSION = 0
+
+BOTAN ?= $(if $(shell pkg-config --exists botan-3 && echo yes),system,bundled)
+ifeq ($(BOTAN),system)
+  BOTAN_CFLAGS := $(shell pkg-config --cflags botan-3)
+  BOTAN_LIBS := $(shell pkg-config --libs botan-3)
+  BOTAN_DEP :=
+else
+  BOTAN_DIR := third_party/botan
+  BOTAN_CFLAGS := -I$(BOTAN_DIR)/build/include/public
+  BOTAN_LIBS := $(BOTAN_DIR)/libbotan-3.a
+  BOTAN_DEP := $(BOTAN_DIR)/libbotan-3.a
+endif
+LDFLAGS = $(BOTAN_LIBS)
+
+ifdef TSAN
+  CXXFLAGS += -g -fsanitize=thread
+  LDFLAGS += -fsanitize=thread
+endif
 
 STATIC_LIB = libmeshlink.a
-SHARED_LIB = libmeshlink.so
-INCLUDE = -I./include -I../botan/build/include/public
+SHARED_LIB = libmeshlink.so.$(VERSION)
+INCLUDE = -I./include $(BOTAN_CFLAGS)
 SOURCES = $(wildcard src/*.cpp) $(wildcard libs/*.cpp)
 OBJECTS = $(SOURCES:.cpp=.o)
 TEST_SOURCES = $(wildcard tests/*.cpp)
@@ -23,14 +42,30 @@ dev: CXXFLAGS += -g -fsanitize=thread -fsanitize=undefined
 dev: LDFLAGS += -fsanitize=thread -fsanitize=undefined
 dev: $(STATIC_LIB) $(SHARED_LIB)
 
+ifeq ($(BOTAN),bundled)
+$(BOTAN_DIR)/libbotan-3.a:
+	@test -f $(BOTAN_DIR)/configure.py || { echo "Botan not found: install libbotan-3-dev or run git submodule update --init"; exit 1; }
+	scripts/build-botan.sh
+endif
+
+# Botan headers must exist before anything that includes them is compiled
+$(OBJECTS) $(TEST_OBJECTS) bench/bench_connection.o: | $(BOTAN_DEP)
+
 $(STATIC_LIB): $(OBJECTS)
 	ar rcs $@ $^
 
 $(SHARED_LIB): $(OBJECTS)
-	$(CXX) -shared -o $@ $^ $(LDFLAGS)
+	$(CXX) -shared -Wl,-soname,libmeshlink.so.$(SOVERSION) -o $@ $^ $(LDFLAGS)
 
 tests: $(TEST_OBJECTS) $(STATIC_LIB)
 	$(CXX) $(CXXFLAGS) -o $(TEST_BINARY) $(TEST_OBJECTS) $(STATIC_LIB) $(LDFLAGS) -lgtest_main -lgtest -lpthread
+
+test: tests
+	./$(TEST_BINARY) --gtest_brief=1
+
+# Race checks: TSAN alone (combined with UBSan it reports false data races)
+tsan:
+	$(MAKE) clean && $(MAKE) TSAN=1 tests && ./$(TEST_BINARY) --gtest_brief=1; $(MAKE) clean
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
@@ -46,9 +81,26 @@ bench: bench/bench_connection.o $(STATIC_LIB)
 bench/%.o: bench/%.cpp
 	$(CXX) $(CXXFLAGS) $(DEPFLAGS) $(INCLUDE) -c $< -o $@
 
-.PHONY: clean bench
+install: all
+	install -d $(DESTDIR)$(PREFIX)/include/meshlink $(DESTDIR)$(PREFIX)/lib/pkgconfig
+	cp -r include/meshlink/. $(DESTDIR)$(PREFIX)/include/meshlink/
+	install -m 644 $(STATIC_LIB) $(DESTDIR)$(PREFIX)/lib/
+	install -m 755 $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/
+	ln -sf $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/libmeshlink.so.$(SOVERSION)
+	ln -sf $(SHARED_LIB) $(DESTDIR)$(PREFIX)/lib/libmeshlink.so
+ifeq ($(BOTAN),bundled)
+	install -m 644 $(BOTAN_DIR)/libbotan-3.a $(DESTDIR)$(PREFIX)/lib/
+	install -d $(DESTDIR)$(PREFIX)/include/botan-3 && cp -r $(BOTAN_DIR)/build/include/public/botan $(DESTDIR)$(PREFIX)/include/botan-3/
+	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@VERSION@|$(VERSION)|' -e 's|@REQUIRES@||' \
+	    -e 's|@LIBS_PRIVATE@|$${libdir}/libbotan-3.a|' -e 's|@CFLAGS_EXTRA@|-I$${includedir}/botan-3|' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
+else
+	sed -e 's|@PREFIX@|$(PREFIX)|' -e 's|@VERSION@|$(VERSION)|' -e 's|@REQUIRES@|botan-3|' \
+	    -e 's|@LIBS_PRIVATE@||' -e 's|@CFLAGS_EXTRA@||' meshlink.pc.in > $(DESTDIR)$(PREFIX)/lib/pkgconfig/meshlink.pc
+endif
+
+.PHONY: all dev test tests tsan bench install clean
 
 clean:
-	rm -f $(OBJECTS) $(STATIC_LIB) $(SHARED_LIB) $(TEST_OBJECTS) $(TEST_BINARY) bench/*.o bench/*.d run_bench $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+	rm -f $(OBJECTS) $(STATIC_LIB) libmeshlink.so* $(TEST_OBJECTS) $(TEST_BINARY) run_test_tsan bench/*.o bench/*.d run_bench $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
 
 -include $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)

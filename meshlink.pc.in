@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+includedir=${prefix}/include
+libdir=${prefix}/lib
+
+Name: meshlink
+Description: Peer-to-peer encrypted mesh network library
+Version: @VERSION@
+Requires.private: @REQUIRES@
+Cflags: -I${includedir} @CFLAGS_EXTRA@
+Libs: -L${libdir} -lmeshlink -pthread
+Libs.private: @LIBS_PRIVATE@
