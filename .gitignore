@@ -12,3 +12,7 @@ build/
 .idea/
 .vscode/
 examples/hello_mesh
+
+# Markdown stays local unless it is published documentation
+*.md
+!README.md
